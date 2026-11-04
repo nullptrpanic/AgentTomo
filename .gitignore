@@ -4,3 +4,8 @@
 !.cargo/config.toml
 !.gitignore
 Cargo.lock
+
+# Local agent instructions and implementation plans.
+/AGENTS.md
+/agents.md
+/docs/superpowers/plans/
