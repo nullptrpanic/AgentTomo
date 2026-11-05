@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>AgentTomo · Playground</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/assets/vendor/xterm.css">
+  <link rel="stylesheet" href="/assets/style.css">
+  <script defer src="/assets/vendor/xterm.js"></script>
+  <script defer src="/assets/vendor/addon-fit.js"></script>
+  <script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">a<span>t</span></span><strong>AgentTomo</strong><span class="divider">/</span><span>Playground</span></div>
+    <div class="topbar-actions"><span id="status" class="status" data-state="starting" role="status">Starting</span><button id="new-session" type="button">New session <span aria-hidden="true">↗</span></button></div>
+  </header>
+  <main>
+    <section class="terminal-panel" aria-labelledby="terminal-title">
+      <div class="panel-heading"><div><span class="eyebrow">WORKSPACE</span><h1 id="terminal-title">Container terminal</h1></div><span id="image" class="image-label">Docker</span></div>
+      <div class="terminal-toolbar"><span class="terminal-tab"><span aria-hidden="true">›_</span> bash</span><span id="session-id">Creating a temporary container…</span></div>
+      <div id="terminal" aria-label="Interactive container terminal"></div>
+      <div class="terminal-footer"><span><span class="small-dot"></span> Isolated Docker session</span><span>Ctrl-C to interrupt · Ctrl-D to exit</span></div>
+    </section>
+    <section class="trace-panel" aria-labelledby="trace-title">
+      <div class="panel-heading"><div><span class="eyebrow">OBSERVABILITY</span><h2 id="trace-title">Process tree <span id="event-count" class="count">0</span></h2></div><span class="trace-label"><span class="small-dot"></span> Live behaviors</span></div>
+      <p class="trace-description">Expand a task to inspect its behavior and descendants.<br><span>Process lifecycle · file opens · TCP forwarding. HTTPS stays encrypted.</span></p>
+      <div id="trace-scroll" tabindex="0" aria-label="Process tree and behaviors">
+        <div id="empty-trace"><span class="empty-icon" aria-hidden="true">⌁</span><strong>Waiting for activity</strong><p>Try <code>ls /tmp</code> or <code>uname -a</code> in the terminal.</p></div>
+        <ul id="process-tree" aria-label="Process tree"></ul>
+      </div>
+      <details id="event-detail"><summary>Selected event <span id="selected-sequence"></span></summary><pre id="event-json">Select a trace row to inspect its fields.</pre></details>
+      <footer class="trace-footer"><span id="trace-summary">Waiting for process events</span><span>Logs retained on host</span></footer>
+    </section>
+  </main>
+  <div id="notice" role="alert" hidden></div>
+  <footer class="page-footer"><span>One page. One container. A visible execution trail.</span><span>Closing this page removes its container.</span></footer>
+</body>
+</html>
