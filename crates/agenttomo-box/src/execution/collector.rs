@@ -20,15 +20,23 @@ use crate::tracing::{self, Event};
 
 nix::ioctl_read_bad!(bytes_available, nix::libc::FIONREAD, nix::libc::c_int);
 
-pub async fn run(command: &OsStr, directory: &Path, with_terminal: bool) -> io::Result<()> {
+pub async fn run(
+    command: &OsStr,
+    directory: &Path,
+    with_terminal: bool,
+    preview_limits: crate::recording::file_preview::Limits,
+    http: crate::proxy::http::Options,
+) -> io::Result<()> {
     let parent_lost = signal(SignalKind::user_defined1())?;
-    let (mut recording, input_log) = Recording::create(command, directory).await?;
+    let (mut recording, input_log) = Recording::create(command, directory, preview_limits).await?;
     let result = collect(
         command,
         with_terminal,
         input_log,
         &mut recording,
         parent_lost,
+        preview_limits.enabled(),
+        http,
     )
     .await;
     if let Err(error) = &result {
@@ -44,13 +52,45 @@ async fn collect(
     input_log: File,
     recording: &mut Recording,
     mut parent_lost: Signal,
+    capture_files: bool,
+    http: crate::proxy::http::Options,
 ) -> io::Result<()> {
     nix::sys::prctl::set_child_subreaper(true)?;
-    let (proxy, service, mut proxy_events) = crate::proxy::channel();
+    let (observations, mut proxy_events) = mpsc::channel(256);
+    let inspection = crate::proxy::http::Inspection::create(recording.directory(), http).await?;
+    let trust = inspection
+        .as_ref()
+        .map(|inspection| super::trust::Overlay::new(&inspection.authority.pem))
+        .transpose()?;
+    let registry = crate::network::association::Registry::default();
+    let associations = registry.clone();
+    let (network, endpoints) = oneshot::channel::<crate::network::Endpoints>();
     let scope_finished = CancellationToken::new();
-    let mut proxy_task = tokio::spawn(service.run(scope_finished.clone()));
+    let scope = scope_finished.clone();
+    let mut proxy_task = tokio::spawn(async move {
+        let endpoints = endpoints.await.map_err(io::Error::other)?;
+        tokio::try_join!(
+            crate::proxy::tcp::run(
+                endpoints.tcp,
+                associations.clone(),
+                observations.clone(),
+                scope.clone(),
+                inspection,
+            ),
+            crate::proxy::udp::run(endpoints.udp, associations, observations, scope),
+        )?;
+        Ok::<_, io::Error>(())
+    });
     let (events_tx, mut events) = mpsc::channel(256);
-    let thread = tracing::spawn(command.to_owned(), with_terminal, events_tx, proxy)?;
+    let thread = tracing::spawn(
+        command.to_owned(),
+        with_terminal,
+        events_tx,
+        registry,
+        network,
+        capture_files,
+        trust.as_ref().map(|overlay| overlay.path().to_owned()),
+    )?;
     let (pid, streams) = match events.recv().await {
         Some(Event::Started { pid, streams }) => (pid, streams),
         Some(Event::Failed(error)) => return Err(io::Error::other(error)),
@@ -85,6 +125,7 @@ async fn collect(
         tokio::select! {
             event = events.recv(), if !tracing_done => match event {
                 Some(Event::Process { kind, data }) => recording.event("ptrace", kind, data).await?,
+                Some(Event::FileOpen(opened)) => recording.file_open(opened).await?,
                 Some(Event::RootExit(code)) => {
                     // Drain a snapshot, not EOF or an unbounded busy pipe.
                     if let Some(stop) = stop_input.take() { let _ = stop.send(()); }

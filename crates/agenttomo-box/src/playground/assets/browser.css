@@ -1,0 +1,11 @@
+.workspace-tabs { display: flex; height: 100%; gap: 12px; }
+.workspace-tabs button { background: transparent; color: #8b9bae; border: 0; border-bottom: 2px solid transparent; padding: 0 4px; font-size: 11px; }
+.workspace-tabs button[aria-pressed="true"] { color: #c7d7e4; border-bottom-color: #9be9c2; }
+#browser { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+.browser-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; min-width: 0; flex: 0 0 auto; font-size: 11px; }
+#browser-status { color: #9be9c2; overflow-wrap: anywhere; }
+#browser-reconnect { border: 1px solid #45596c; border-radius: 4px; padding: 5px 8px; background: #1a2531; color: #d3dee8; font-size: 10px; }
+#browser-reconnect:disabled { opacity: .5; cursor: default; }
+#browser-screen { flex: 1; min-height: 0; min-width: 0; overflow: hidden; background: #182029; }
+.browser-help { flex: 0 0 auto; margin: 0; padding: 8px 12px; color: #8b9bae; font-size: 10px; line-height: 1.5; }
+.browser-help code { color: #c7d7e4; }

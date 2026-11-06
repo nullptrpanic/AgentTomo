@@ -3,11 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark light">
+  <meta name="color-scheme" content="dark">
   <title>AgentTomo · Playground</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/assets/vendor/xterm.css">
   <link rel="stylesheet" href="/assets/style.css">
+  <link rel="stylesheet" href="/assets/file-preview.css">
+  <link rel="stylesheet" href="/assets/traffic.css">
+  <link rel="stylesheet" href="/assets/browser.css">
   <script defer src="/assets/vendor/xterm.js"></script>
   <script defer src="/assets/vendor/addon-fit.js"></script>
   <script type="module" src="/assets/app.js"></script>
@@ -20,17 +23,35 @@
   <main>
     <section class="terminal-panel" aria-labelledby="terminal-title">
       <div class="panel-heading"><div><span class="eyebrow">WORKSPACE</span><h1 id="terminal-title">Container terminal</h1></div><span id="image" class="image-label">Docker</span></div>
-      <div class="terminal-toolbar"><span class="terminal-tab"><span aria-hidden="true">›_</span> bash</span><span id="session-id">Creating a temporary container…</span></div>
+      <div class="terminal-toolbar"><nav class="workspace-tabs" aria-label="Workspace view"><button type="button" data-workspace="terminal" aria-pressed="true">Terminal</button><button id="browser-tab" type="button" data-workspace="browser" aria-pressed="false" hidden>Browser</button></nav><span id="session-id">Creating a temporary container…</span></div>
       <div id="terminal" aria-label="Interactive container terminal"></div>
-      <div class="terminal-footer"><span><span class="small-dot"></span> Isolated Docker session</span><span>Ctrl-C to interrupt · Ctrl-D to exit</span></div>
+      <section id="browser" aria-label="Container Chrome window" hidden>
+        <div class="browser-toolbar"><span id="browser-status" role="status">Waiting for desktop</span><button id="browser-reconnect" type="button" disabled>Reconnect display</button></div>
+        <div id="browser-screen" aria-label="Interactive remote desktop"></div>
+        <p class="browser-help">Chrome is part of this traced session. Reopen a closed window with <code>google-chrome</code> in Terminal.</p>
+      </section>
+      <div class="terminal-footer"><span><span class="small-dot"></span> Isolated Docker session</span><span id="workspace-hint">Ctrl-C to interrupt · Ctrl-D to exit</span></div>
     </section>
     <section class="trace-panel" aria-labelledby="trace-title">
-      <div class="panel-heading"><div><span class="eyebrow">OBSERVABILITY</span><h2 id="trace-title">Process tree <span id="event-count" class="count">0</span></h2></div><span class="trace-label"><span class="small-dot"></span> Live behaviors</span></div>
-      <p class="trace-description">Expand a task to inspect its behavior and descendants.<br><span>Process lifecycle · file opens · TCP forwarding. HTTPS stays encrypted.</span></p>
+      <div class="panel-heading"><div><span class="eyebrow">OBSERVABILITY</span><h2 id="trace-title">Activity <span id="event-count" class="count">0</span></h2></div><span class="trace-label"><span class="small-dot"></span> Live behaviors</span></div>
+      <nav class="observation-tabs" aria-label="Observation view"><button type="button" data-observation="process" aria-pressed="true">Process tree</button><button type="button" data-observation="traffic" aria-pressed="false">Traffic</button></nav>
+      <p class="trace-description">Expand a process to inspect its behavior and descendants.<br><span id="capture-description">Process lifecycle · file opens · mmap · TCP / UDP · HTTP Host / TLS SNI.</span></p>
+      <div class="trace-tools">
+        <details id="event-filter" class="event-filter">
+          <summary>Event filters <span class="filter-state">All events</span></summary>
+          <div class="filter-menu">
+            <div class="filter-actions"><button type="button" data-filter-action="all">Select all</button><button type="button" data-filter-action="none">Clear all</button></div>
+            <div class="filter-groups"></div>
+            <p>Filters affect displayed events. Full logs are retained.</p>
+          </div>
+        </details>
+      </div>
       <div id="trace-scroll" tabindex="0" aria-label="Process tree and behaviors">
         <div id="empty-trace"><span class="empty-icon" aria-hidden="true">⌁</span><strong>Waiting for activity</strong><p>Try <code>ls /tmp</code> or <code>uname -a</code> in the terminal.</p></div>
         <ul id="process-tree" aria-label="Process tree"></ul>
       </div>
+      <section id="traffic" aria-label="Traffic inspector" hidden></section>
+      <aside id="file-preview" aria-label="File preview" hidden></aside>
       <details id="event-detail"><summary>Selected event <span id="selected-sequence"></span></summary><pre id="event-json">Select a trace row to inspect its fields.</pre></details>
       <footer class="trace-footer"><span id="trace-summary">Waiting for process events</span><span>Logs retained on host</span></footer>
     </section>

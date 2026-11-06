@@ -4,11 +4,11 @@
 use nix::{
     sys::{
         ptrace,
-        uio::{RemoteIoVec, process_vm_readv},
+        uio::{RemoteIoVec, process_vm_readv, process_vm_writev},
     },
     unistd::Pid,
 };
-use std::io::{self, IoSliceMut};
+use std::io::{self, IoSlice, IoSliceMut};
 
 pub fn read(tid: Pid, address: u64, length: usize) -> io::Result<Vec<u8>> {
     address
@@ -65,6 +65,18 @@ pub fn write(tid: Pid, address: u64, bytes: &[u8]) -> io::Result<()> {
     address
         .checked_add(bytes.len() as u64)
         .ok_or_else(|| io::Error::other("address overflow"))?;
+    if process_vm_writev(
+        tid,
+        &[IoSlice::new(bytes)],
+        &[RemoteIoVec {
+            base: address as usize,
+            len: bytes.len(),
+        }],
+    )
+    .is_ok_and(|n| n == bytes.len())
+    {
+        return Ok(());
+    }
     let word_size = std::mem::size_of::<nix::libc::c_long>();
     let mut offset = 0;
     while offset < bytes.len() {

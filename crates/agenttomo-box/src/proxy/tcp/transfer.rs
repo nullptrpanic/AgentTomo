@@ -1,10 +1,13 @@
-//! Tokio's copy owns buffering/backpressure. Separate directions allow the
-//! target's write-half close to coexist with a still-readable response.
+//! Separate directions preserve half-close and upload draining. Only the upload
+//! needs a read/write loop to inspect the preface; download uses Tokio's copy.
 
+use super::{Context, protocol::Inspector};
+use crate::recording::Observation;
+use serde_json::json;
 use std::io;
 use tokio::{
-    io::{AsyncWriteExt, copy as copy_stream},
-    net::TcpStream,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy as copy_stream},
+    sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -15,14 +18,41 @@ pub struct Outcome {
 }
 
 pub async fn copy(
-    mut client: TcpStream,
-    mut upstream: TcpStream,
+    client: impl AsyncRead + AsyncWrite + Unpin,
+    upstream: impl AsyncRead + AsyncWrite + Unpin,
     scope_finished: CancellationToken,
+    context: &Context,
+    events: &mpsc::Sender<Observation>,
 ) -> io::Result<Outcome> {
-    let (mut client_read, mut client_write) = client.split();
-    let (mut upstream_read, mut upstream_write) = upstream.split();
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
     let upload = async {
-        let count = copy_stream(&mut client_read, &mut upstream_write).await?;
+        let mut inspector = Inspector::default();
+        let mut buffer = [0; 8192];
+        let mut count = 0;
+        loop {
+            let length = client_read.read(&mut buffer).await?;
+            if length == 0 {
+                break;
+            }
+            let name = inspector.observe(&buffer[..length]);
+            // Forward each chunk immediately, even while the parser needs more
+            // bytes or has rejected its format. Never send TLS parser alerts.
+            upstream_write.write_all(&buffer[..length]).await?;
+            count += length as u64;
+            if let Some(name) = name {
+                events
+                    .send(context.event(
+                        "network.protocol",
+                        json!({
+                            "protocol":name.protocol, "domain":name.domain,
+                            "domain_source":name.source, "scope":"connection_preface",
+                        }),
+                    ))
+                    .await
+                    .map_err(io::Error::other)?;
+            }
+        }
         upstream_write.shutdown().await?;
         Ok::<_, io::Error>(count)
     };
@@ -62,7 +92,7 @@ mod tests {
     use super::*;
     use tokio::{
         io::AsyncReadExt,
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         time::{Duration, timeout},
     };
 
@@ -89,7 +119,20 @@ mod tests {
             target.shutdown().await.unwrap();
             let finished = CancellationToken::new();
             finished.cancel();
-            let transfer = tokio::spawn(copy(client, upstream, finished));
+            let (events, _receiver) = mpsc::channel(1);
+            let context = Context {
+                connection_id: 1,
+                key: crate::network::association::Key {
+                    transport: crate::network::association::Transport::Tcp,
+                    source: client.peer_addr().unwrap(),
+                    destination: listener.local_addr().unwrap(),
+                },
+                metadata: None,
+            };
+            let transfer =
+                tokio::spawn(
+                    async move { copy(client, upstream, finished, &context, &events).await },
+                );
             tokio::time::sleep(Duration::from_millis(20)).await;
             let mut received = Vec::new();
             server.read_to_end(&mut received).await.unwrap();

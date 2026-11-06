@@ -1,0 +1,22 @@
+#file-preview { flex: 0 1 auto; min-height: 140px; max-height: 40%; overflow: auto; border-top: 1px solid #3d4a59; padding: 12px 18px; background: #14212c; font-size: 11px; scrollbar-color: #45596c transparent; }
+.trace-panel:has(#file-preview:not([hidden])) #trace-scroll { min-height: 120px; }
+.trace-panel:has(#file-preview:not([hidden])) #event-detail { min-height: 40px; overflow: auto; }
+#file-preview button { border: 1px solid #45596c; background: #21323e; color: #c7d7e4; padding: 5px 8px; border-radius: 4px; font-size: 10px; white-space: nowrap; }
+#file-preview button:hover, #file-preview button[aria-pressed="true"] { border-color: #9be9c2; color: #9be9c2; }
+#file-preview button:disabled { opacity: .45; cursor: default; }
+.file-inspector-heading, .file-inspector-path, .file-inspector-tools { display: flex; align-items: center; gap: 9px; }
+.file-inspector-heading { justify-content: space-between; }
+.file-inspector-heading strong { font-size: 12px; color: #e7cb8d; }
+.file-inspector-path { margin-top: 9px; align-items: flex-start; }
+.file-inspector-path code { flex: 1; min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; color: #d3dee8; font-size: 11px; }
+.file-inspector-meta, .file-inspector-status { color: #8b9bae; font-size: 10px; line-height: 1.6; overflow-wrap: anywhere; }
+.file-inspector-note { padding: 7px 10px; background: #21302e; color: #a0eac7; line-height: 1.5; }
+.file-inspector-note.truncated { background: #393226; color: #e7cb8d; }
+.file-inspector-tools { margin: 9px 0; flex-wrap: wrap; }
+.file-inspector-tools > span { flex: 1; color: #8b9bae; }
+.file-inspector-code { background: #101820; border: 1px solid #2c3b48; border-radius: 4px; margin: 0; padding: 9px; overflow: auto; max-height: 250px; font: 11px/1.7 ui-monospace, Consolas, monospace; }
+.file-inspector-code.lines { display: grid; grid-template-columns: minmax(24px, max-content) minmax(max-content, 1fr); column-gap: 12px; }
+.file-inspector-code.lines pre { margin: 0; font: inherit; white-space: pre; }
+.file-inspector-code .line-number { color: #71869a; user-select: none; text-align: right; }
+.file-inspector-empty { padding: 14px 0; color: #a8b7c7; line-height: 1.6; }
+@media (max-width: 900px) { .trace-panel:has(#file-preview:not([hidden])) { height: 80vh; min-height: 600px; } }

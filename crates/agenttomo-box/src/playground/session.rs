@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{App, docker, trace_feed};
+use super::{App, desktop, docker, trace_feed};
 use crate::execution::protocol::{self, Input, Message};
 use crate::recording::create_log;
 
@@ -35,13 +35,13 @@ pub async fn serve(mut socket: WebSocket, app: App) {
             .mode(0o700)
             .create(&directory)
             .await?;
-        let metadata = json!({"session_id":id,"container":name,"image":app.settings.image});
+        let metadata = json!({"session_id":id,"container":name,"image":app.settings.image,"browser":app.settings.browser});
         let mut file = create_log(&directory, "session.json").await?;
         file.write_all(&serde_json::to_vec(&metadata)?).await?;
         file.flush().await?;
         socket
             .send(WsMessage::Text(
-                json!({"type":"session","id":id,"container":name,"image":app.settings.image})
+                json!({"type":"session","id":id,"container":name,"image":app.settings.image,"http_capture":app.settings.http.enabled,"browser":app.settings.browser})
                     .to_string()
                     .into(),
             ))
@@ -52,14 +52,26 @@ pub async fn serve(mut socket: WebSocket, app: App) {
         }
         // Do not cancel create on disconnect: obtain ownership first, then the
         // common cleanup below removes the known container even if start fails.
-        docker::create(&name, &app.settings.image, &app.settings.binary, &directory).await?;
+        docker::create(
+            &name,
+            &app.settings.image,
+            &app.settings.binary,
+            &directory,
+            app.settings.file_preview,
+            app.settings.http,
+            app.settings.browser,
+        )
+        .await?;
         if app.shutdown.is_cancelled() {
             return Ok("server_shutdown");
         }
-        drive(&mut socket, &name, directory.join("run"), &app.shutdown).await
+        drive(&mut socket, &id, &name, directory.join("run"), &app).await
     }
     .await;
 
+    if let Some(lifetime) = app.desktops.lock().expect("desktop registry").remove(&id) {
+        lifetime.cancel();
+    }
     let cleanup = docker::remove(&name).await;
     let error = result
         .as_ref()
@@ -86,10 +98,12 @@ pub async fn serve(mut socket: WebSocket, app: App) {
 
 async fn drive(
     socket: &mut WebSocket,
+    id: &str,
     name: &str,
     run_directory: std::path::PathBuf,
-    shutdown: &CancellationToken,
+    app: &App,
 ) -> io::Result<&'static str> {
+    let shutdown = &app.shutdown;
     let mut child = docker::start(name)?;
     let mut input = child.stdin.take().expect("piped Docker stdin");
     let mut output = BufReader::new(child.stdout.take().expect("piped Docker stdout"));
@@ -101,13 +115,32 @@ async fn drive(
 
     let source = async {
         let worker = async {
+            let mut desktop: Option<tokio::process::Child> = None;
             loop {
-                let message = match protocol::receive(&mut output).await {
+                let result = tokio::select! {
+                    result = protocol::receive(&mut output) => result,
+                    status = async {
+                        match &mut desktop {
+                            Some(child) => child.wait().await,
+                            None => std::future::pending().await,
+                        }
+                    } => return Err(io::Error::other(format!("desktop exited unexpectedly: {}", status?))),
+                };
+                let message = match result {
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                     result => result?,
                 };
                 let frame = match message {
-                    Message::Started { pid } => Frame::Json(json!({"type":"ready","pid":pid})),
+                    Message::Started { pid } => {
+                        if app.settings.browser {
+                            desktop = Some(desktop::start(name).await?);
+                            app.desktops
+                                .lock()
+                                .expect("desktop registry")
+                                .insert(id.to_owned(), app.shutdown.child_token());
+                        }
+                        Frame::Json(json!({"type":"ready","pid":pid}))
+                    }
                     Message::Stdout(bytes) | Message::Stderr(bytes) => Frame::Bytes(bytes),
                     Message::RootExit(code) => Frame::Json(json!({"type":"root_exit","code":code})),
                     Message::Error(error) => return Err(io::Error::other(error)),

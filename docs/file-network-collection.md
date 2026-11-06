@@ -1,61 +1,74 @@
 # 文件与 TCP 采集
 
-## 本次交付
-
-在现有 run 和 Playground 中补齐文件打开记录及 TCP 重定向/转发，不改变前台随根进程退出、采集器继续服务后代的生命周期。文件与网络采集模块独立，代理不依赖 ptrace，也不依赖文件采集。
+当前网络后端为 namespace + netfilter TPROXY + 同进程常驻代理。旧版 ptrace 改写 connect、每连接 listener 和 getpeername 还原已移除。UDP 详见 [UDP 采集与转发](udp-collection.md)，内存映射详见 [mmap 采集](mmap-collection.md)。
 
 ## 模块与数据流
 
-- `syscall/`：seccomp 白名单筛选、系统调用停点信息、目标内存和寄存器适配，只提供机制。
-- `collectors/file/`：open/openat/openat2/creat 参数快照与真实返回值、路径记录；不读取文件内容。
-- `collectors/network/`：socket 类型识别、connect 参数/结果、为 TCP 建立重定向；不执行异步字节转发。
-- `proxy/`：独立的 Tokio TCP 代理；输入是连接 ID、发起 TID、原目标和已绑定的本地 listener，输出为代理连接与传输记录。
-- `tracing/syscalls.rs`：分发关心的调用、维护每个 TID 的入口/出口状态；文件和网络模块彼此不引用。
-- `recording/`：为各来源记录统一时间和序号；Web 只消费真实记录。
+- `network/namespace.rs`：单线程启动 helper 创建 user/net namespace、配置路由与 iptables/ip6tables，把监听及回包 FD 通过 SCM_RIGHTS 交给外层采集器。只操作新 namespace；不修改宿主规则，也不需要 TUN、veth 或 FUSE。
+- `network/socket.rs`、`packet.rs`：透明 socket、UDP 原始地址控制消息与回包封装。
+- `collectors/network/`：只维护私有的 socket 身份、地址和调用者元数据，不发布 `network.*` 事件，不改写应用的网络目的地址。
+- `network/association.rs`：一次运行内的五元组关联表，不做全局进程/socket 扫描。
+- `proxy/tcp/`、`proxy/udp/`：独立的 Tokio 转发与网络事实记录，均在采集器同一个 Rust 进程内。上游 socket 属于外层网络 namespace，不会再次命中内层规则。
+- `syscall/`、`tracing/`：选择性 seccomp 停点、ptrace 状态机和寄存器/内存机制；不实现代理协议。
+- `collectors/file/`、`collectors/memory/`：独立解释文件与映射事件。
+- `recording/`：统一分类、序号、时间和落盘；Web 消费同一事件格式。
 
 ```mermaid
 flowchart LR
-    Target[目标及其后代] --> Filter[seccomp RET_TRACE]
-    Filter --> Dispatch[ptrace syscall 分发]
-    Dispatch --> Files[独立文件采集]
-    Dispatch --> Net[独立网络采集]
-    Net -->|连接 ID / 原目标 / TID| Proxy[独立 Tokio TCP 代理]
-    Target <-->|重定向后的 TCP| Proxy
-    Proxy <--> Remote[原目标]
-    Files --> Records[统一证据记录]
-    Net --> Records
-    Proxy --> Records
-    Records --> Tree[进程树内的行为]
+    subgraph Inner[新 user / network namespace]
+        Target[目标与后代] -->|原始地址| Rules[OUTPUT 标记 / PREROUTING TPROXY]
+        Rules --> Listen[常驻 TCP / UDP socket]
+    end
+    subgraph Outer[外层采集器进程]
+        Listen -->|启动时传递 FD| Proxy[Tokio 代理]
+        Trace[ptrace 线程] -->|私有进程与五元组元数据| Registry[运行内关联表]
+        Registry --> Proxy
+        Trace --> File[文件 / 进程 / mmap 事件]
+        Proxy --> Network[网络事件]
+    end
+    Proxy <-->|外层普通 socket| Upstream[原目标]
+    File --> Log[带 category 的 events.jsonl]
+    Network --> Log
 ```
 
-## 采集与拦截规则
+每个诊断作用域固定创建 IPv4/IPv6 各一个 TCP listener 和一个 UDP 接收 socket；不是每连接新建 listener。TPROXY 不改写报文两端地址：TCP `accept` 的 peer 和 `getsockname` 分别给出原始源端点和目的端点。完整 key 为协议、源 IP/端口、目标 IP/端口，关联表按运行独立，相同源端口访问不同目标互不冲突。相比 REDIRECT，无需依赖 NAT 后源端点反推 conntrack 原元组。
 
-使用 no_new_privs + seccomp RET_TRACE 选择 open/openat/openat2/creat/socket/connect，并用 PTRACE_SYSCALL 获取选中调用的退出；其余调用由内核直接执行。过滤器继承到后代，安装失败不执行目标。使用 Linux 5.3+ 的 PTRACE_GET_SYSCALL_INFO；当前后端只采集原生 x86_64 ABI，其他架构保留进程跟踪，不安装此 syscall 过滤器。需要外层允许子进程 ptrace、seccomp 安装、目标 /proc 访问和本地端口绑定；不依赖 eBPF、iptables、额外 capability 或 namespace。no_new_privs 会阻止后续 exec 通过 setuid/file capabilities 获得新权限。
+启动前检查外层 IPv6 路由：如果没有任何非回环单播路由，内层不添加 IPv6 默认路由，但保留 IPv6 回环及代理 socket。这样应用在 IPv4-only 环境内尝试外部 IPv6 会立即获得不可达错误，可正常回退 IPv4，避免先与本地代理完成 TCP 握手后才遭遇重置。外层有 IPv6 路由时沿用原来的 IPv6 转发；目前不动态同步外层路由变化。
 
-文件记录请求路径与原始字节、dirfd/base_path、打开参数、返回 FD 或 errno；成功后定点读取 `/proc/<tid>/fd/<返回FD>` 补充实际路径。参数不可读/截断要单独标记，不能影响目标的原始文件操作。openat2 记录 flags/mode/resolve，不将其与路径字符串混为一谈。事件在 syscall 退出停点生成；内核信号重启码单独标为 restart，不冒充最终用户态 errno，没有退出停点的调用可能缺少完成记录。这里不宣称覆盖 read/write/mmap、rename/unlink 或 io_uring 文件操作。
+## 启动要求与失败行为
 
-网络在 socket 成功返回时登记其 inode 和类型，connect 时仅查询当前已知 FD 的 symlink 并按 inode 查表，不扫描 FD 表；fork、dup、exec 后的同一 socket 因而可以识别。只重定向本次执行中观察到创建的 AF_INET/AF_INET6 TCP socket；UDP、Unix socket、继承自外部的未知 socket 和不同网络命名空间的调用保持原路径，记录原因。socket 元数据随诊断作用域保留，不做全局常驻缓存。
+运行环境需允许创建 user/net namespace、在其内部使用 NET_ADMIN/NET_RAW、安装 seccomp、跟踪自启动子进程及读取其 `/proc`。必须有 `ip`、`iptables`、`ip6tables`，内核支持 IPv4/IPv6 TPROXY、socket match 和策略路由。程序也会在 `/usr/sbin`、`/sbin` 查找工具，不要求修改 shell 配置。
 
-每次 TCP connect 分配一个专属 loopback listener，将原目标与 ID 交给代理。sockaddr 复制到当前线程栈的临时区域，调整调用参数指针；不修改应用原 sockaddr，退出时恢复栈内容及参数。支持只读/共享 sockaddr。失败、信号重启、线程退出都回收未使用路由。
+helper 映射调用者原 UID/GID，临时能力只属于新 user namespace；配置完毕后清空 capabilities 与 bounding/ambient 集合，启用 no_new_privs，再释放用户命令。网络或跟踪初始化失败以 125 退出，报告原因，不执行用户命令，也不退回 ptrace 重定向。这里的 namespace 是网络后端必需条件；挂载 namespace、OverlayFS 仍是独立的可选能力。
 
-代理先接受被重定向的连接，再异步连接原目标，使用 Tokio 转发，处理半关闭和并发。原始 connect 返回的是目标到本地代理的结果，原目标连接结果另记，不能将两者混为成功；上游失败时目标看到连接关闭/重置。getpeername 会看到代理端点，原 socket 的源端口/接口选项不复制到上游。这是 TCP 代理的可见语义变化，不是完全透明的内核网络仿真。HTTPS 只透传 TLS 字节，不解密、不声称获得 HTTP 请求内容。
+Docker 默认 seccomp/AppArmor 可能禁止嵌套 namespace。Playground 开发容器设置 `seccomp=unconfined`、`apparmor=unconfined`，同时保留 `cap-drop=ALL`、当前 UID/GID 和 no-new-privileges；不添加 privileged，不修改 Docker daemon。这个开发配置放宽了容器安全策略，不能当作恶意代码隔离方案。
 
-代理接受连接及连接上游各有 30 秒超时；只有发起连接的 socket 受该路由影响，tracer 不等待上游网络 I/O。根进程结束不关闭代理；全部 tracee 结束后停止等待向目标下行的数据，仍完成已接收的上行数据转发，再结束记录。异常采集失败或容器删除会取消整个作用域。
+## 进程归属
 
-`file.open`、`network.connect` 使用 ptrace 来源；`network.upstream`、`network.transfer` 使用 tcp_proxy 来源，结果分别记录，字节计数未知时为 null。各来源共享单次运行的序号与落盘时刻；该时刻不冒充 syscall 的精确开始时刻。进程与行为携带运行内稳定 task_id，fork 另有 child_task_id；代理沿路由携带同一 task_id 和 connection_id，避免进程退出/TID 复用后的错误归属。它们只服务原生任务身份和 TCP 路由，不引入 Agent 工具语义关联。
+socket 成功创建时，读取该已知 FD 的 inode 并分配运行内 socket ID。fork/dup 后同一 inode 可以继续识别；不会遍历全部 FD。connect 入口只有目标地址，自动源端口尚未确定，因此在成功或 EINPROGRESS 出口临时执行一次 getsockname 查询，再完整恢复原返回值、寄存器和借用的栈字节。查询期间通过 PTRACE_SETSIGMASK 临时阻塞可屏蔽信号，由内核保留待交付信号及 siginfo；恢复原信号掩码后正常交付，SIGSTOP/SIGKILL 仍按内核语义处理。FD 被其他线程关闭/复用时放弃归属。
 
-这种实现需要线程栈临时空间、本地 listener 和每个活动连接的两个 socket，未设计为安全边界。socket 类型缓存随本次运行保留，长时间高连接数诊断会增加内存用量；当前无任务总超时。网络采集不覆盖外部传入的未知 FD、TCP Fast Open、sendto/QUIC、io_uring 等路径；外层过滤器优先拒绝的调用也不会产生 RET_TRACE 事件。
+代理接受连接可能早于元数据登记，最多等待 250 ms。未取得可靠元数据仍转发，标记 `attribution=unavailable`，不猜 PID。TCP 的 `attribution=connect_initiator` 表示建连发起者，不宣称它就是共享 FD 后每一次 write 的执行者。PID、稳定的 `process_instance_id` 和 `socket_id` 随代理事件保存，迟到的事件不会复活已退出进程。同进程线程共享该身份；线程号仅保留在底层 ptrace 操作内。
 
-## 验证
+## 事件与应用可见行为
 
-文件验证实际成功/失败打开、相对 dirfd、openat2、非 UTF-8 路径、无效地址及信号中断。网络验证 IPv4/IPv6、阻塞/非阻塞 connect、只读 sockaddr、fork/dup 后连接、并发与双向半关闭、UDP 保持直连、上游失败记录、父退出后的后代访问，以及实际数据经过内置代理。保留现有生命周期与 PTY 测试，最后用 Docker 浏览器观察同一节点下的文件和网络行为。
+- `network.upstream`：代理实际连接原目标的结果。
+- `network.protocol`：默认模式读取 HTTP/1 Host/请求目标 authority 或 TLS ClientHello SNI；仅解析前 64 KiB，HTTP 最多 128 个头。支持分段，畸形、未知或超限前缀不阻断转发。默认 TLS 不解密，域名是客户端声明，不恢复 ECH 隐藏名称。开启 `--capture-http` 后使用独立 HTTP/TLS 模块，记录 `network.http.*`、正文范围和 `network.tls.error`，具体限额与 CA 注入边界见[内容检查设计](content-inspection-design.md)。
+- `network.transfer`：转发结果、上/下行字节数；无法确认的计数为 null。
 
-2026-11-05 验证记录：
+上述事件来源均为 `tcp_proxy`，`category=network`，携带原始 `source_address`、`destination`、协议与 connection ID。ptrace 不再输出 network.connect、getpeername 或网络收发事件。失败且未到达代理的系统调用不是出口流量记录，不能从无事件推断应用没有尝试调用。
 
-- `cargo test --workspace`、`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings` 通过；默认测试包含 40 项。宿主关闭 IPv6 回环，对应条件用例报告未在宿主执行。
-- `cargo test -p agenttomo-box --test playground -- --ignored --nocapture` 的 3 项 Docker 用例通过；`node --test crates/agenttomo-box/tests/process-tree.test.mjs` 的 11 项树模型测试通过。
-- 额外在现有 Ubuntu 24.04 镜像内，以 UID/GID 1000、cap-drop=ALL、no-new-privileges 和默认 seccomp 运行静态 C 程序，文件采集成功；IPv6 经代理双向各传输 65,536 字节并校验内容。没有拉取镜像、修改节点权限或使用特权容器。
-- 实际浏览器终端读取 `/etc/hostname` 并请求本地验证 HTTP 服务：文件打开与 TCP 连接归于同一 task_id，代理上行 40 字节、下行 139 字节，终端收到完整响应；点击事件能查看原始记录。页面无 JS 异常，桌面事件列无重叠，窄屏无横向溢出。
-- 收尾回归覆盖：所有 tracee 结束、下行已关闭且上游暂时背压时，继续排空 256 KiB 上行数据，不让失效下行中断上传。
+应用的 connect 参数及 getpeername 返回值保持内核原行为，不再看到重写的代理目的地址。不过目标运行在只有 lo 的新网络视图，外部服务看到的是代理出网地址/端口；TCP 仍是两段连接，远端失败可能表现为后续 EOF/reset，TCP_INFO、接口绑定、MTU、错误队列和 socket 选项不等同于原网络。当前内层 loopback 已有目标 socket 时直接由内核处理，保留命令自建 TCP/UDP 服务互访；没有内层目标 socket 的流量交给外层代理（包括外层 DNS/loopback 服务）。内层互访不是出口代理事件。入站服务、广播/组播及主动切换网络 namespace 不属于支持范围。外部传入 FD、io_uring、TCP Fast Open 等归属路径未作完整保证。
 
-机制参考：[seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html)、[ptrace](https://man7.org/linux/man-pages/man2/ptrace.2.html)、[connect](https://man7.org/linux/man-pages/man2/connect.2.html)。
+## 转发汇总时间
+
+`network.transfer` 与 `network.udp.transfer` 在收尾时才有完整字节计数，但事件的业务开始时间单独记录：TCP 在代理 `accept` 返回时取时，UDP 在代理收到该流的第一个数据报时取时，均早于关联查找与后台任务排队。字段为 `started_unix_ns`、`completed_unix_ns`、`duration_ns` 和 `start_source`（`proxy_accept` / `proxy_first_datagram`）。耗时使用单调时钟计算；这是代理连接/流的寿命，不是 HTTP 请求或目标 `connect` syscall 的开始时间。
+
+`observed_unix_ns`、`monotonic_ns` 与 `sequence` 继续保留记录器写入时序。Playground 对新记录优先显示开始时间，并仅在显示层按开始时间排序；结束和写入时间保留在原始详情及时间提示中。旧日志没有开始字段时沿用原记录时间，不推算或伪造开始时间。特别快退出的目标，其排队报文可能在退出后才被代理收到，此时代理开始时间晚于进程退出也是实际观察结果。
+
+## 文件行为与生命周期
+
+文件仍由 seccomp RET_TRACE + ptrace 采集 open/openat/openat2/creat：请求路径及原始字节、dirfd/base_path、flags/mode/resolve、返回 FD 或 errno，成功时补充已知 FD 的路径。读取失败、截断和内核重启码分别标记；不虚拟化文件系统，不把 mmap 当作每次内存读写。
+
+文件预览从成功打开的已知 FD 固定可读普通文件对象，由 recording 异步保存有上限的内容前缀，不在浏览器点击时重读路径。默认 64 KiB/文件、16 MiB/运行，可通过 `--file-preview-max-bytes`、`--file-preview-total-bytes` 调整或设为 0 禁用。快照与 JSONL 分开保存，事件包含范围和完整性状态；它不是 read 调用记录，也不是原子文件快照。支持范围及 Web 读取边界见[内容检查设计](content-inspection-design.md)。
+
+根命令退出时前台返回；ptrace 继续跟踪全部后代。全部目标退出后代理排空已接收的上行数据，停止等待无接收者的下行，落盘后才标记 complete。上游 TCP 建连有 30 秒超时。

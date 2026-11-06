@@ -6,9 +6,18 @@ use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 
-pub fn exec(command: &OsStr) -> u8 {
+pub fn exec(command: &OsStr, trust_overlay: Option<&std::path::Path>) -> u8 {
     // fd 3 is a dedicated, unbuffered gate, separate from the target's streams.
     let mut control = unsafe { UnixStream::from_raw_fd(3) };
+    if let Err(error) = crate::network::namespace::prepare(&control, || {
+        if let Some(directory) = trust_overlay {
+            super::trust::install(directory)?;
+        }
+        Ok(())
+    }) {
+        let _ = write!(control, "E{error}");
+        return 125;
+    }
     if control.write_all(b"R").is_err() {
         return 125;
     }

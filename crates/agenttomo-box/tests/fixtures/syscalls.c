@@ -63,6 +63,43 @@ static int port;
 static int inherited_socket = -1;
 static int upload_only;
 static int invalid_calls;
+static int protocol_payload;
+
+static void expect_peer(int fd) {
+    struct sockaddr_storage peer;
+    socklen_t size = sizeof(peer);
+    check(getpeername(fd, (struct sockaddr *)&peer, &size), "getpeername");
+    if (size != destination_size || memcmp(&peer, destination, size)) {
+        fputs("getpeername did not return the original destination\n", stderr);
+        exit(84);
+    }
+}
+
+static void peer_buffers(int fd) {
+    const socklen_t capacities[] = {0, 1, 2, 3, 4, 8, destination_size - 1, destination_size, destination_size + 8};
+    for (size_t i = 0; i < sizeof(capacities) / sizeof(capacities[0]); i++) {
+        unsigned char bytes[64];
+        memset(bytes, 0xa5, sizeof(bytes));
+        socklen_t size = capacities[i];
+        check(getpeername(fd, (struct sockaddr *)(bytes + 8), &size), "short peer buffer");
+        size_t copied = capacities[i] < destination_size ? capacities[i] : destination_size;
+        if (size != destination_size || memcmp(bytes + 8, destination, copied)) exit(63);
+        for (size_t j = 0; j < sizeof(bytes); j++) {
+            if ((j < 8 || j >= 8 + copied) && bytes[j] != 0xa5) exit(62);
+        }
+    }
+    socklen_t size = destination_size;
+    if (syscall(SYS_getpeername, fd, (void *)1, &size) != -1 || errno != EFAULT) exit(61);
+    struct sockaddr_storage peer;
+    if (syscall(SYS_getpeername, fd, &peer, (void *)1) != -1 || errno != EFAULT) exit(60);
+    int other = dup(fd); check(other, "peer dup");
+    expect_peer(other);
+    close(other);
+    pid_t child = fork(); check(child, "peer fork");
+    if (!child) { expect_peer(fd); _exit(0); }
+    int status; check(waitpid(child, &status, 0), "peer wait");
+    if (!WIFEXITED(status) || WEXITSTATUS(status)) exit(59);
+}
 
 static int tcp(int nonblocking, int duplicate, int refused) {
     int fd = inherited_socket >= 0 ? inherited_socket : socket(family, SOCK_STREAM | (nonblocking ? SOCK_NONBLOCK : 0), 0);
@@ -81,11 +118,14 @@ static int tcp(int nonblocking, int duplicate, int refused) {
         check(fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK), "blocking io");
     }
     if (memcmp(saved, destination, destination_size)) return 83;
-    struct sockaddr_storage peer; socklen_t size = sizeof(peer);
-    check(getpeername(fd, (struct sockaddr *)&peer, &size), "getpeername");
-    int peer_port = family == AF_INET ? ntohs(((struct sockaddr_in *)&peer)->sin_port) : ntohs(((struct sockaddr_in6 *)&peer)->sin6_port);
-    if (peer_port == port) { fputs("connection bypassed proxy\n", stderr); return 84; }
-    if (invalid_calls && (connect(fd, destination, destination_size) != -1 || errno != EISCONN)) return 69;
+    expect_peer(fd);
+    if (invalid_calls) {
+        struct sockaddr_in other = *(const struct sockaddr_in *)destination;
+        other.sin_port = htons(port == 65535 ? port - 1 : port + 1);
+        if (connect(fd, (struct sockaddr *)&other, sizeof(other)) != -1 || errno != EISCONN) return 69;
+        expect_peer(fd);
+    }
+    if (!refused) peer_buffers(fd);
     if (refused) {
         char byte;
         if (recv(fd, &byte, 1, 0) > 0) return 85;
@@ -93,13 +133,25 @@ static int tcp(int nonblocking, int duplicate, int refused) {
     }
     unsigned char bytes[65536];
     for (size_t index = 0; index < sizeof(bytes); index++) bytes[index] = (unsigned char)index;
+    size_t length = sizeof(bytes);
+    if (protocol_payload) {
+        FILE *input = fopen("payload.bin", "rb");
+        if (!input) return 65;
+        length = fread(bytes, 1, sizeof(bytes), input);
+        if (ferror(input) || !feof(input)) return 64;
+        fclose(input);
+    }
     size_t offset = 0;
-    while (offset < sizeof(bytes)) { ssize_t n = write(fd, bytes + offset, sizeof(bytes) - offset); check(n, "send"); offset += n; }
+    while (offset < length) {
+        size_t count = length - offset;
+        if (protocol_payload && count > 7) count = 7;
+        ssize_t n = write(fd, bytes + offset, count); check(n, "send"); offset += n;
+    }
     if (upload_only) _exit(0);
     check(shutdown(fd, SHUT_WR), "half close");
     unsigned char reply[sizeof(bytes)]; offset = 0;
-    while (offset < sizeof(reply)) { ssize_t n = read(fd, reply + offset, sizeof(reply) - offset); check(n, "receive"); if (!n) return 86; offset += n; }
-    if (memcmp(reply, bytes, sizeof(bytes))) return 87;
+    while (offset < length) { ssize_t n = read(fd, reply + offset, length - offset); check(n, "receive"); if (!n) return 86; offset += n; }
+    if (memcmp(reply, bytes, length)) return 87;
     char extra; if (read(fd, &extra, 1) != 0) return 88;
     close(fd); puts("TCP_OK"); return 0;
 }
@@ -111,12 +163,13 @@ static void *thread_client(void *unused) {
 
 static int network(const char *mode, int requested_port) {
     port = requested_port;
+    protocol_payload = !strcmp(mode, "protocol");
     family = !strcmp(mode, "tcp6") ? AF_INET6 : AF_INET;
     void *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (page == MAP_FAILED) return 89;
     if (family == AF_INET) {
         struct sockaddr_in value = {.sin_family = AF_INET, .sin_port = htons(port)};
-        inet_pton(AF_INET, "127.0.0.1", &value.sin_addr);
+        inet_pton(AF_INET, !strcmp(mode, "peer-ip") ? "127.0.0.2" : "127.0.0.1", &value.sin_addr);
         memcpy(page, &value, sizeof(value)); destination_size = sizeof(value);
     } else {
         struct sockaddr_in6 value = {.sin6_family = AF_INET6, .sin6_port = htons(port)};
@@ -137,6 +190,9 @@ static int network(const char *mode, int requested_port) {
     invalid_calls = !strcmp(mode, "invalid");
     if (invalid_calls) {
         int fd = socket(family, SOCK_STREAM, 0); check(fd, "invalid test socket");
+        struct sockaddr_storage peer; socklen_t size = sizeof(peer);
+        if (getpeername(fd, (struct sockaddr *)&peer, &size) != -1 || errno != ENOTCONN) return 58;
+        if (getpeername(-1, (struct sockaddr *)&peer, &size) != -1 || errno != EBADF) return 57;
         if (connect(fd, (void *)1, destination_size) != -1 || errno != EFAULT) return 68;
         if (connect(fd, destination, 1) != -1 || errno != EINVAL) return 67;
         if (connect(-1, destination, destination_size) != -1 || errno != EBADF) return 66;

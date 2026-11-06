@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>AgentTomo · 流量观察 Demo</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./file-preview.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand"><span class="brand-mark">at<span></span></span><strong>AgentTomo</strong><span class="slash">/</span><span class="workspace-name">Playground</span><span class="demo-badge">交互 Demo · 模拟数据</span></div>
+    <div class="header-actions"><span id="simulation-status" class="live-label"><span class="live-dot"></span>模拟流量运行中</span><button id="simulation-toggle" class="button">暂停模拟</button><button id="reset-demo" class="button quiet">重置演示</button></div>
+  </header>
+
+  <main id="workspace" class="workspace">
+    <aside id="terminal-panel" class="terminal-panel" aria-label="终端预览">
+      <div class="terminal-heading"><span class="eyebrow">WORKSPACE</span><h1>Container terminal</h1><span class="image-tag">agenttomo-playground:24.04</span></div>
+      <div class="terminal-tabs"><span class="terminal-tab">›_ &nbsp; bash</span><span class="muted">PID 28</span></div>
+      <div class="terminal-output">
+        <p class="prompt">ubuntu@playground:~$</p><p>python agent_demo.py</p>
+        <p class="terminal-comment"># 检索文档</p><p>GET docs.example.test/guide</p><p class="terminal-success">200 OK · 146 ms</p>
+        <p class="terminal-comment"># 获取模型流式响应</p><p>POST api.example.test/v1/responses</p><p class="terminal-success">200 OK · text/event-stream</p>
+        <div class="terminal-stream"><span class="terminal-comment">↓ 最近的响应片段</span><p id="terminal-token">正在阅读项目文档…</p><span class="terminal-caret" aria-hidden="true"></span></div>
+        <p class="terminal-comment"># 工具通道</p><p>wss://tools.example.test/events</p><p class="terminal-success">101 Switching Protocols</p>
+      </div>
+      <div class="terminal-shortcuts"><span class="eyebrow">定位示例行为</span><button data-jump="http-docs" class="shortcut"><span>HTTP 请求</span><span>↗</span></button><button data-jump="sse-response" class="shortcut"><span>SSE 流式响应</span><span>↗</span></button><button data-jump="ws-tools" class="shortcut"><span>WebSocket 工具交互</span><span>↗</span></button><button data-file="readme" class="shortcut"><span>file.open 文件预览</span><span>↗</span></button></div>
+      <div class="terminal-footer"><span class="small-dot"></span>终端预览，不执行实际命令</div>
+    </aside>
+
+    <section class="inspector" aria-label="诊断工作区">
+      <div class="inspector-heading">
+        <nav class="primary-tabs" aria-label="观察视图"><button data-pane="traffic" class="primary-tab active" aria-pressed="true">流量 <span class="count">8</span></button><button data-pane="processes" class="primary-tab" aria-pressed="false">进程 <span class="count">4</span></button></nav>
+        <div class="workspace-actions"><span class="session-name">session demo-8f42</span><button id="terminal-toggle" class="button quiet" aria-expanded="true">收起终端</button></div>
+      </div>
+
+      <div id="traffic-pane" class="traffic-pane">
+        <div class="traffic-toolbar">
+          <label class="search-box"><span aria-hidden="true">⌕</span><input id="traffic-search" type="search" placeholder="搜索域名、路径或方法" aria-label="搜索流量"><span class="search-hint">过滤</span></label>
+          <label class="select-label"><span class="sr-only">进程过滤</span><select id="pid-filter"><option value="all">所有进程</option><option value="35">curl · PID 35</option><option value="42">python · PID 42</option><option value="51">agent · PID 51</option></select></label>
+          <button id="group-toggle" class="button quiet" aria-pressed="false">按域名分组</button>
+        </div>
+        <div class="protocol-toolbar"><div class="protocol-filters" aria-label="协议过滤"><button data-protocol="all" class="filter active" aria-pressed="true">全部</button><button data-protocol="http" class="filter" aria-pressed="false">HTTP</button><button data-protocol="sse" class="filter" aria-pressed="false">SSE <span class="tiny-live"></span></button><button data-protocol="ws" class="filter" aria-pressed="false">WebSocket <span class="tiny-live"></span></button></div><span id="request-count" class="muted">8 个请求 · 2 个活动流</span></div>
+        <div id="request-scroll" class="request-scroll">
+          <table class="request-table"><thead><tr><th class="number-cell">#</th><th>方法</th><th class="url-column">地址 / 协议</th><th class="pid-column">PID</th><th>状态</th><th class="size-column numeric">大小</th><th class="time-column numeric">耗时</th></tr></thead><tbody id="request-list"></tbody></table>
+          <p id="empty-requests" class="empty-state" hidden>没有匹配的请求。调整搜索或过滤条件。</p>
+        </div>
+
+        <section class="request-detail" aria-label="选中请求详情">
+          <div class="detail-heading"><div class="detail-identity"><span id="detail-method" class="method post">POST</span><span id="detail-url" class="detail-url">https://api.example.test/v1/responses</span></div><div id="detail-meta" class="detail-meta"></div></div>
+          <nav id="detail-tabs" class="detail-tabs" aria-label="请求详情"><button data-detail="overview">概览</button><button data-detail="request">请求</button><button data-detail="response">响应</button><button data-detail="messages" class="active">消息 <span class="tiny-live"></span></button></nav>
+          <div id="detail-content" class="detail-content"></div>
+        </section>
+      </div>
+
+      <div id="process-pane" class="process-pane" hidden>
+        <div class="section-intro"><h2>进程行为</h2><p>查看执行链、预览打开的文件，或从网络行为定位到流量详情。</p></div>
+        <div id="process-workspace" class="process-workspace">
+          <div id="process-list"></div>
+          <aside id="file-preview" class="file-preview" aria-label="文件预览" hidden></aside>
+        </div>
+      </div>
+      <footer class="inspector-footer"><span id="footer-summary">8 个请求 · 4 个进程</span><span><span class="small-dot"></span>所有流量为本地模拟</span></footer>
+    </section>
+  </main>
+  <div id="announcement" class="sr-only" role="status" aria-live="polite"></div>
+</body>
+</html>

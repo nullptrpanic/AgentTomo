@@ -1,18 +1,11 @@
-// Project trace semantics, independent of DOM and transport. TIDs are task IDs;
-// clone records alone cannot tell us whether the child is a separate process.
-const isTid = (value) => Number.isInteger(value) && value > 0;
-const creationKinds = new Set(["process.fork", "process.vfork", "process.clone"]);
-const command = (argv) => argv.map(arg => /\s/.test(arg) ? JSON.stringify(arg) : arg).join(" ");
-const proxyKinds = new Set(["network.upstream", "network.transfer"]);
+// Native schema v2: PID owns behavior; an instance distinguishes PID reuse.
+import { LegacyProcessTree } from "./legacy-process-tree.mjs";
+import { describeBehavior, formatCommand } from "./event-description.mjs";
 
-function behavior(kind, data) {
-  const result = data.restart ? "interrupted; restart pending" : data.errno ? `errno ${data.errno}` : data.result ?? "result unavailable";
-  if (kind === "file.open") return `${data.syscall || "open"} ${data.path ?? "[unreadable path]"} → ${typeof result === "number" && result >= 0 ? `FD ${result}` : result}`;
-  if (kind === "network.connect") return `${data.transport || "socket"} ${data.destination ?? "[address unavailable]"} · ${data.redirected ? "local proxy" : "direct"} → ${result}${data.skip_reason ? ` · ${data.skip_reason}` : ""}`;
-  if (kind === "network.upstream") return `${data.destination} · upstream ${data.status}${data.error ? `: ${data.error}` : ""}`;
-  if (kind === "network.transfer") return `${data.destination ?? "connection"} · ${data.status} · ↑ ${data.bytes_up ?? "?"} B · ↓ ${data.bytes_down ?? "?"} B${data.error ? ` · ${data.error}` : ""}`;
-  return JSON.stringify(data);
-}
+const valid = value => Number.isInteger(value) && value > 0;
+const creationKinds = new Set(["process.fork", "process.vfork", "process.clone"]);
+const connectionKinds = new Set(["network.upstream", "network.transfer"]);
+const identity = pid => `PID ${valid(pid) ? pid : "—"}`;
 
 export class ProcessTree {
   constructor(limit = 1000) {
@@ -20,109 +13,112 @@ export class ProcessTree {
     this.nodes = new Map();
     this.active = new Map();
     this.latest = new Map();
-    this.byTask = new Map();
+    this.byInstance = new Map();
     this.entries = [];
-    this.total = 0;
+    this.count = 0;
     this.nextId = 0;
+    this.rootPid = null;
+    this.legacy = null;
   }
 
-  get roots() {
-    return [...this.nodes.values()].filter(node => node.parentId === null);
+  get total() { return this.legacy?.total ?? this.count; }
+
+  start(pid) {
+    this.rootPid = pid;
+    if (this.legacy) this.legacy.start(pid);
+    else if (valid(pid)) (this.latest.get(pid) || this.process(pid)).root = true;
   }
 
-  start(tid) {
-    if (isTid(tid)) (this.roots.find(node => node.tid === tid) || this.latest.get(tid) || this.task(tid)).root = true;
-  }
-
-  task(tid, taskId = null, live = true) {
-    if (!isTid(tid)) tid = null;
-    if (!isTid(taskId)) taskId = null;
-    let node = taskId === null ? this.active.get(tid) : this.byTask.get(taskId);
-    // A ready message may introduce the root before its first stable ID arrives.
-    if (!node && taskId !== null && this.active.get(tid)?.taskId === null) node = this.active.get(tid);
+  process(pid, instanceId = null, live = true) {
+    if (!valid(pid)) pid = null;
+    if (!valid(instanceId)) instanceId = null;
+    let node = instanceId === null ? this.active.get(pid) : this.byInstance.get(instanceId);
+    if (!node && instanceId !== null && this.active.get(pid)?.instanceId === null) node = this.active.get(pid);
     if (!node) {
       node = {
-        id: `task-${++this.nextId}`, tid, taskId, parentId: null, children: new Set(),
-        name: tid === null ? "Unattributed events" : null, state: tid === null || !live ? "unknown" : "running",
-        birth: null, root: false, hasExec: false, events: [], omitted: 0, exit: null,
+        id: `process-${++this.nextId}`, pid, instanceId, parentId: null, children: new Set(),
+        name: pid === null ? "Unattributed events" : null, state: pid === null || !live ? "unknown" : "running",
+        root: false, birth: null, hasExec: false, events: [], omitted: 0, exit: null,
+        startedNs: null, endedNs: null, activity: 0,
       };
       this.nodes.set(node.id, node);
     }
-    if (taskId !== null) { node.taskId = taskId; this.byTask.set(taskId, node); }
-    if (live && node.state === "unknown" && tid !== null) node.state = "running";
-    if (live && (node.state === "running" || tid === null)) {
-      this.active.set(tid, node);
-      this.latest.set(tid, node);
+    if (instanceId !== null) { node.instanceId = instanceId; this.byInstance.set(instanceId, node); }
+    if (live && node.state === "unknown" && pid !== null) node.state = "running";
+    if (pid === null || (live && node.state === "running")) {
+      this.active.set(pid, node);
+      this.latest.set(pid, node);
     }
     return node;
   }
 
   add(event) {
     const data = event.data || {};
-    let node;
+    if (this.legacy || event.schema_version === 1 || Object.hasOwn(data, "tid") || Object.hasOwn(data, "parent_tid")) {
+      if (!this.legacy) { this.legacy = new LegacyProcessTree(this.limit); this.legacy.start(this.rootPid); }
+      this.legacy.add(event);
+      return;
+    }
+    const time = Number.isFinite(event.monotonic_ns) && event.monotonic_ns >= 0 ? event.monotonic_ns : null;
+    const node = this.process(data.pid, data.process_instance_id, !String(event.kind).startsWith("network."));
     let description;
-    if (creationKinds.has(event.kind) && isTid(data.parent_tid) && isTid(data.child_tid)) {
-      node = this.task(data.parent_tid, data.task_id);
-      // waitpid can report a child exec/exit before its parent's creation stop.
-      const observed = this.latest.get(data.child_tid);
-      const child = isTid(data.child_task_id) ? this.task(data.child_tid, data.child_task_id) : observed && !observed.birth && !observed.root ? observed : this.task(data.child_tid);
+    if (creationKinds.has(event.kind) && valid(data.child_pid)) {
+      const child = this.process(data.child_pid, data.child_process_instance_id);
       if (child !== node) {
         child.parentId = node.id;
         child.birth = event.kind.replace("process.", "");
+        child.startedNs ??= time;
         if (!child.hasExec) child.name ??= node.name;
         node.children.add(child.id);
       }
-      description = `TID ${data.parent_tid} → TID ${data.child_tid}`;
+      description = `${identity(data.pid)} → ${identity(data.child_pid)}`;
+    } else if (event.kind === "process.exec") {
+      node.startedNs ??= time;
+      const previous = node.name;
+      const argv = Array.isArray(data.argv) ? data.argv : [];
+      node.hasExec = true;
+      node.name = argv[0] || null;
+      description = `${previous || "exec"} → ${argv.length ? formatCommand(argv) : "arguments unavailable"}`;
+    } else if (event.kind === "process.exit") {
+      node.state = "exited";
+      node.endedNs = time;
+      node.exit = data.signal ? `signal ${data.signal}` : `exit ${data.exit_code ?? "?"}`;
+      description = node.exit;
+      if (this.active.get(node.pid) === node) this.active.delete(node.pid);
     } else {
-      if (event.kind === "process.exec" && isTid(data.former_tid) && data.former_tid !== data.tid && isTid(data.tid)) {
-        node = this.task(data.former_tid, data.task_id);
-        const previous = this.active.get(data.tid);
-        if (previous && previous !== node) {
-          previous.state = "replaced";
-          previous.exit = "replaced by exec";
-        }
-        this.active.delete(data.former_tid);
-        if (this.latest.get(data.former_tid) === node) this.latest.delete(data.former_tid);
-        node.tid = data.tid;
-        this.active.set(data.tid, node);
-        this.latest.set(data.tid, node);
-      } else {
-        node = this.task(data.tid, data.task_id, !proxyKinds.has(event.kind));
-      }
-      if (event.kind === "process.exec") {
-        const previous = node.name;
-        const argv = Array.isArray(data.argv) ? data.argv : [];
-        node.hasExec = true;
-        node.name = argv[0] || null;
-        description = `${previous || "exec"} → ${argv.length ? command(argv) : "arguments unavailable"}`;
-        if (data.former_tid && data.former_tid !== data.tid) description += ` (TID ${data.former_tid} → ${data.tid})`;
-      } else if (event.kind === "process.exit") {
-        node.state = "exited";
-        node.exit = data.signal ? `signal ${data.signal}` : `exit ${data.exit_code ?? "?"}`;
-        description = node.exit;
-        if (this.active.get(node.tid) === node) this.active.delete(node.tid);
-      } else {
-        description = behavior(event.kind, data);
+      const domain = connectionKinds.has(event.kind) && valid(data.connection_id)
+        ? this.entries.findLast(entry => entry.event.kind === "network.protocol" && entry.event.data.connection_id === data.connection_id)?.event.data.domain : null;
+      description = describeBehavior(event.kind, data, domain);
+    }
+    if (event.kind === "network.protocol" && valid(data.connection_id)) {
+      for (const entry of this.entries) {
+        if (connectionKinds.has(entry.event.kind) && entry.event.data.connection_id === data.connection_id)
+          entry.description = describeBehavior(entry.event.kind, entry.event.data, data.domain);
       }
     }
-    const entry = { id: ++this.total, event, description, nodeId: node.id };
+    const entry = { id: ++this.count, event, description, nodeId: node.id };
     node.events.push(entry);
     this.entries.push(entry);
     while (this.entries.length > this.limit) {
-      const oldest = this.entries.shift();
-      const owner = this.nodes.get(oldest.nodeId);
+      const first = this.entries.shift();
+      const owner = this.nodes.get(first.nodeId);
       owner.events.shift();
-      owner.omitted += 1;
+      owner.omitted++;
       this.prune(owner);
     }
+  }
+
+  processView() {
+    if (this.legacy) return this.legacy.processView();
+    return { nodes: new Map([...this.nodes].map(([id, node]) => [id, { ...node, activity: 0 }])), entries: this.entries };
   }
 
   prune(node) {
     while (node && node.events.length === 0 && node.children.size === 0 && node.state !== "running") {
       this.nodes.delete(node.id);
-      if (this.byTask.get(node.taskId) === node) this.byTask.delete(node.taskId);
-      if (this.latest.get(node.tid) === node) this.latest.delete(node.tid);
-      if (this.active.get(node.tid) === node) this.active.delete(node.tid);
+      if (this.byInstance.get(node.instanceId) === node) this.byInstance.delete(node.instanceId);
+      if (this.latest.get(node.pid) === node) this.latest.delete(node.pid);
+      if (this.active.get(node.pid) === node) this.active.delete(node.pid);
       const parent = this.nodes.get(node.parentId);
       parent?.children.delete(node.id);
       node = parent;

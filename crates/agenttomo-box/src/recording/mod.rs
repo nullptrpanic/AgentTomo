@@ -1,5 +1,9 @@
 //! Run files and the separate completion states of the root and collection.
 
+pub mod file_preview;
+pub mod http;
+pub mod streams;
+
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,10 +44,18 @@ pub struct Recording {
     events: File,
     started: Instant,
     sequence: u64,
+    previews: file_preview::Store,
 }
 
 impl Recording {
-    pub async fn create(command: &OsStr, directory: &Path) -> io::Result<(Self, File)> {
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+    pub async fn create(
+        command: &OsStr,
+        directory: &Path,
+        preview_limits: file_preview::Limits,
+    ) -> io::Result<(Self, File)> {
         if let Some(parent) = directory
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -79,6 +91,7 @@ impl Recording {
             events: create_log(directory, "events.jsonl").await?,
             started: Instant::now(),
             sequence: 0,
+            previews: file_preview::Store::create(directory, preview_limits).await?,
         };
         result.status("running", None).await?;
         Ok((result, input))
@@ -87,13 +100,25 @@ impl Recording {
     pub async fn event(&mut self, source: &str, kind: &str, data: Value) -> io::Result<()> {
         self.sequence += 1;
         let value = json!({
-            "schema_version": 1, "sequence": self.sequence, "kind": kind,
+            "schema_version": 2, "sequence": self.sequence, "kind": kind,
+            "category": match kind.split('.').next() {
+                Some("network") => "network",
+                Some("file") => "file",
+                Some("process") => "process",
+                Some("memory") => "memory",
+                _ => "other",
+            },
             "source": source, "observed_unix_ns": SystemTime::now().duration_since(UNIX_EPOCH).map_err(io::Error::other)?.as_nanos(),
             "monotonic_ns": self.started.elapsed().as_nanos(), "data": data,
         });
         let mut bytes = serde_json::to_vec(&value)?;
         bytes.push(b'\n');
         self.events.write_all(&bytes).await
+    }
+
+    pub async fn file_open(&mut self, opened: crate::collectors::file::Opened) -> io::Result<()> {
+        let data = self.previews.capture(opened).await;
+        self.event("ptrace", "file.open", data).await
     }
 
     pub async fn root_exit(&mut self, code: u8) -> io::Result<()> {

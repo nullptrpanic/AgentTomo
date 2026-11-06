@@ -1,6 +1,22 @@
 use nix::libc;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
+/// Canonical socket endpoint for five-tuple matching. Flow labels are not an
+/// endpoint identity; IPv4-mapped callers share the IPv4 packet path.
+pub fn canonical(address: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V6(mut address) => {
+            if let Some(ip) = address.ip().to_ipv4_mapped() {
+                SocketAddr::new(ip.into(), address.port())
+            } else {
+                address.set_flowinfo(0);
+                SocketAddr::V6(address)
+            }
+        }
+        address => address,
+    }
+}
+
 pub fn decode(bytes: &[u8]) -> Option<SocketAddr> {
     let family = u16::from_ne_bytes(bytes.get(..2)?.try_into().ok()?) as i32;
     let port = u16::from_be_bytes(bytes.get(2..4)?.try_into().ok()?);

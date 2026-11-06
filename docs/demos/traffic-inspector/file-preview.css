@@ -1,0 +1,150 @@
+.process-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 20px;
+}
+.process-workspace.preview-open {
+  grid-template-columns: minmax(240px, .85fr) minmax(300px, 1.15fr);
+}
+.process-workspace #process-list { min-width: 0; }
+.process-workspace .process-behavior { min-width: 0; }
+.process-workspace .process-behavior code { min-width: 0; }
+.process-behavior.selected-file {
+  background: #233024;
+  border-radius: 4px;
+  padding-inline: 8px;
+  margin-inline: -8px;
+}
+.file-open-result { color: var(--muted); font-size: 10px; }
+.file-open-result.failed { color: var(--danger); }
+.process-behavior .file-preview-link { color: var(--green); }
+.file-preview {
+  border: 1px solid var(--line);
+  background: #101c26;
+  border-radius: 7px;
+  min-width: 0;
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  max-height: 680px;
+}
+.file-preview-heading {
+  padding: 17px 16px 7px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.file-preview-heading h2 {
+  font-size: 16px;
+  margin-top: 5px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.file-preview-heading .button { padding: 4px 6px; font-size: 11px; }
+.file-preview-path {
+  padding: 0 16px;
+  font: 11px/1.7 var(--mono);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.file-preview-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  padding: 10px 16px 14px;
+  font-size: 10px;
+  color: var(--muted);
+}
+.file-result { color: var(--green); }
+.file-result.failed { color: var(--danger); }
+.file-preview-tabs {
+  display: flex;
+  gap: 22px;
+  border-bottom: 1px solid var(--line);
+  padding: 0 16px;
+}
+.file-preview-tabs button {
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 0 10px;
+  border-bottom: 2px solid transparent;
+}
+.file-preview-tabs button.active { color: var(--text); border-color: var(--green); }
+.file-preview-content { padding: 15px; overflow: auto; min-height: 260px; }
+.file-preview-content .key-values th { width: 96px; }
+.file-capture-note {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 8px 10px;
+  background: #162b27;
+  border-radius: 4px;
+  margin-bottom: 14px;
+}
+.file-capture-note.truncated { color: var(--orange); background: #302a20; }
+.file-code-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 10px;
+  margin-bottom: 10px;
+}
+.file-code {
+  margin: 0;
+  background: #0d1720;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 12px 0;
+  font: 11px/1.85 var(--mono);
+  color: #c2d4e2;
+}
+.file-line { display: grid; grid-template-columns: 34px minmax(0, 1fr); }
+.file-line-number {
+  color: var(--faint);
+  text-align: right;
+  padding-right: 10px;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+.file-line-text { white-space: pre-wrap; overflow-wrap: anywhere; padding-right: 12px; }
+.file-hex { overflow-x: auto; white-space: pre; padding: 12px; font-size: 10px; }
+.file-preview-empty {
+  padding: 25px 12px;
+  text-align: center;
+  color: var(--muted);
+}
+.file-empty-symbol {
+  display: block;
+  color: var(--orange);
+  font: 24px var(--mono);
+  margin-bottom: 14px;
+}
+.file-preview-empty h3 { color: var(--text); font-size: 12px; margin-bottom: 10px; }
+.file-preview-empty p { font-size: 11px; line-height: 1.8; }
+.file-preview-footer {
+  border-top: 1px solid var(--line);
+  padding: 10px 15px;
+  color: var(--faint);
+  font-size: 10px;
+}
+@media (max-width: 1200px) {
+  .process-workspace.preview-open { grid-template-columns: minmax(0, 1fr); }
+  .file-preview { position: static; max-height: 650px; }
+}
+@media (max-width: 560px) {
+  .file-preview-heading { padding: 14px 12px 7px; }
+  .file-preview-path { padding-inline: 12px; }
+  .file-preview-meta { padding-inline: 12px; }
+  .file-preview-content { padding: 11px; }
+  .file-preview-heading h2 { font-size: 14px; }
+  .file-preview-tabs { padding-inline: 12px; }
+  .file-preview-content .key-values th { width: 83px; }
+  .file-code { font-size: 10px; }
+  .file-hex { font-size: 10px; }
+  .file-line { grid-template-columns: 29px minmax(0, 1fr); }
+}

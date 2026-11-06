@@ -1,7 +1,7 @@
 //! Linux process ownership. Every ptrace/wait operation stays on this OS thread.
 
+mod processes;
 mod syscalls;
-mod tasks;
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -18,7 +18,7 @@ use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 pub struct Pipes {
     pub stdin: ChildStdin,
@@ -34,6 +34,7 @@ pub enum Streams {
 pub enum Event {
     Started { pid: i32, streams: Streams },
     Process { kind: &'static str, data: Value },
+    FileOpen(crate::collectors::file::Opened),
     RootExit(u8),
     Finished,
     Failed(String),
@@ -49,12 +50,23 @@ pub fn spawn(
     command: OsString,
     with_terminal: bool,
     sender: mpsc::Sender<Event>,
-    proxy: crate::proxy::Handle,
+    registry: crate::network::association::Registry,
+    network: oneshot::Sender<crate::network::Endpoints>,
+    capture_files: bool,
+    trust_overlay: Option<std::path::PathBuf>,
 ) -> io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("agenttomo-tracer".into())
         .spawn(move || {
-            if let Err(error) = run(command, with_terminal, &sender, proxy) {
+            if let Err(error) = run(
+                command,
+                with_terminal,
+                &sender,
+                registry,
+                network,
+                capture_files,
+                trust_overlay,
+            ) {
                 let _ = emit(&sender, Event::Failed(error.to_string()));
             }
             // EXITKILL applies to this tracing thread, including on error/panic.
@@ -65,13 +77,19 @@ fn run(
     command: OsString,
     with_terminal: bool,
     sender: &mpsc::Sender<Event>,
-    proxy: crate::proxy::Handle,
+    registry: crate::network::association::Registry,
+    network: oneshot::Sender<crate::network::Endpoints>,
+    capture_files: bool,
+    trust_overlay: Option<std::path::PathBuf>,
 ) -> io::Result<()> {
     // The helper cannot exec user code until we arm ptrace and send its gate byte.
     // SEIZE supports group-stop/LISTEN and avoids a pre_exec SIGSTOP/spawn deadlock.
     let (mut control, child_control) = UnixStream::pair()?;
     let mut launch = Command::new(std::env::current_exe()?);
     launch.arg("__tracee").arg("-c").arg(command);
+    if let Some(path) = trust_overlay {
+        launch.arg("--trust-overlay").arg(path);
+    }
     let master = if with_terminal {
         let pair = terminal::open()?;
         launch
@@ -104,6 +122,19 @@ fn run(
     drop(child_control);
     drop(launch);
     let root = Pid::from_raw(child.id() as i32);
+    control.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    let endpoints = match crate::network::namespace::receive(&mut control) {
+        Ok(endpoints) => endpoints,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let netns = std::fs::read_link(format!("/proc/{root}/ns/net"))?;
+    network
+        .send(endpoints)
+        .map_err(|_| io::Error::other("network proxy stopped during startup"))?;
     let mut ready = [0];
     if control.read_exact(&mut ready).is_err() || ready != *b"R" {
         let _ = child.kill();
@@ -128,6 +159,31 @@ fn run(
         )));
     }
     control.write_all(b"G")?;
+    if crate::syscall::SUPPORTED {
+        // The acknowledgement itself is a send/write on the private gate.
+        // Drive that stop before waiting for its byte; do not expose it as a
+        // target event. A failed filter installation instead reaches EXIT.
+        match waitpid(root, Some(WaitPidFlag::__WALL))? {
+            WaitStatus::PtraceEvent(pid, _, nix::libc::PTRACE_EVENT_SECCOMP) => {
+                let call = crate::syscall::Call::read(pid, None)?;
+                if call.args[0] != 3 {
+                    return Err(io::Error::other(
+                        "unexpected syscall before startup acknowledgement",
+                    ));
+                }
+                ptrace::cont(pid, None)?;
+            }
+            WaitStatus::PtraceEvent(pid, _, nix::libc::PTRACE_EVENT_EXIT) => {
+                ptrace::cont(pid, None)?;
+            }
+            WaitStatus::Exited(_, _) => {}
+            _ => {
+                return Err(io::Error::other(
+                    "helper stopped before startup acknowledgement",
+                ));
+            }
+        }
+    }
     let mut installed = [0];
     if control.read_exact(&mut installed).is_err() || installed != *b"F" {
         let mut error = String::new();
@@ -160,9 +216,9 @@ fn run(
     let mut known = HashSet::from([root]);
     let mut newborn = HashSet::new();
     let mut root_exited = false;
-    let mut calls = syscalls::Dispatch::new(proxy);
-    let mut tasks = tasks::Tasks::default();
-    tasks.child(root);
+    let mut calls = syscalls::Dispatch::new(registry, netns, capture_files);
+    let mut processes = processes::Registry::default();
+    processes.child(root);
     loop {
         let status = match waitpid(None, Some(WaitPidFlag::__WALL)) {
             Err(Errno::EINTR) => continue,
@@ -174,14 +230,17 @@ fn run(
                 calls.forget(pid);
                 known.remove(&pid);
                 newborn.remove(&pid);
-                emit(
-                    sender,
-                    Event::Process {
-                        kind: "process.exit",
-                        data: json!({"tid": pid.as_raw(), "task_id":tasks.id(pid), "exit_code": code}),
-                    },
-                )?;
-                tasks.remove(pid);
+                if let Some(identity) = processes.exit(pid) {
+                    let mut data = json!({"exit_code": code});
+                    crate::process::fields(Some(identity), &mut data);
+                    emit(
+                        sender,
+                        Event::Process {
+                            kind: "process.exit",
+                            data,
+                        },
+                    )?;
+                }
                 if pid == root {
                     root_exited = true;
                     emit(sender, Event::RootExit(code as u8))?;
@@ -191,14 +250,17 @@ fn run(
                 calls.forget(pid);
                 known.remove(&pid);
                 newborn.remove(&pid);
-                emit(
-                    sender,
-                    Event::Process {
-                        kind: "process.exit",
-                        data: json!({"tid": pid.as_raw(), "task_id":tasks.id(pid), "signal": signal as i32, "core_dumped": core_dumped}),
-                    },
-                )?;
-                tasks.remove(pid);
+                if let Some(identity) = processes.exit(pid) {
+                    let mut data = json!({"signal": signal as i32, "core_dumped": core_dumped});
+                    crate::process::fields(Some(identity), &mut data);
+                    emit(
+                        sender,
+                        Event::Process {
+                            kind: "process.exit",
+                            data,
+                        },
+                    )?;
+                }
                 if pid == root {
                     root_exited = true;
                     emit(sender, Event::RootExit(128 + signal as u8))?;
@@ -206,9 +268,12 @@ fn run(
             }
             WaitStatus::PtraceEvent(pid, signal, event) => {
                 let first_stop = known.insert(pid) | newborn.remove(&pid);
+                if event != nix::libc::PTRACE_EVENT_EXEC {
+                    processes.observe(pid);
+                }
                 match event {
                     nix::libc::PTRACE_EVENT_SECCOMP => {
-                        if let Err(error) = calls.enter(pid, tasks.id(pid)) {
+                        if let Err(error) = calls.enter(pid, processes.observe(pid)) {
                             if error.raw_os_error() != Some(nix::libc::ESRCH) {
                                 return Err(error);
                             }
@@ -227,13 +292,17 @@ fn run(
                             nix::libc::PTRACE_EVENT_VFORK => "process.vfork",
                             _ => "process.clone",
                         };
-                        emit(
-                            sender,
-                            Event::Process {
-                                kind,
-                                data: json!({"parent_tid": pid.as_raw(), "child_tid": new.as_raw(), "task_id":tasks.id(pid), "child_task_id":tasks.child(new)}),
-                            },
-                        )?;
+                        let parent = processes.observe(pid);
+                        let child = processes.child(new);
+                        if parent.is_none() || child.is_none() || parent != child {
+                            let mut data = json!({
+                                "parent_pid": parent.map(|p| p.pid),
+                                "child_pid": child.map(|p| p.pid),
+                                "child_process_instance_id": child.map(|p| p.process_instance_id),
+                            });
+                            crate::process::fields(parent, &mut data);
+                            emit(sender, Event::Process { kind, data })?;
+                        }
                     }
                     nix::libc::PTRACE_EVENT_EXEC => {
                         let old = Pid::from_raw(ptrace::getevent(pid)? as i32);
@@ -242,8 +311,9 @@ fn run(
                             known.remove(&old);
                             newborn.remove(&old);
                         }
-                        let mut data = exec_context(pid, old);
-                        data["task_id"] = tasks.exec(pid, old).into();
+                        let identity = processes.exec(pid, old);
+                        let mut data = exec_context(pid);
+                        crate::process::fields(Some(identity), &mut data);
                         emit(
                             sender,
                             Event::Process {
@@ -262,7 +332,7 @@ fn run(
             }
             WaitStatus::PtraceSyscall(pid) => {
                 match calls.exit(pid) {
-                    Ok(Some((kind, data))) => emit(sender, Event::Process { kind, data })?,
+                    Ok(Some(event)) => emit(sender, event)?,
                     Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => {
                         calls.forget(pid)
                     }
@@ -271,7 +341,9 @@ fn run(
                 }
                 resume(&calls, pid, None)?;
             }
-            WaitStatus::Stopped(pid, signal) => resume(&calls, pid, Some(signal))?,
+            WaitStatus::Stopped(pid, signal) => {
+                resume(&calls, pid, Some(signal))?;
+            }
             _ => {}
         }
     }
@@ -295,8 +367,8 @@ fn listen(pid: Pid) -> io::Result<()> {
     Ok(())
 }
 
-fn exec_context(pid: Pid, old: Pid) -> Value {
-    let mut data = json!({"tid": pid.as_raw(), "former_tid": old.as_raw()});
+fn exec_context(pid: Pid) -> Value {
+    let mut data = json!({});
     let path = format!("/proc/{pid}/cmdline");
     let mut raw = Vec::new();
     match std::fs::File::open(path)

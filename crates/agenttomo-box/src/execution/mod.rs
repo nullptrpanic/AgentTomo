@@ -4,6 +4,7 @@ pub(crate) mod child;
 pub(crate) mod collector;
 pub(crate) mod protocol;
 mod streams;
+pub(crate) mod trust;
 
 use std::ffi::OsStr;
 use std::io;
@@ -20,7 +21,12 @@ use tokio::sync::watch;
 use crate::recording;
 use protocol::{Input, Message};
 
-pub async fn run(command: &OsStr, output_dir: Option<&Path>) -> io::Result<u8> {
+pub async fn run(
+    command: &OsStr,
+    output_dir: Option<&Path>,
+    preview_limits: recording::file_preview::Limits,
+    http: crate::proxy::http::Options,
+) -> io::Result<u8> {
     let directory = output_dir
         .map(Path::to_path_buf)
         .map(Ok)
@@ -34,6 +40,11 @@ pub async fn run(command: &OsStr, output_dir: Option<&Path>) -> io::Result<u8> {
         .arg(command)
         .arg("--output-dir")
         .arg(directory)
+        .arg("--file-preview-max-bytes")
+        .arg(preview_limits.max_bytes.to_string())
+        .arg("--file-preview-total-bytes")
+        .arg(preview_limits.total_bytes.to_string())
+        .args(http.arguments())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());

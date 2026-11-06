@@ -1,4 +1,6 @@
-//! File-open observation only; no redirection and no dependency on networking.
+//! File-open observation and optional snapshot handles; independent of networking.
+
+mod preview;
 
 use crate::syscall::{Call, memory, result_fields};
 use nix::libc;
@@ -17,7 +19,13 @@ pub const SYSCALLS: &[(i64, &str)] = &[
 
 pub struct Attempt {
     pub data: Value,
+    handle: nix::unistd::Pid,
     started: Instant,
+}
+
+pub struct Opened {
+    pub data: Value,
+    pub content: Option<std::fs::File>,
 }
 
 pub fn enter(call: &Call) -> Option<Attempt> {
@@ -32,8 +40,8 @@ pub fn enter(call: &Call) -> Option<Attempt> {
         libc::AT_FDCWD
     };
     let path_pointer = call.args[usize::from(at)];
-    let mut data =
-        json!({"tid":call.tid.as_raw(),"task_id":call.task_id,"syscall":name,"dirfd":dirfd});
+    let mut data = json!({"syscall":name,"dirfd":dirfd});
+    crate::process::fields(call.process, &mut data);
     match memory::c_string(call.tid, path_pointer, 4096) {
         Ok((bytes, truncated)) => {
             data["path"] = String::from_utf8_lossy(&bytes).into_owned().into();
@@ -86,21 +94,25 @@ pub fn enter(call: &Call) -> Option<Attempt> {
     }
     Some(Attempt {
         data,
+        handle: call.tid,
         started: Instant::now(),
     })
 }
 
 impl Attempt {
-    pub fn finish(mut self, result: i64) -> Value {
+    pub fn finish(mut self, result: i64, capture: bool) -> Opened {
         result_fields(&mut self.data, result);
         self.data["duration_ns"] = json!(self.started.elapsed().as_nanos());
-        if result >= 0 {
-            let tid = self.data["tid"].as_i64().unwrap();
-            if let Ok(path) = std::fs::read_link(PathBuf::from(format!("/proc/{tid}/fd/{result}")))
-            {
-                self.data["resolved_path"] = path.to_string_lossy().into_owned().into();
-            }
+        if result >= 0
+            && let Ok(path) =
+                std::fs::read_link(PathBuf::from(format!("/proc/{}/fd/{result}", self.handle)))
+        {
+            self.data["resolved_path"] = path.to_string_lossy().into_owned().into();
         }
-        self.data
+        let content = preview::pin(self.handle, result, capture, &mut self.data);
+        Opened {
+            data: self.data,
+            content,
+        }
     }
 }

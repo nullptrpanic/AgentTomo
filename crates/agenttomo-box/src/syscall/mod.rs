@@ -2,7 +2,7 @@
 
 mod filter;
 pub mod memory;
-pub mod redirect;
+pub mod query;
 
 use nix::{errno::Errno, libc, unistd::Pid};
 use std::io;
@@ -47,22 +47,24 @@ impl Stop {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Call {
+    // Native ptrace handle, never an observation/association identity.
     pub tid: Pid,
-    pub task_id: u64,
+    pub process: Option<crate::process::Identity>,
     pub number: i64,
     pub args: [u64; 6],
 }
 
 impl Call {
-    pub fn read(tid: Pid, task_id: u64) -> io::Result<Self> {
+    pub fn read(tid: Pid, process: Option<crate::process::Identity>) -> io::Result<Self> {
         let stop = Stop::read(tid)?;
         if stop.op != 3 || stop.arch != NATIVE_ARCH {
             return Err(io::Error::other("unsupported syscall stop/ABI"));
         }
         Ok(Self {
             tid,
-            task_id,
+            process,
             number: stop.data[0] as i64,
             args: stop.data[1..7].try_into().unwrap(),
         })

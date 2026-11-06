@@ -2,7 +2,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::{path::PathBuf, time::Duration};
+use std::{os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -49,17 +49,48 @@ impl Drop for Server {
 }
 
 async fn start_server() -> Server {
+    start_server_with_docker_wrapper(None).await
+}
+
+async fn start_server_with_docker_wrapper(wrapper: Option<&str>) -> Server {
+    start_server_with_options(wrapper, &[]).await
+}
+
+async fn start_server_with_options(wrapper: Option<&str>, options: &[&str]) -> Server {
     let directory = std::env::temp_dir().join(format!(
         "agenttomo-playground-test-{}",
         uuid::Uuid::new_v4()
     ));
-    let mut server = Command::new(env!("CARGO_BIN_EXE_agenttomo-box"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agenttomo-box"));
+    command
         .args(["playground", "--listen", "127.0.0.1:0", "--output-dir"])
         .arg(&directory)
+        .args(options)
+        // Tests send terminal-style signals to this group, never to the test runner.
+        .process_group(0)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .unwrap();
+        .stderr(std::process::Stdio::inherit());
+    if let Some(wrapper) = wrapper {
+        let path = std::env::var_os("PATH").unwrap();
+        let real = std::env::split_paths(&path)
+            .map(|path| path.join("docker"))
+            .find(|path| path.is_file())
+            .expect("Docker CLI is required");
+        let bin = directory.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("docker");
+        std::fs::write(&script, wrapper).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        command
+            .env("AGENTTOMO_TEST_REAL_DOCKER", real)
+            .env("AGENTTOMO_TEST_GATE_DIR", &directory)
+            .env(
+                "PATH",
+                std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))
+                    .unwrap(),
+            );
+    }
+    let mut server = command.spawn().unwrap();
     let mut lines = BufReader::new(server.stdout.take().unwrap()).lines();
     let line = timeout(Duration::from_secs(15), lines.next_line())
         .await
@@ -76,6 +107,160 @@ async fn start_server() -> Server {
         child: server,
         directory,
         ws_url,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker access and the local agenttomo-playground-chrome:24.04 image"]
+async fn browser_bridge_requires_auth_and_a_live_owned_session() {
+    let mut server = start_server_with_options(
+        None,
+        &[
+            "--browser",
+            "--image",
+            "agenttomo-playground-chrome:24.04",
+            "--capture-http",
+        ],
+    )
+    .await;
+    let (mut terminal, _) = connect_async(&server.ws_url).await.unwrap();
+    let (container, id) = ready(&mut terminal).await;
+    let _guard = ContainerGuard(container.clone());
+    let url = server
+        .ws_url
+        .replace("/ws?", &format!("/api/sessions/{id}/desktop?"));
+    let unauthorized = url.split('?').next().unwrap();
+    assert!(
+        matches!(connect_async(unauthorized).await.unwrap_err(), tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 401)
+    );
+    let mut foreign = url.as_str().into_client_request().unwrap();
+    foreign
+        .headers_mut()
+        .insert("Origin", "https://other.example".parse().unwrap());
+    assert!(
+        matches!(connect_async(foreign).await.unwrap_err(), tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 403)
+    );
+    let missing = url.replace(&id, "00000000000000000000000000000000");
+    assert!(
+        matches!(connect_async(missing).await.unwrap_err(), tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 404)
+    );
+    let (mut display, _) = connect_async(&url).await.unwrap();
+    let greeting = timeout(Duration::from_secs(10), display.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(greeting, Message::Binary(bytes) if bytes.starts_with(b"RFB ")));
+    display.close(None).await.unwrap();
+    let (mut display, _) = connect_async(&url).await.unwrap();
+    let greeting = timeout(Duration::from_secs(10), display.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(greeting, Message::Binary(bytes) if bytes.starts_with(b"RFB ")));
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let output = Command::new("docker")
+                .args(["exec", &container, "pgrep", "--count", "--exact", "nc"])
+                .output()
+                .await
+                .unwrap();
+            if output.stdout == b"1\n" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("reconnecting leaked a VNC relay process");
+    terminal.close(None).await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while let Some(Ok(message)) = display.next().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("desktop bridge survived terminal disconnect");
+    removed(&container).await;
+    assert!(
+        matches!(connect_async(&url).await.unwrap_err(), tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 404)
+    );
+    server.stop().await;
+    let _ = std::fs::remove_dir_all(&server.directory);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker access and the local agenttomo-playground-chrome:24.04 image"]
+async fn server_shutdown_closes_an_active_desktop_without_http_capture() {
+    let mut server = start_server_with_options(
+        None,
+        &["--browser", "--image", "agenttomo-playground-chrome:24.04"],
+    )
+    .await;
+    let (mut terminal, _) = connect_async(&server.ws_url).await.unwrap();
+    let (container, id) = ready(&mut terminal).await;
+    let _guard = ContainerGuard(container.clone());
+    let url = server
+        .ws_url
+        .replace("/ws?", &format!("/api/sessions/{id}/desktop?"));
+    let (mut display, _) = connect_async(&url).await.unwrap();
+    let greeting = timeout(Duration::from_secs(10), display.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(greeting, Message::Binary(bytes) if bytes.starts_with(b"RFB ")));
+    server.stop().await;
+    removed(&container).await;
+    timeout(Duration::from_secs(3), async {
+        while let Some(Ok(message)) = display.next().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("desktop survived server shutdown");
+    let _ = std::fs::remove_dir_all(&server.directory);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker access and the local agenttomo-playground:24.04 image"]
+async fn browser_mode_reports_missing_image_helpers_and_removes_the_container() {
+    let mut server = start_server_with_options(None, &["--browser"]).await;
+    let (mut socket, _) = connect_async(&server.ws_url).await.unwrap();
+    let (container, message) = timeout(Duration::from_secs(15), async {
+        let mut container = String::new();
+        while let Some(Ok(Message::Text(text))) = socket.next().await {
+            let value: Value = serde_json::from_str(&text).unwrap();
+            if value["type"] == "session" {
+                container = value["container"].as_str().unwrap().to_owned();
+            }
+            if value["type"] == "error" {
+                return (container, value["message"].as_str().unwrap().to_owned());
+            }
+        }
+        panic!("missing desktop setup error");
+    })
+    .await
+    .unwrap();
+    assert!(message.contains("agenttomo-playground-chrome"), "{message}");
+    removed(&container).await;
+    server.stop().await;
+    let _ = std::fs::remove_dir_all(&server.directory);
+}
+
+// Failure-path tests intentionally leave a container behind before asserting.
+// Always clean up that specific fixture, including after a panic.
+struct ContainerGuard(String);
+impl Drop for ContainerGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "--force", "--volumes", &self.0])
+            .output();
     }
 }
 
@@ -125,7 +310,7 @@ async fn removed(container: &str) {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker access and a local ubuntu:24.04 image"]
+#[ignore = "requires Docker access and a local agenttomo-playground:24.04 image"]
 async fn docker_terminal_streams_real_traces_and_cleans_up() {
     let mut server = start_server().await;
     let ws_url = &server.ws_url;
@@ -155,7 +340,7 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
         .unwrap();
     socket
         .send(Message::Binary(
-            b"test -t 0 && printf 'PTY_OK\\n'; stty size; /bin/echo TRACE_VERIFIED\n"
+            b"test -t 0 && printf 'PTY_OK\\n'; stty size; if ifconfig lo >/dev/null && ip link show lo >/dev/null && curl --version >/dev/null && dig -v >/dev/null && jq -n -e '1 + 1 == 2' >/dev/null && python3 -c 'import socket'; then printf 'TOOLS_OK\\n'; else printf 'TOOLS_MISSING\\n'; fi; /bin/echo TRACE_VERIFIED\n"
                 .to_vec()
                 .into(),
         ))
@@ -164,7 +349,11 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
     let mut terminal = Vec::new();
     let mut traced_echo = false;
     timeout(Duration::from_secs(10), async {
-        while !traced_echo || !String::from_utf8_lossy(&terminal).contains("33 101\r\n") {
+        while !traced_echo
+            || !String::from_utf8_lossy(&terminal).contains("33 101\r\n")
+            || !(String::from_utf8_lossy(&terminal).contains("TOOLS_OK\r\n")
+                || String::from_utf8_lossy(&terminal).contains("TOOLS_MISSING\r\n"))
+        {
             match socket.next().await.unwrap().unwrap() {
                 Message::Binary(bytes) => terminal.extend(bytes),
                 Message::Text(text) => {
@@ -182,6 +371,11 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
     .await
     .expect("terminal output or matching trace was missing");
     assert!(String::from_utf8_lossy(&terminal).contains("PTY_OK\r\n"));
+    assert!(
+        String::from_utf8_lossy(&terminal).contains("TOOLS_OK\r\n"),
+        "{}",
+        String::from_utf8_lossy(&terminal)
+    );
     assert!(!container.is_empty());
     socket.close(None).await.unwrap();
     removed(&container).await;
@@ -190,7 +384,7 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker access and a local ubuntu:24.04 image"]
+#[ignore = "requires Docker access and a local agenttomo-playground:24.04 image"]
 async fn completion_flushes_descendant_traces_after_shell_exit() {
     let mut server = start_server().await;
     let (mut socket, _) = connect_async(&server.ws_url).await.unwrap();
@@ -257,7 +451,7 @@ async fn completion_flushes_descendant_traces_after_shell_exit() {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker access and a local ubuntu:24.04 image"]
+#[ignore = "requires Docker access and a local agenttomo-playground:24.04 image"]
 async fn server_shutdown_removes_an_active_container() {
     let mut server = start_server().await;
     let (mut socket, _) = connect_async(&server.ws_url).await.unwrap();
@@ -271,4 +465,119 @@ async fn server_shutdown_removes_an_active_container() {
     assert_eq!(result["reason"], "server_shutdown");
     assert_eq!(result["container_removed"], true);
     let _ = std::fs::remove_dir_all(&server.directory);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker access and a local agenttomo-playground:24.04 image"]
+async fn repeated_terminal_interrupts_do_not_interrupt_container_cleanup() {
+    // Gate the real rm command so the second Ctrl-C deterministically occurs
+    // while cleanup is running, rather than relying on Docker's timing.
+    let wrapper = r#"#!/bin/sh
+if [ "$1" = rm ]; then
+    echo ready > "$AGENTTOMO_TEST_GATE_DIR/removing"
+    while [ ! -f "$AGENTTOMO_TEST_GATE_DIR/release" ]; do sleep 0.01; done
+fi
+exec "$AGENTTOMO_TEST_REAL_DOCKER" "$@"
+"#;
+    let mut server = start_server_with_docker_wrapper(Some(wrapper)).await;
+    let (mut socket, _) = connect_async(&server.ws_url).await.unwrap();
+    let (container, id) = ready(&mut socket).await;
+    let _container = ContainerGuard(container.clone());
+    let group = nix::unistd::Pid::from_raw(server.child.id().unwrap() as i32);
+    nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGINT).unwrap();
+    timeout(Duration::from_secs(5), async {
+        while !server.directory.join("removing").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cleanup did not start");
+    nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGINT).unwrap();
+    std::fs::write(server.directory.join("release"), b"").unwrap();
+    assert!(
+        timeout(Duration::from_secs(15), server.child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    let result: Value = serde_json::from_slice(
+        &std::fs::read(server.directory.join(id).join("session-result.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["container_removed"], true, "{result}");
+    assert!(result["error"].is_null(), "{result}");
+    assert_eq!(result["reason"], "server_shutdown");
+    removed(&container).await;
+    let _ = std::fs::remove_dir_all(&server.directory);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker access and a local agenttomo-playground:24.04 image"]
+async fn cleanup_verifies_daemon_state_after_the_rm_client_reports_failure() {
+    // The daemon completes the real deletion, but the CLI fails before the
+    // server can receive a successful result, as with an interrupted client.
+    let wrapper = r#"#!/bin/sh
+if [ "$1" = rm ]; then
+    "$AGENTTOMO_TEST_REAL_DOCKER" "$@" || exit "$?"
+    exit 42
+fi
+exec "$AGENTTOMO_TEST_REAL_DOCKER" "$@"
+"#;
+    let mut server = start_server_with_docker_wrapper(Some(wrapper)).await;
+    let (mut socket, _) = connect_async(&server.ws_url).await.unwrap();
+    let (container, id) = ready(&mut socket).await;
+    let _container = ContainerGuard(container.clone());
+    server.stop().await;
+    removed(&container).await;
+    let result: Value = serde_json::from_slice(
+        &std::fs::read(server.directory.join(id).join("session-result.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["container_removed"], true, "{result}");
+    assert!(result["error"].is_null(), "{result}");
+    let _ = std::fs::remove_dir_all(&server.directory);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker access and a local agenttomo-playground:24.04 image"]
+async fn cleanup_reports_real_failures_instead_of_claiming_the_container_is_gone() {
+    for (failure, verification, expected) in [
+        ("exit 42", "", "exit status: 42"),
+        ("kill -KILL $$", "", "signal: 9"),
+        (
+            "exit 42",
+            "if [ \"$1\" = container ] && [ \"$2\" = ls ]; then echo 'verification denied' >&2; exit 43; fi",
+            "verification denied",
+        ),
+    ] {
+        let wrapper = format!(
+            "#!/bin/sh\nif [ \"$1\" = rm ]; then {failure}; fi\n{verification}\nexec \"$AGENTTOMO_TEST_REAL_DOCKER\" \"$@\"\n"
+        );
+        let mut server = start_server_with_docker_wrapper(Some(&wrapper)).await;
+        let (mut socket, _) = connect_async(&server.ws_url).await.unwrap();
+        let (container, id) = ready(&mut socket).await;
+        let _container = ContainerGuard(container.clone());
+        server.stop().await;
+        let result: Value = serde_json::from_slice(
+            &std::fs::read(server.directory.join(id).join("session-result.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["container_removed"], false, "{result}");
+        assert!(
+            result["error"].as_str().unwrap().contains(expected),
+            "{result}"
+        );
+        assert!(
+            Command::new("docker")
+                .args(["container", "inspect", &container])
+                .output()
+                .await
+                .unwrap()
+                .status
+                .success(),
+            "the fixture must really still exist"
+        );
+        let _ = std::fs::remove_dir_all(&server.directory);
+    }
 }

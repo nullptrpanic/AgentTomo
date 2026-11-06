@@ -545,7 +545,7 @@ fn traces_double_fork_and_setsid_after_root_exit_with_closed_stdio() {
     let root_pid = dir.pid("root.pid");
     let root_exit = events
         .iter()
-        .position(|e| e["kind"] == "process.exit" && e["data"]["tid"] == root_pid)
+        .position(|e| e["kind"] == "process.exit" && e["data"]["pid"] == root_pid)
         .unwrap();
     let later_exec = events
         .iter()
@@ -555,7 +555,7 @@ fn traces_double_fork_and_setsid_after_root_exit_with_closed_stdio() {
     assert!(
         events
             .iter()
-            .any(|e| e["kind"] == "process.exit" && e["data"]["tid"] == pid)
+            .any(|e| e["kind"] == "process.exit" && e["data"]["pid"] == pid)
     );
     assert!(
         events
@@ -593,11 +593,40 @@ fn waits_for_root_process_when_only_its_leader_thread_exits() {
         assert!(child.wait().success());
         assert_eq!(read_all(child.0.stdout.take().unwrap()), b"thread-output\n");
         dir.collection_finished();
-        assert!(dir.events().iter().any(|e| e["kind"] == "process.clone"));
+        let events = dir.events();
+        assert!(events.iter().all(|e| e["kind"] != "process.clone"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["kind"] == "process.exit")
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|e| e["kind"] == "process.exit")
+                .all(|e| e["data"]["pid"] == root_pid)
+        );
         if mode == "thread-exec" {
-            assert!(dir.events().iter().any(
-                |e| e["kind"] == "process.exec" && e["data"]["tid"] != e["data"]["former_tid"]
-            ));
+            let instances: std::collections::HashSet<_> = events
+                .iter()
+                .filter(|e| e["kind"] == "process.exec")
+                .map(|e| {
+                    assert_eq!(e["data"]["pid"], root_pid);
+                    e["data"]["process_instance_id"].as_u64().unwrap()
+                })
+                .collect();
+            assert_eq!(
+                instances.len(),
+                1,
+                "exec from a worker must retain the process identity"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e["kind"] == "process.exec" && e["data"]["argv"][0] == "thread-exec")
+            );
         }
     }
 }
