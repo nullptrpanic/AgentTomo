@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+umask 077
+# Chrome uses NSS, not the system PEM bundle. Only the disposable container's
+# user store is changed; the task CA is read from the existing trust overlay.
+ca=/etc/ssl/certs/agenttomo-task-ca.pem
+if [ -f "$ca" ]; then
+    database="$HOME/.local/share/pki/nssdb"
+    if [ -d "$HOME/.pki/nssdb" ]; then database="$HOME/.pki/nssdb"; fi
+    mkdir -p "$database"
+    if [ ! -f "$database/cert9.db" ]; then
+        certutil -N --empty-password -d "sql:$database"
+    fi
+    certutil -A -d "sql:$database" -t 'C,,' -n 'AgentTomo task CA' -i "$ca"
+fi
+# QUIC bypasses the HTTP-over-TCP inspector. Retain Chrome's sandbox and normal
+# certificate verification. A fresh container gives every session its own profile.
+exec /opt/google/chrome/google-chrome --user-data-dir=/tmp/agenttomo-chrome-profile \
+    --disable-quic --no-first-run --no-default-browser-check --start-maximized "$@"

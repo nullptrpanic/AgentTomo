@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+# The collector announces its root PID before desktop setup starts. Wait here
+# so Chrome inherits tracing and the task's network/trust namespaces.
+attempt=0
+until [ -f /tmp/agenttomo-desktop/ready ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 200 ]; then printf 'Desktop startup timed out\n' >&2; exit 1; fi
+    sleep 0.1
+done
+agenttomo-chrome about:blank >/tmp/agenttomo-chrome.log 2>&1 &
+printf 'Chrome is opening in the Browser tab. Log: /tmp/agenttomo-chrome.log\n'
+exec /bin/bash --noprofile --norc -i
