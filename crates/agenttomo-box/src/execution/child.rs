@@ -9,9 +9,20 @@ use std::os::unix::process::CommandExt;
 pub fn exec(command: &OsStr, trust_overlay: Option<&std::path::Path>) -> u8 {
     // fd 3 is a dedicated, unbuffered gate, separate from the target's streams.
     let mut control = unsafe { UnixStream::from_raw_fd(3) };
+    let ca = if trust_overlay.is_some() {
+        match super::trust::receive(&mut control) {
+            Ok(ca) => ca,
+            Err(error) => {
+                let _ = write!(control, "Ecannot receive task CA: {error}");
+                return 125;
+            }
+        }
+    } else {
+        Vec::new()
+    };
     if let Err(error) = crate::network::namespace::prepare(&control, || {
         if let Some(directory) = trust_overlay {
-            super::trust::install(directory)?;
+            super::trust::install(directory, &ca)?;
         }
         Ok(())
     }) {

@@ -4,6 +4,7 @@ use nix::{errno::Errno, libc};
 use std::{
     ffi::CString,
     fs, io,
+    io::Read,
     os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
 };
@@ -13,6 +14,7 @@ const BUNDLE: &str = "ca-certificates.crt";
 
 pub struct Overlay {
     directory: PathBuf,
+    pem: String,
 }
 
 impl Overlay {
@@ -20,15 +22,18 @@ impl Overlay {
         let directory =
             std::env::temp_dir().join(format!("agenttomo-trust-{}", uuid::Uuid::new_v4()));
         fs::DirBuilder::new().mode(0o700).create(&directory)?;
-        let overlay = Self { directory };
-        // This is a public certificate, never a signing key. The helper reads
-        // it before covering this directory with private tmpfs.
-        fs::write(overlay.directory.join("ca.pem"), pem)?;
-        Ok(overlay)
+        Ok(Self {
+            directory,
+            pem: pem.to_owned(),
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.directory
+    }
+
+    pub fn handoff(&self) -> (PathBuf, String) {
+        (self.path().to_owned(), self.pem.clone())
     }
 }
 
@@ -61,14 +66,27 @@ fn mount(
     Ok(())
 }
 
-pub fn install(directory: &Path) -> io::Result<()> {
+pub fn receive(control: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut length = [0; 4];
+    control.read_exact(&mut length)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if !(1..=65536).contains(&length) {
+        return Err(io::Error::other(
+            "invalid task CA length in startup handoff",
+        ));
+    }
+    let mut pem = vec![0; length];
+    control.read_exact(&mut pem)?;
+    Ok(pem)
+}
+
+pub fn install(directory: &Path, ca: &[u8]) -> io::Result<()> {
     let install = || -> io::Result<()> {
-        let ca = fs::read(directory.join("ca.pem"))?;
         let mut bundle = fs::read(Path::new(CERTS).join(BUNDLE))?;
         if !bundle.ends_with(b"\n") {
             bundle.push(b'\n');
         }
-        bundle.extend_from_slice(&ca);
+        bundle.extend_from_slice(ca);
         Errno::result(unsafe { libc::unshare(libc::CLONE_NEWNS) })?;
         mount("", Path::new("/"), "", libc::MS_REC | libc::MS_PRIVATE, "")?;
         mount(
@@ -100,4 +118,35 @@ pub fn install(directory: &Path) -> io::Result<()> {
         Ok(())
     };
     install().map_err(|error| io::Error::other(format!("cannot inject task CA through OverlayFS into {CERTS}/{BUNDLE}: {error}; capture requires user/mount namespaces and OverlayFS (no fallback)")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_mountpoint_never_contains_an_archived_ca() {
+        let overlay = Overlay::new("public CA fixture").unwrap();
+        let path = overlay.path().to_owned();
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+        drop(overlay);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn startup_handoff_is_bounded_and_leaves_the_next_gate_byte_unread() {
+        let pem = b"public certificate";
+        let mut bytes = (pem.len() as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(pem);
+        bytes.push(b'G');
+        let mut cursor = std::io::Cursor::new(bytes);
+        assert_eq!(receive(&mut cursor).unwrap(), pem);
+        let mut next = [0];
+        cursor.read_exact(&mut next).unwrap();
+        assert_eq!(&next, b"G");
+        for length in [0_u32, 65537, u32::MAX] {
+            assert!(receive(&mut length.to_be_bytes().as_slice()).is_err());
+        }
+        assert!(receive(&mut [0, 0, 0, 5, b'x'].as_slice()).is_err());
+    }
 }

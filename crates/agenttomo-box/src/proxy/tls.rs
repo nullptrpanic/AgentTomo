@@ -1,26 +1,55 @@
 //! Task-local signing material. Private keys never leave the collector's memory.
+use moka::sync::Cache;
 use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
-    pki_types::{CertificateDer, PrivatePkcs8KeyDer},
+    pki_types::{CertificateDer, DnsName, PrivatePkcs8KeyDer},
 };
-use std::{
-    io,
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{io, net::IpAddr, sync::Arc, time::Duration};
+use time::OffsetDateTime;
+
+#[cfg(test)]
+mod tests;
 
 pub struct Authority {
     issuer: Issuer<'static, KeyPair>,
     certificate: CertificateDer<'static>,
     pub pem: String,
     pub client: Arc<ClientConfig>,
+    servers: Cache<String, Arc<ServerConfig>>,
 }
 
-fn validity(params: &mut CertificateParams) {
-    let now = SystemTime::now();
-    params.not_before = (now - Duration::from_secs(300)).into();
-    params.not_after = (now + Duration::from_secs(24 * 3600)).into();
+fn validity(params: &mut CertificateParams, now: OffsetDateTime, expires: OffsetDateTime) {
+    params.not_before = now - time::Duration::minutes(5);
+    params.not_after = expires;
+}
+
+fn root_expiry(now: OffsetDateTime) -> Result<OffsetDateTime, time::error::ComponentRange> {
+    let year = now.year() + 10;
+    // A February 29 anniversary falls on February 28 in a non-leap year.
+    now.replace_year(year)
+        .or_else(|_| now.replace_day(28)?.replace_year(year))
+}
+
+fn certificate_name(hostname: &str) -> io::Result<String> {
+    let name = hostname
+        .strip_suffix('.')
+        .unwrap_or(hostname)
+        .to_ascii_lowercase();
+    if let Ok(address) = name.parse::<IpAddr>() {
+        return Ok(address.to_string());
+    }
+    DnsName::try_from(hostname).map_err(io::Error::other)?;
+    let Some(domain) = psl::domain(name.as_bytes()).filter(|domain| domain.suffix().is_known())
+    else {
+        return Ok(name);
+    };
+    let base = if domain.as_bytes() == name.as_bytes() {
+        name.as_str()
+    } else {
+        name.split_once('.').expect("subdomain has a parent").1
+    };
+    Ok(format!("*.{base}"))
 }
 
 impl Authority {
@@ -39,17 +68,21 @@ impl Authority {
             .with_no_client_auth();
         client.alpn_protocols = vec![b"http/1.1".to_vec()];
         let mut params = CertificateParams::default();
-        validity(&mut params);
+        let now = OffsetDateTime::now_utc();
+        validity(
+            &mut params,
+            now,
+            root_expiry(now).map_err(io::Error::other)?,
+        );
         params.is_ca = rcgen::IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages = vec![
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
         params.distinguished_name = DistinguishedName::new();
-        params.distinguished_name.push(
-            DnType::CommonName,
-            format!("AgentTomo task {}", uuid::Uuid::new_v4()),
-        );
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "AgentTomo Root CA");
         let key = KeyPair::generate().map_err(io::Error::other)?;
         let certificate = params.self_signed(&key).map_err(io::Error::other)?;
         Ok(Self {
@@ -57,14 +90,31 @@ impl Authority {
             certificate: certificate.der().clone(),
             issuer: Issuer::new(params, key),
             client: Arc::new(client),
+            servers: Cache::builder()
+                .max_capacity(1024)
+                .time_to_live(Duration::from_secs(3600))
+                .build(),
         })
     }
 
     pub fn server(&self, name: &str) -> io::Result<Arc<ServerConfig>> {
-        // rcgen recognizes IP SANs as well as DNS names. Never fall back to a
-        // wildcard or a certificate for an unrelated host when SNI is absent.
-        let mut params = CertificateParams::new(vec![name.to_owned()]).map_err(io::Error::other)?;
-        validity(&mut params);
+        let name = certificate_name(name)?;
+        self.servers
+            .try_get_with(name.clone(), || self.sign(&name))
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+
+    fn sign(&self, name: &str) -> io::Result<Arc<ServerConfig>> {
+        let mut names = vec![name.to_owned()];
+        if let Some(base) = name.strip_prefix("*.") {
+            names.push(base.to_owned());
+        }
+        // rcgen writes IP addresses as IP SANs and other names as DNS SANs.
+        let mut params = CertificateParams::new(names).map_err(io::Error::other)?;
+        let now = OffsetDateTime::now_utc();
+        validity(&mut params, now, now + time::Duration::days(1));
+        params.distinguished_name = DistinguishedName::new();
+        params.distinguished_name.push(DnType::CommonName, name);
         params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
         // Required by strict X.509 clients (including Python 3.13 defaults).
         params.use_authority_key_identifier_extension = true;

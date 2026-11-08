@@ -77,10 +77,6 @@ impl Inspection {
             return Ok(None);
         }
         let authority = Authority::new()?;
-        use tokio::io::AsyncWriteExt;
-        let mut ca = crate::recording::create_log(directory, "task-ca.pem").await?;
-        ca.write_all(authority.pem.as_bytes()).await?;
-        ca.flush().await?;
         Ok(Some(Arc::new(Self {
             authority,
             store: Store::create(directory, options.limits).await?,

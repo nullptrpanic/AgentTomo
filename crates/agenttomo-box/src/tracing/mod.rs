@@ -53,7 +53,7 @@ pub fn spawn(
     registry: crate::network::association::Registry,
     network: oneshot::Sender<crate::network::Endpoints>,
     capture_files: bool,
-    trust_overlay: Option<std::path::PathBuf>,
+    trust_overlay: Option<(std::path::PathBuf, String)>,
 ) -> io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("agenttomo-tracer".into())
@@ -80,14 +80,14 @@ fn run(
     registry: crate::network::association::Registry,
     network: oneshot::Sender<crate::network::Endpoints>,
     capture_files: bool,
-    trust_overlay: Option<std::path::PathBuf>,
+    trust_overlay: Option<(std::path::PathBuf, String)>,
 ) -> io::Result<()> {
     // The helper cannot exec user code until we arm ptrace and send its gate byte.
     // SEIZE supports group-stop/LISTEN and avoids a pre_exec SIGSTOP/spawn deadlock.
     let (mut control, child_control) = UnixStream::pair()?;
     let mut launch = Command::new(std::env::current_exe()?);
     launch.arg("__tracee").arg("-c").arg(command);
-    if let Some(path) = trust_overlay {
+    if let Some((path, _)) = &trust_overlay {
         launch.arg("--trust-overlay").arg(path);
     }
     let master = if with_terminal {
@@ -123,7 +123,16 @@ fn run(
     drop(launch);
     let root = Pid::from_raw(child.id() as i32);
     control.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
-    let endpoints = match crate::network::namespace::receive(&mut control) {
+    control.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+    let setup = (|| {
+        if let Some((_, pem)) = &trust_overlay {
+            let length = u32::try_from(pem.len()).map_err(io::Error::other)?;
+            control.write_all(&length.to_be_bytes())?;
+            control.write_all(pem.as_bytes())?;
+        }
+        crate::network::namespace::receive(&mut control)
+    })();
+    let endpoints = match setup {
         Ok(endpoints) => endpoints,
         Err(error) => {
             let _ = child.kill();

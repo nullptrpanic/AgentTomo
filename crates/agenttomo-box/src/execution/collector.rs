@@ -90,7 +90,7 @@ async fn collect(
         registry,
         network,
         capture_files,
-        trust.as_ref().map(|overlay| overlay.path().to_owned()),
+        trust.as_ref().map(super::trust::Overlay::handoff),
     )?;
     let (pid, streams) = match events.recv().await {
         Some(Event::Started { pid, streams }) => (pid, streams),

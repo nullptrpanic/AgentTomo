@@ -164,9 +164,74 @@ fn https_uses_overlay_trust_without_changing_the_original_bundle() {
         std::fs::read("/etc/ssl/certs/ca-certificates.crt").unwrap(),
         before
     );
-    let public_ca = std::fs::read_to_string(fixture.0.join("run/task-ca.pem")).unwrap();
-    assert!(public_ca.contains("BEGIN CERTIFICATE"));
-    assert!(!public_ca.contains("PRIVATE KEY"));
+    assert!(
+        !fixture.0.join("run/task-ca.pem").exists(),
+        "task CA must not be archived"
+    );
+}
+
+#[test]
+fn task_trust_files_are_available_to_the_target_without_saved_previews() {
+    let fixture = fixture();
+    let script = r#"
+from pathlib import Path
+import hashlib
+import os
+ca = Path('/etc/ssl/certs/agenttomo-task-ca.pem').read_bytes()
+assert ca in Path('/etc/ssl/certs/ca-certificates.crt').read_bytes()
+for flags in [os.O_WRONLY, os.O_PATH]:
+    fd = os.open('/etc/ssl/certs/agenttomo-task-ca.pem', flags)
+    os.close(fd)
+Path('ordinary.txt').write_text('ordinary-preview')
+assert Path('ordinary.txt').read_text() == 'ordinary-preview'
+# Cover the NSS database paths used by the Chrome launcher, plus its journal.
+for directory in ['home/.local/share/pki/nssdb', 'home/.pki/nssdb']:
+    path = Path(directory)
+    path.mkdir(parents=True, exist_ok=True)
+    for name in ['cert9.db', 'cert9.db-wal', 'cert9.db-journal']:
+        file = path / name
+        file.write_bytes(ca)
+        assert file.read_bytes() == ca
+print(hashlib.sha256(ca).hexdigest())
+"#;
+    std::fs::write(fixture.0.join("trust_probe.py"), script).unwrap();
+    let mut command = fixture.command("exec python3 trust_probe.py");
+    command.args(["--capture-http", "--file-preview-total-bytes", "33554432"]);
+    let output = Fixture::wait(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = fixture.events();
+    for path in [
+        "/etc/ssl/certs/agenttomo-task-ca.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "home/.local/share/pki/nssdb/cert9.db",
+        "home/.pki/nssdb/cert9.db-wal",
+    ] {
+        let opens: Vec<_> = events
+            .iter()
+            .filter(|event| event["kind"] == "file.open" && event["data"]["path"] == path)
+            .collect();
+        assert!(!opens.is_empty(), "{path}");
+        for event in opens {
+            assert_eq!(
+                event["data"]["preview"],
+                serde_json::json!({
+                    "status": "unavailable", "source": "open_snapshot", "reason": "task_trust_material"
+                }),
+                "{event}"
+            );
+        }
+    }
+    assert!(events.iter().any(|event| event["kind"] == "file.open"
+        && event["data"]["path"] == "ordinary.txt"
+        && event["data"]["preview"]["status"] == "complete"));
+    assert!(!fixture.0.join("run/task-ca.pem").exists());
+    let ca = std::fs::read(fixture.0.join("home/.pki/nssdb/cert9.db")).unwrap();
+    let saved = std::fs::read(fixture.0.join("run/file-previews.bin")).unwrap();
+    assert!(!saved.windows(ca.len()).any(|bytes| bytes == ca));
 }
 
 #[test]
