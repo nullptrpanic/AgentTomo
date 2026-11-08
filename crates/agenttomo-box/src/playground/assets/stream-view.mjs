@@ -1,12 +1,13 @@
 import { StreamModel } from "./stream-model.mjs";
 import { previewContent } from "./file-preview.mjs";
 import { copyText } from "./copy-text.mjs";
+import { copyIcon } from "./icons.mjs";
 
 export class StreamView {
   constructor(root, row, load, onSelect) {
     this.root = root; this.requestId = row.id; this.row = row; this.load = load; this.onSelect = onSelect;
     this.model = new StreamModel(); this.active = true; this.version = 0;
-    root.innerHTML = `<div class="stream-toolbar"><strong class="stream-state"></strong><button type="button" class="stream-follow" aria-pressed="true">Follow latest</button></div><p class="stream-retention" role="status">Loading recent messages…</p><div class="stream-list" role="list" aria-label="Stream messages"></div><div class="traffic-body-tools"><strong>Message</strong><button type="button" class="stream-copy" disabled>Copy content</button></div><p class="stream-payload-status" role="status"></p><pre class="traffic-body stream-payload"></pre>`;
+    root.innerHTML = `<div class="stream-toolbar"><strong class="stream-state"></strong><button type="button" class="stream-follow" aria-pressed="true">Follow latest</button></div><p class="stream-retention" role="status">Loading recent messages…</p><div class="stream-list" role="list" aria-label="Stream messages"></div><div class="traffic-body-tools"><strong>Message</strong><button type="button" class="stream-copy traffic-icon" aria-label="Copy content" title="Copy content" disabled>${copyIcon}</button></div><p class="stream-payload-status" role="status"></p><pre class="traffic-body stream-payload"></pre>`;
     this.list = root.querySelector(".stream-list");
     this.follow = root.querySelector(".stream-follow");
     this.follow.onclick = () => { this.model.latest(); this.renderMessages(); this.renderPayload(); };
@@ -79,6 +80,8 @@ export class StreamView {
       body.textContent = content.text || "(empty message)";
       status.textContent = `${message.kind} · ${message.captured_bytes} / ${message.observed_bytes} B retained${message.event_id ? ` · id ${message.event_id}` : ""}${message.frames ? ` · ${message.frames} frame(s)` : ""}${message.close_code ? ` · close ${message.close_code}` : ""}${message.decoded === false ? " · extension bytes; not decoded" : message.compressed ? " · decompressed" : ""}${message.truncated ? " · prefix only" : ""}${message.complete === false ? " · incomplete" : ""}`;
       copy.disabled = false;
+      copy.title = content.format === "hex" ? "Copy hex" : "Copy content";
+      copy.setAttribute("aria-label", copy.title);
       copy.onclick = async () => { try { await copyText(content.text); if (this.active && version === this.version) status.textContent = "Displayed message copied."; } catch (error) { if (this.active && version === this.version) status.textContent = error.message; } };
     } catch (error) {
       if (this.active && version === this.version) status.textContent = error.status === 410 ? "Message expired from the sliding window." : `Message unavailable: ${error.message}`;

@@ -1,4 +1,5 @@
 //! Serve retained payload ranges, never arbitrary file paths from the browser.
+mod decoding;
 
 use super::{Access, App};
 use axum::{
@@ -26,6 +27,11 @@ pub(super) struct Range {
     length: u32,
 }
 
+#[derive(Deserialize)]
+pub(super) struct HttpOptions {
+    decode: Option<String>,
+}
+
 pub async fn file_preview(
     State(app): State<App>,
     Path(session): Path<String>,
@@ -37,6 +43,7 @@ pub async fn file_preview(
         range,
         crate::recording::file_preview::PAYLOAD_FILE,
         crate::recording::file_preview::MAX_PREVIEW_BYTES,
+        None,
     )
     .await
 }
@@ -45,6 +52,7 @@ pub async fn http_body(
     State(app): State<App>,
     Path(session): Path<String>,
     Query(range): Query<Range>,
+    Query(options): Query<HttpOptions>,
 ) -> Response {
     read(
         app,
@@ -52,6 +60,7 @@ pub async fn http_body(
         range,
         crate::recording::http::PAYLOAD_FILE,
         crate::recording::http::MAX_BODY_BYTES,
+        options.decode,
     )
     .await
 }
@@ -62,6 +71,7 @@ async fn read(
     range: Range,
     payload_file: &'static str,
     max_bytes: u32,
+    decode: Option<String>,
 ) -> Response {
     if !range.access.authorized(&app) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -69,6 +79,7 @@ async fn read(
     if session.len() != 32
         || !session.bytes().all(|byte| byte.is_ascii_hexdigit())
         || range.length > max_bytes
+        || decode.as_ref().is_some_and(|value| value.len() > 128)
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -94,17 +105,24 @@ async fn read(
         }
         let mut bytes = vec![0; range.length as usize];
         file.read_exact_at(&mut bytes, range.offset)?;
-        Ok::<_, io::Error>(bytes)
+        Ok::<_, io::Error>(decoding::decode(
+            bytes,
+            decode.as_deref().unwrap_or("identity"),
+        ))
     })
     .await;
     match result {
-        Ok(Ok(bytes)) => (
+        Ok(Ok(body)) => (
             [
                 (header::CONTENT_TYPE, "application/octet-stream"),
                 (header::CACHE_CONTROL, "no-store"),
                 (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (
+                    header::HeaderName::from_static("x-agenttomo-decoding"),
+                    body.status,
+                ),
             ],
-            bytes,
+            body.bytes,
         )
             .into_response(),
         Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
@@ -115,18 +133,24 @@ async fn read(
     }
 }
 
-pub(super) fn run_directory(root: &FsPath, session: &str) -> io::Result<File> {
-    let mut dir = OpenOptions::new()
+pub(super) fn session_directory(root: &FsPath, session: &str) -> io::Result<File> {
+    let dir = OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
         .open(root)?;
-    for part in [session, "run"] {
-        dir = File::from(openat(
-            &dir,
-            part,
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )?);
-    }
-    Ok(dir)
+    Ok(File::from(openat(
+        &dir,
+        session,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?))
+}
+
+pub(super) fn run_directory(root: &FsPath, session: &str) -> io::Result<File> {
+    Ok(File::from(openat(
+        session_directory(root, session)?,
+        "run",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?))
 }

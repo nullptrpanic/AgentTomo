@@ -25,3 +25,19 @@ test("UI retention evicts whole exchanges and late bodies do not resurrect them"
   assert.equal(model.add(event("request.body", 1)), null);
   assert.equal(model.entries.size, 2);
 });
+
+test("connection navigation finds all keep-alive requests without guessing by domain or PID", () => {
+  const model = new TrafficModel(3);
+  model.add(event("response", 1, { connection_id: 9 }));
+  model.add(event("request", 1, { connection_id: 9, url: "https://same.test/a" }));
+  model.add(event("request", 2, { connection_id: 9, url: "https://same.test/b" }));
+  model.add(event("request", 3, { connection_id: 10, url: "https://same.test/a" }));
+  const connection = { kind: "network.upstream", data: { connection_id: 9 } };
+  assert.deepEqual(model.matching(connection).map(row => row.id), [1, 2]);
+  assert.deepEqual(model.visible("/b", 9).map(row => row.id), [2]);
+  assert.deepEqual(model.matching(event("response.body", 2, { connection_id: 9 })).map(row => row.id), [2]);
+  assert.deepEqual(model.matching({ kind: "network.udp.send", data: {} }), []);
+  model.add(event("request", 4, { connection_id: 11 }));
+  assert.deepEqual(model.matching(connection).map(row => row.id), [2]);
+  assert.deepEqual(model.matching(event("request.body", 1, { connection_id: 9 })), []);
+});

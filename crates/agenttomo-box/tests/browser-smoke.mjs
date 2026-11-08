@@ -6,6 +6,7 @@ import { once } from "node:events";
 import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
+import { gzipSync } from "node:zlib";
 
 const { chromium } = await import(process.env.AGENTTOMO_PLAYWRIGHT_MODULE || "playwright");
 const repo = fileURLToPath(new URL("../../..", import.meta.url));
@@ -14,7 +15,7 @@ const docker = (...args) => execFileSync("docker", args, { encoding: "utf8", tim
 const bridge = JSON.parse(docker("network", "inspect", "bridge"))[0].IPAM.Config[0].Gateway;
 const httpsUrl = new URL(process.env.AGENTTOMO_HTTPS_TEST_URL || "https://www.baidu.com/").href;
 const html = "<!doctype html><html><title>AgentTomo Chrome</title><body>chrome-observed</body></html>";
-const fixture = createServer((_req, res) => { res.setHeader("content-type", "text/html"); res.end(html); });
+const fixture = createServer((_req, res) => { res.setHeader("content-type", "text/html; charset=utf-8"); res.setHeader("content-encoding", "gzip"); res.end(gzipSync(html)); });
 fixture.listen(0, bridge);
 await once(fixture, "listening");
 const httpUrl = `http://${bridge}:${fixture.address().port}/chrome-observation`;
@@ -83,9 +84,20 @@ try {
   assert.ok(events.some(e => e.kind === "process.exec" && e.data.pid === request.data.pid && e.data.argv?.includes("--utility-sub-type=network.mojom.NetworkService")));
   assert.ok(events.some(e => e.kind === "file.open"));
   assert.ok(!events.some(e => e.kind === "process.exec" && ["Xvfb", "x11vnc", "openbox"].includes(e.data.argv?.[0]?.split("/").pop())));
-  await page.locator("[data-observation=traffic]").click();
-  await page.locator('[aria-label="Filter traffic"]').fill("/chrome-observation");
-  await page.locator(".traffic-row").click();
+  await page.locator(`.process-node[data-pid="${request.data.pid}"]`).last().evaluate(node => {
+    for (let parent = node; parent; parent = parent.parentElement) if (parent.tagName === "DETAILS") parent.open = true;
+  });
+  const connections = events.filter(e => e.kind === "network.upstream" && e.data.destination === `${bridge}:${fixture.address().port}`);
+  const connectionIndex = connections.findIndex(e => e.data.connection_id === request.data.connection_id);
+  assert.ok(connectionIndex >= 0);
+  await page.locator(".event-row").filter({ has: page.locator(".event-type", { hasText: /^network\.upstream$/ }) }).filter({ hasText: `${bridge}:${fixture.address().port}` }).nth(connectionIndex).click();
+  assert.ok(await page.locator("#traffic").isVisible(), "connection event must open Traffic");
+  assert.ok((await page.locator(".traffic-navigation").textContent()).includes(`Connection #${request.data.connection_id}`));
+  await until(async () => (await page.locator(".traffic-body").textContent()).includes("chrome-observed"));
+  assert.ok((await page.locator(".traffic-body-status").textContent()).includes("decompressed"));
+  await page.locator("[data-body-mode=raw]").click();
+  await until(async () => (await page.locator(".traffic-body").textContent()).includes("1f 8b 08"));
+  await page.locator("[data-body-mode=decoded]").click();
   await until(async () => (await page.locator(".traffic-body").textContent()).includes("chrome-observed"));
   await page.locator("[data-observation=process]").click();
   assert.ok(await page.locator(".process-node > summary").filter({ hasText: `PID ${request.data.pid}` }).count());
@@ -103,9 +115,11 @@ try {
   assert.equal(nss.replace(/\s/g, ""), ca.replace(/\s/g, ""));
   assert.equal(docker("exec", session.container, "cat", "/etc/ssl/certs/ca-certificates.crt").includes(ca), false);
   await page.locator("[data-observation=traffic]").click();
+  await page.locator(".traffic-show-all").click();
   await page.locator('[aria-label="Filter traffic"]').fill(new URL(httpsUrl).hostname);
   await page.locator(".traffic-row").filter({ hasText: httpsUrl }).first().click();
   await until(async () => (await page.locator(".traffic-body").textContent()).length > 0);
+  assert.match(await page.locator(".traffic-body").textContent(), /<!doctype|<html/i, "HTTPS HTML must display as readable markup");
   if (process.env.AGENTTOMO_TEST_ARTIFACTS) {
     await mkdir(process.env.AGENTTOMO_TEST_ARTIFACTS, { recursive: true });
     await page.screenshot({ path: `${process.env.AGENTTOMO_TEST_ARTIFACTS}/chrome-https.png`, fullPage: true });
@@ -114,14 +128,47 @@ try {
   await until(async () => await page.locator("#browser-status").textContent() === "Connected · Chrome");
   await page.locator("[data-workspace=terminal]").click();
   assert.ok(await page.locator("#terminal").isVisible());
+  const separator = page.locator("#panel-resizer");
+  const initial = await page.locator(".terminal-panel").boundingBox();
+  const handle = await separator.boundingBox();
+  await page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(handle.x - 130, handle.y + handle.height / 2, { steps: 10 });
+  await page.mouse.up();
+  const resized = await page.locator(".terminal-panel").boundingBox();
+  assert.ok(resized.width < initial.width - 100, "drag must change panel widths");
+  await separator.press("ArrowRight");
+  assert.ok((await page.locator(".terminal-panel").boundingBox()).width > resized.width + 15, "keyboard resizing");
+  await separator.press("Home");
+  assert.ok(Math.abs((await page.locator(".terminal-panel").boundingBox()).width - 320) <= 1, "workspace minimum width");
+  await separator.dblclick();
+  await until(async () => Math.abs((await page.locator(".terminal-panel").boundingBox()).width - initial.width) < 2);
+  await page.locator("#terminal").click();
+  const previewPath = "/tmp/agenttomo-preview-regression.json";
+  await page.keyboard.type(`printf '{"preview":"after-browser-startup"}\\n' > ${previewPath}; cat ${previewPath}\n`, { delay: 5 });
+  await until(() => events.some(e => e.kind === "file.open" && e.data.path === previewPath && e.data.result >= 0 && (e.data.flags & 3) === 0));
+  const previewEvent = events.find(e => e.kind === "file.open" && e.data.path === previewPath && e.data.result >= 0 && (e.data.flags & 3) === 0);
+  assert.equal(previewEvent.data.preview?.status, "complete", JSON.stringify(previewEvent.data.preview));
+  assert.ok(events.some(e => e.kind === "file.open" && e.data.preview?.reused), "repeated file snapshots must reuse storage");
+  await page.locator("[data-observation=process]").click();
+  await page.locator(`.process-node[data-pid="${previewEvent.data.pid}"]`).last().evaluate(node => {
+    for (let parent = node; parent; parent = parent.parentElement) if (parent.tagName === "DETAILS") parent.open = true;
+  });
+  await page.locator(".event-row").filter({ hasText: previewPath }).last().click();
+  await until(async () => (await page.locator(".file-inspector-body").textContent()).includes("after-browser-startup"));
+  await page.locator("#event-detail summary").click();
+  assert.ok((await page.locator("#event-json").textContent()).includes(previewPath), "raw event details remain available");
+  await page.locator("[data-preview-close]").click();
+  await page.locator("#event-detail summary").click();
   await page.locator("[data-workspace=browser]").click();
   for (const width of [768, 390, 320]) {
     await page.setViewportSize({ width, height: 900 });
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), `overflow at ${width}`);
+    assert.ok(!await separator.isVisible(), "narrow layouts stack the panels");
   }
   assert.deepEqual(pageErrors, []);
   assert.equal(errors, "");
-  console.log(JSON.stringify({ result: "PASS", networkPid: request.data.pid, https: httpsUrl, warnings }));
+  console.log(JSON.stringify({ result: "PASS", networkPid: request.data.pid, https: httpsUrl, checks: ["connection to Traffic", "panel drag and keyboard resize", "file preview after Chrome startup", "snapshot reuse", "raw event details", "narrow layout"], warnings }));
 } catch (error) {
   console.error("Playground stderr:", errors);
   throw error;

@@ -99,14 +99,16 @@ try {
   await until(async () => await page.locator(".stream-message").count() > 0, "messages reopen");
   for (const socket of wss.clients) socket.close(1000, "finished");
   await until(async () => (await page.locator(".stream-state").textContent()).includes("Closed"), "stream closes without replacing its view");
-  await page.locator(".traffic-copy-url").click();
-  await until(async () => (await page.locator(".stream-payload-status").textContent()).includes("URL copied"), "copy URL after lifecycle update");
+  await page.locator(".stream-follow").click();
+  await until(async () => await page.locator(".stream-copy").isEnabled(), "closed stream payload available");
+  await page.locator(".stream-copy").click();
+  await until(async () => (await page.locator(".stream-payload-status").textContent()).includes("copied"), "copy message after lifecycle update");
   for (const width of [768, 390, 320]) {
     await page.setViewportSize({ width, height: 900 });
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), `overflow at ${width}`);
   }
   assert.deepEqual(pageErrors, []); assert.equal(errors, "");
-  console.log(JSON.stringify({ result: "PASS", checks: ["Chrome EventSource", "Chrome compressed WebSocket", "live payload before EOF", "bidirectional messages", "window expiry", "scroll pause and resume", "copy", "raw details", "request/message tabs", "closed state and URL copy", "narrow layout"] }));
+  console.log(JSON.stringify({ result: "PASS", checks: ["Chrome EventSource", "Chrome compressed WebSocket", "live payload before EOF", "bidirectional messages", "window expiry", "scroll pause and resume", "copy", "raw details", "request/message tabs", "closed state and message copy", "narrow layout"] }));
 } catch (error) {
   console.error("Playground stderr:", errors);
   throw error;

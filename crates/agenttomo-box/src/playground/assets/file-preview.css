@@ -4,6 +4,7 @@
 #file-preview button { border: 1px solid #45596c; background: #21323e; color: #c7d7e4; padding: 5px 8px; border-radius: 4px; font-size: 10px; white-space: nowrap; }
 #file-preview button:hover, #file-preview button[aria-pressed="true"] { border-color: #9be9c2; color: #9be9c2; }
 #file-preview button:disabled { opacity: .45; cursor: default; }
+#file-preview .file-inspector-icon { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 5px; flex-shrink: 0; }
 .file-inspector-heading, .file-inspector-path, .file-inspector-tools { display: flex; align-items: center; gap: 9px; }
 .file-inspector-heading { justify-content: space-between; }
 .file-inspector-heading strong { font-size: 12px; color: #e7cb8d; }

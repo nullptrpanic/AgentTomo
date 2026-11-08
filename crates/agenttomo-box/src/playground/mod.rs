@@ -1,8 +1,11 @@
-//! HTTP entry point. Each authenticated WebSocket owns a Docker session.
+//! Owner WebSockets manage Docker sessions; monitor pages only read their journals.
 
 mod assets;
 mod desktop;
 mod docker;
+mod monitor;
+#[cfg(test)]
+mod monitor_tests;
 mod payload;
 mod session;
 mod streams;
@@ -42,6 +45,7 @@ struct App {
     shutdown: CancellationToken,
     sessions: TaskTracker,
     desktops: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    running: Arc<Mutex<HashMap<String, Option<i32>>>>,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +81,7 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
         shutdown: CancellationToken::new(),
         sessions: TaskTracker::new(),
         desktops: Default::default(),
+        running: Default::default(),
     };
     let listener = tokio::net::TcpListener::bind(options.listen).await?;
     let address = listener.local_addr()?;
@@ -104,6 +109,7 @@ fn router(app: App) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/ws", get(websocket))
+        .route("/api/sessions/{session}/events", get(monitor::read))
         .route(
             "/api/sessions/{session}/file-preview",
             get(payload::file_preview),
@@ -229,6 +235,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
             desktops: Default::default(),
+            running: Default::default(),
         };
         let router = router(app);
         let base = format!("/api/sessions/{id}/stream-messages");
@@ -329,6 +336,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
             desktops: Default::default(),
+            running: Default::default(),
         };
         let router = router(app);
         let base = format!("/api/sessions/{id}/{endpoint}");
@@ -379,6 +387,57 @@ mod tests {
                     }
                 );
             }
+        }
+        if endpoint == "http-body" {
+            use std::io::Write;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(b"<html>decoded preview</html>").unwrap();
+            let original = encoder.finish().unwrap();
+            std::fs::write(&payload, &original).unwrap();
+            for (token, decode, status) in [
+                ("wrong", "gzip", StatusCode::UNAUTHORIZED),
+                ("test-token", "gzip", StatusCode::OK),
+                ("test-token", "identity", StatusCode::OK),
+            ] {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!(
+                                "{base}?token={token}&offset=0&length={}&decode={decode}",
+                                original.len()
+                            ))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status);
+                if status == StatusCode::OK {
+                    assert_eq!(
+                        response.headers()["x-agenttomo-decoding"],
+                        if decode == "gzip" {
+                            "complete"
+                        } else {
+                            "identity"
+                        }
+                    );
+                    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+                    let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        &bytes[..],
+                        if decode == "gzip" {
+                            b"<html>decoded preview</html>".as_slice()
+                        } else {
+                            &original
+                        }
+                    );
+                }
+            }
+            assert_eq!(std::fs::read(&payload).unwrap(), original);
         }
         let uri = format!("{base}?token=test-token&offset=0&length=4");
         std::fs::remove_file(&payload).unwrap();
@@ -441,6 +500,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
             desktops: Default::default(),
+            running: Default::default(),
         };
         let router = router(app);
         for (path, expected) in [
@@ -450,6 +510,9 @@ mod tests {
             ("/assets/vendor/xterm.js", StatusCode::OK),
             ("/assets/vendor/novnc.mjs", StatusCode::OK),
             ("/assets/browser-view.mjs", StatusCode::OK),
+            ("/assets/workspace.mjs", StatusCode::OK),
+            ("/assets/monitor.mjs", StatusCode::OK),
+            ("/assets/observation.mjs", StatusCode::OK),
             ("/assets/process-tree.mjs", StatusCode::OK),
             ("/assets/trace-view.mjs", StatusCode::OK),
             ("/assets/event-filter.mjs", StatusCode::OK),

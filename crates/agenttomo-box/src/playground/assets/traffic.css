@@ -1,30 +1,37 @@
 .observation-tabs { display: flex; gap: 8px; padding: 0 23px 12px; }
 .observation-tabs button, #traffic button { border: 1px solid #344b5a; border-radius: 5px; background: #1b2935; color: #cbd8e4; padding: 6px 9px; font-size: 11px; }
 .observation-tabs [aria-pressed=true], #traffic [aria-pressed=true] { color: #9be9c2; border-color: #66a88c; background: #213b36; }
+#traffic .traffic-icon { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 5px; flex-shrink: 0; }
+#traffic .traffic-icon:hover:not(:disabled) { border-color: #9be9c2; color: #9be9c2; }
+#traffic .traffic-icon:disabled { opacity: .45; cursor: default; }
 #traffic { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding: 0 15px; font-size: 11px; }
 .traffic-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.traffic-navigation { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; color: #9be9c2; }
 .traffic-toolbar input { flex: 1; min-width: 140px; padding: 8px 10px; border: 1px solid #344b5a; border-radius: 5px; color: #d3dee8; background: #121e28; }
-.traffic-count, .traffic-meta, .traffic-status, .traffic-body-status { color: #8fa3b7; }
+.traffic-count, .traffic-meta, .traffic-status, .traffic-body-status, .traffic-copy-status { color: #8fa3b7; }
 .traffic-status { font-size: 10px; line-height: 1.5; margin: 7px 0; }
 .traffic-list { flex: 0 1 36%; min-height: 80px; overflow: auto; border-top: 1px solid #34404e; border-bottom: 1px solid #34404e; scrollbar-gutter: stable; }
 #traffic .traffic-row { display: grid; grid-template-columns: 54px minmax(0, 1fr) 52px; gap: 4px 7px; text-align: left; width: 100%; border-radius: 0; border: 0; border-bottom: 1px solid #26333f; background: transparent; padding: 10px 6px; }
 #traffic .traffic-row:hover, #traffic .traffic-row[aria-pressed=true] { background: #223b42; }
-.traffic-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.traffic-url { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .traffic-code { text-align: right; color: #9be9c2; }
 .traffic-meta { grid-column: 2 / -1; font-size: 10px; }
 .traffic-method { color: #8cbcef; }
 .traffic-inspector { flex: 1; min-height: 80px; overflow: auto; padding: 12px 0; }
 .traffic-detail-heading { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 10px; }
 .traffic-detail-heading strong { flex: 1; min-width: 0; overflow-wrap: anywhere; font-weight: 500; color: #c5dcee; line-height: 1.6; }
-.traffic-detail-heading button { flex-shrink: 0; }
 .traffic-inspector nav { display: flex; gap: 6px; }
-.traffic-headers { background: #15212b; border-radius: 5px; padding: 8px; margin: 10px 0; }
-.traffic-headers summary { cursor: pointer; color: #a8b7c7; }
-.traffic-headers pre, .traffic-body { white-space: pre; overflow: auto; font: 11px/1.65 ui-monospace, Consolas, monospace; tab-size: 2; }
-.traffic-headers pre { max-height: 120px; margin: 8px 0 0; }
-.traffic-body-tools { display: flex; align-items: center; justify-content: space-between; }
+.traffic-section { margin: 10px 0; min-width: 0; }
+.traffic-section > summary { display: flex; align-items: center; gap: 8px; min-height: 44px; box-sizing: border-box; padding: 8px; background: #15212b; border-radius: 5px; cursor: pointer; color: #a8b7c7; font-weight: 500; list-style: none; }
+.traffic-section > summary::-webkit-details-marker { display: none; }
+.traffic-section-title::before { content: "▸"; display: inline-block; width: 8px; margin-right: 6px; }
+.traffic-section[open] > summary .traffic-section-title::before { content: "▾"; }
+.traffic-headers pre, .traffic-body { white-space: pre-wrap; overflow-wrap: anywhere; overflow: auto; font: 11px/1.65 ui-monospace, Consolas, monospace; tab-size: 2; }
+.traffic-headers pre { max-height: 120px; margin: 8px 0 0; padding: 10px; background: #0c141b; border-radius: 5px; }
+.traffic-body-tools { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 8px 0; }
+.traffic-body-modes { display: flex; gap: 6px; }
 .traffic-body { min-height: 30px; max-height: 300px; background: #0c141b; padding: 10px; border-radius: 5px; }
-.traffic-body-status { line-height: 1.6; overflow-wrap: anywhere; }
+.traffic-body-status, .traffic-copy-status { line-height: 1.6; overflow-wrap: anywhere; }
 .stream-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; }
 .stream-state { color: #9be9c2; font-weight: 500; }
 .stream-retention, .stream-payload-status { color: #8fa3b7; line-height: 1.6; overflow-wrap: anywhere; }

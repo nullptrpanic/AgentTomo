@@ -28,10 +28,11 @@ printf 'hello\n' | cargo run --quiet -p agenttomo-box -- run \
 
 ## playground：Docker 终端与实时 trace
 
-需要能访问本机 Docker daemon，默认使用本地 `agenttomo-playground:24.04` 工具镜像。它基于 Ubuntu 24.04，预装 ifconfig/netstat、ip/ss、curl/wget、dig、nc、jq、strace、Python 等常用工具。首次使用前在仓库根目录构建（需要已有 Ubuntu 基础镜像和 apt 软件源访问）：
+需要能访问本机 Docker daemon，默认使用本地 `agenttomo-playground-chrome:24.04` 镜像并自动启动 Chrome。它基于 Ubuntu 24.04 工具镜像，包含 ifconfig/netstat、ip/ss、curl/wget、dig、nc、jq、strace、Python 和图形桌面组件。首次使用前在仓库根目录构建，需已有 Ubuntu 基础镜像及软件源访问。
 
 ```bash
 docker build --pull=false -t agenttomo-playground:24.04 docker/playground
+docker build --pull=false -t agenttomo-playground-chrome:24.04 docker/playground-chrome
 ```
 
 完整工具列表与使用说明见[镜像说明](../../docker/playground/README.md)。Playground 启动时不会自动拉取或构建镜像，也不会更改 Docker 或宿主权限配置。
@@ -48,21 +49,28 @@ target/debug/agenttomo-box playground --image my-compatible-image:latest --outpu
 
 默认监听 `127.0.0.1:8080`，输出带随机令牌的访问 URL。页面和 WebSocket 都需要令牌；浏览器 WebSocket 还会校验 Origin。持有该 URL 的用户可以创建并操作容器；本版用于受信用户的诊断环境，没有多用户权限或配额管理。前端资源随二进制内置，运行时无需 Node.js 或 CDN。
 
-可选 Chrome 窗口与现有观察面板共用一个会话：
+Chrome 窗口与观察面板共用一个会话，启动示例如下。
 
 ```bash
-docker build --pull=false -t agenttomo-playground-chrome:24.04 docker/playground-chrome
+target/debug/agenttomo-box playground --listen 0.0.0.0:18889 --capture-http
+
+# 选择普通工具镜像时进入终端模式。
 target/debug/agenttomo-box playground --listen 0.0.0.0:18889 \
-  --image agenttomo-playground-chrome:24.04 --browser --capture-http
+  --image agenttomo-playground:24.04
 ```
 
-`--browser` 增加 Terminal / Browser 切换，并自动从被跟踪进程树启动 Chrome。
+镜像提供完整浏览器组件时，页面显示 Terminal / Browser 切换，并从被跟踪进程树启动 Chrome。`--image` 指定其他本地镜像，旧命令应删除 `--browser`。
+启动时在临时容器内检查 `/usr/local/bin/agenttomo-browser-session`、`agenttomo-desktop` 和 `agenttomo-chrome`。三个可执行脚本齐全时启用浏览器，全部缺省时进入终端模式，部分缺失或探测失败时报告错误。探测容器自动清理。同一次服务使用启动时检查过的镜像 ID，镜像名用于页面和会话记录。
 `--capture-http` 同时启用现有 HTTPS 解密；Chrome 从 OverlayFS 中读取任务 CA，导入本会话容器的 NSS 信任库。
 Chrome、其网络服务子进程的真实 PID、文件行为和 HTTP/HTTPS 内容都复用右侧观察窗口。
 显示转发沿用同一个鉴权入口，不发布 VNC 端口。依赖、生命周期及协议边界见
 [Chrome 镜像说明](../../docker/playground-chrome/README.md)。
 
-每个页面创建一个临时容器，目标以服务用户的 UID/GID 运行，清空 capabilities，启用 `no-new-privileges`。为允许嵌套 user/net namespace，开发容器显式使用 `seccomp=unconfined`、`apparmor=unconfined`；这会放宽容器策略，不能作为恶意代码安全沙箱。仅挂载只读 box 二进制和当前会话日志目录，不挂载宿主项目或 Docker socket。镜像需包含 `/bin/bash`、`ip`、`iptables`、`ip6tables`，架构及动态链接库需兼容宿主构建的二进制；当前实测为 Linux x86_64 + Ubuntu 24.04。Docker daemon 必须能访问本机绑定路径，不支持远程 daemon。
+每个工作区主页面创建一个临时容器，目标以服务用户的 UID/GID 运行，清空 capabilities，启用 `no-new-privileges`。为允许嵌套 user/net namespace，开发容器显式使用 `seccomp=unconfined`、`apparmor=unconfined`；这会放宽容器策略，不能作为恶意代码安全沙箱。仅挂载只读 box 二进制和当前会话日志目录，不挂载宿主项目或 Docker socket。镜像需包含 `/bin/bash`、`ip`、`iptables`、`ip6tables`，架构及动态链接库需兼容宿主构建的二进制；当前实测为 Linux x86_64 + Ubuntu 24.04。Docker daemon 必须能访问本机绑定路径，不支持远程 daemon。
+
+页面右上角提供两个图标：侧栏图标收起/展开当前页的监控栏；新页面图标打开同一 session 的独立监控页。原页面与多个监控页可同时显示并更新，筛选、选中事件和展开状态互不影响。独立页复用进程树、Traffic、文件预览和原始事件详情，不创建容器，也不能输入终端命令。
+
+监控链接使用 `/?token=…&monitor=<session-id>`。刷新监控页会从日志回放同一会话，然后继续跟随新事件；界面仍保留原有的最近事件窗口。关闭监控页仅停止该页订阅，关闭工作区主页面仍会结束并清理容器。会话结束后，监控页可继续查看已保存内容；服务重启会更换访问令牌，旧链接需使用新令牌。
 
 网页终端使用真实 PTY，支持 Ctrl-C、窗口 resize 和 Bash 作业控制。PTY 会合并 stdout/stderr，合并输出记录在 `stdout.log`，`stderr.log` 为空。输入记录、进程事件和采集状态复用 `run` 的格式。
 
@@ -72,7 +80,7 @@ Chrome、其网络服务子进程的真实 PID、文件行为和 HTTP/HTTPS 内�
 
 右侧顶部 Event filters 支持多选具体事件（如 `memory.mmap`、`file.open`）和类别通配符（如 `file.*`），默认全选，提供 Select all / Clear all 和半选状态。过滤行为行时保留进程树、真实状态与耗时，显示可见/保留事件数；新事件沿用当前页面的选择。页面保留最近 1,000 条原始行为及必要祖先，过滤前后的完整日志继续保存在磁盘。
 
-Shell 退出后禁用输入，后代仍继续采集，直到显示 `Collection complete`。关闭页面、点击 `New session` 或用 SIGINT/SIGTERM 停止服务，会删除对应的临时容器，日志保留在 `<output-dir>/<session-id>/run/`。外围 `session.json` 记录容器信息，`session-result.json` 记录结束原因及清理结果。主动关闭未完成会话时，内层采集状态可能保留为 `running`，不能视为已完整采集；查看外围结束原因区分中止与完成。SIGKILL 或主机故障无法执行清理，可通过容器标签 `io.agenttomo.playground=true` 定位遗留容器。
+Shell 退出后禁用输入，后代仍继续采集，直到显示 `Collection complete`。关闭工作区主页面、点击 `New session` 或用 SIGINT/SIGTERM 停止服务，会删除对应的临时容器，日志保留在 `<output-dir>/<session-id>/run/`。外围 `session.json` 记录容器信息，`session-result.json` 记录结束原因及清理结果。主动关闭未完成会话时，内层采集状态可能保留为 `running`，不能视为已完整采集；查看外围结束原因区分中止与完成。SIGKILL 或主机故障无法执行清理，可通过容器标签 `io.agenttomo.playground=true` 定位遗留容器。
 
 宿主终端连续 Ctrl-C 不会打断 Docker 清理子进程。删除命令异常时会复核容器是否已不存在，避免 daemon 已完成删除但 CLI 被中断时误报失败；真正失败会显示退出码/信号、Docker 错误和复核结果。只清理当前服务自己的会话容器，不删除其他手动启动的容器。
 
@@ -96,9 +104,17 @@ target/debug/agenttomo-box run --capture-http \
 
 打开服务输出的 token 链接后，右侧 **Traffic** 可查看真实请求/响应头、正文及 PID；原进程树、文件预览和事件 JSON 详情继续保留。正文默认每方向 64 KiB、每次运行共 64 MiB，单方向可配置到 1 MiB，设置 0 只保留头信息。达到保存上限不会截断转发。正文在该条消息结束或中止后显示，明确标注截断、未完整接收或保存失败。
 
-`--capture-http` 同时启用 HTTP/1.1 解析和 TLS 解密，默认不启用。目标 helper 在私有 mount namespace 中用 OverlayFS 覆盖 `/etc/ssl/certs`，保留原证书并追加本次 CA，不修改 lower。要求 Debian/Ubuntu 的 `ca-certificates.crt`、允许创建 mount namespace 和挂载 tmpfs/OverlayFS；失败停止启动，不静默回退。上游 TLS 使用原证书库校验；不会因目标使用 `curl -k` 而跳过代理的上游校验。只保存公开 CA PEM，私钥只驻留采集器内存。
+点击进程树中的网络连接事件可跳到 Traffic，按连接 ID 查看对应请求；同一连接的多个请求会一起列出，点击 **Show all requests** 解除连接筛选。没有采集到 HTTP 请求时会说明原因。左右工作区与观测区之间可拖拽调宽，也支持方向键和双击恢复默认比例。
 
-当前限 HTTP/1.1；TLS 协商到 HTTP/1.1，不支持 HTTP/2-only、QUIC、证书固定、mTLS、ECH、STARTTLS 或自带证书库的自动注入。CA 有效期 24 小时，暂不支持跨期轮换。普通 HTTP 压缩正文保留原压缩字节。完整边界见[内容检查设计](../../docs/content-inspection-design.md)。
+Body 默认用 **Decoded** 展示，查看时解压 gzip／deflate 并按 Content-Type 的 charset 解码文本；**Raw / Hex** 可查看保留的原始字节。解压预览最多 1 MiB，压缩内容被截断时仅展示可恢复前缀并标注不完整。解压失败、Brotli／Zstandard 或多层编码暂回到原始字节并说明原因。磁盘保存额度仍按原始正文计量，转发和记录内容保持原样。
+
+点击 **Body** 标题可折叠或展开正文，默认展开；数据刷新、切换 Decoded / Raw 时保留开合状态。收起后仍可切换表示方式和复制内容，原始事件详情继续保留。
+
+**Headers** 和 **Body** 使用同级标题样式。网络 URL、头信息、正文和 SSE/WebSocket 消息按面板宽度自动换行，复制内容保留原始换行。正文与消息使用复制图标并保留悬停提示，详情不再显示 Copy URL 按钮。
+
+`--capture-http` 同时启用 HTTP/1.1 解析和 TLS 解密，默认不启用。目标 helper 在私有 mount namespace 中用 OverlayFS 覆盖 `/etc/ssl/certs`，保留原证书并追加本次 CA，不修改 lower。要求 Debian/Ubuntu 的 `ca-certificates.crt`、允许创建 mount namespace 和挂载 tmpfs/OverlayFS；失败停止启动，不静默回退。上游 TLS 使用原证书库校验；不会因目标使用 `curl -k` 而跳过代理的上游校验。每个运行随机生成 `AgentTomo Root CA`，私钥在内存中，公开证书经启动 Unix 通道送入目标 tmpfs/OverlayFS，随诊断作用域释放。注入的信任文件和 NSS 证书数据库的文件事件会标记预览已排除，避免证书随默认预览归档。
+
+当前限 HTTP/1.1；TLS 协商到 HTTP/1.1，不支持 HTTP/2-only、QUIC、证书固定、mTLS、ECH、STARTTLS 或自带证书库的自动注入。根 CA 有效期 10 个日历年，域名证书有效期 1 天。每个运行有独立的证书缓存，固定 TTL 1 小时，容量配置为 1,024 条，并发首次访问同组域名共用签发结果。PSL 处理公共后缀和租户边界，例如 `www.baidu.com`、`a.baidu.com` 和 `baidu.com` 共用含 `*.baidu.com`、`baidu.com` 的证书，深层子域单独分组，IP、单段名称和未知后缀使用精确证书。普通 HTTP 压缩正文保留原压缩字节。完整边界见[内容检查设计](../../docs/content-inspection-design.md)。
 
 SSE 和 WebSocket（包括 HTTPS SSE / WSS）在 Traffic 的 **Messages** 页实时展示：方向、开始时间、事件/消息类型、内容、复制和原始详情。滚到底部自动跟随，向上滚动或选旧消息会暂停；点击 **Follow latest** 恢复。SSE 支持多行事件及 gzip/deflate，WebSocket 支持掩码、分片、二进制、ping/pong/close 和 permessage-deflate。
 
@@ -113,7 +129,6 @@ SSE 和 WebSocket（包括 HTTPS SSE / WSS）在 Traffic 的 **Messages** 页实
 | `exit-code.txt` | 根命令退出时写入的退出码，带换行；根命令尚未完成或提前采集失败时为空 |
 | `events.jsonl` | `process.fork/vfork/clone/exec/exit`、`file.open`、`memory.mmap`、`network.upstream/protocol/transfer`、`network.udp.send/receive/transfer/error`；开启内容采集时还有 `network.http.*` 和 `network.tls.error` |
 | `http-bodies.bin` | 开启内容采集时保存的请求/响应正文前缀，按事件中的 offset/captured_bytes 读取 |
-| `task-ca.pem` | 本次解密任务的公开 CA，不含私钥 |
 | `file-previews.bin` | 启用文件预览时保存有总大小上限的内容快照；事件通过 offset / captured_bytes 引用，不内嵌到 JSONL |
 | `collection-status.json` | `running`、`complete` 或 `failed`，以及采集器 PID 和失败原因；以原子替换更新 |
 
@@ -135,9 +150,11 @@ SSE 和 WebSocket（包括 HTTPS SSE / WSS）在 Traffic 的 **Messages** 页实
 
 文件采集覆盖 `open/openat/openat2/creat`，记录请求路径、原始路径字节、dirfd/相对路径基准、flags、返回 FD 或 errno，以及成功时可读取的实际 FD 路径。路径最多 4,096 字节，截断/不可读有明确标记；不虚拟化文件系统。元数据在 syscall 退出停点生成；信号中断的内核重启码标为 `restart`，不能当作最终用户态 errno。没有返回停点的调用可能没有完成记录。尚未采集文件 read/write、rename/unlink、io_uring 或文件前后差异。
 
-成功打开可读普通文件时，采集器从已知 FD 固定原文件对象，记录器异步保存有上限的前缀快照，不移动应用的读取位置。默认每个文件最多 **64 KiB**、每次运行最多 **16 MiB**；`run` 和 `playground` 都支持 `--file-preview-max-bytes`（最大 1 MiB，0 禁用）与 `--file-preview-total-bytes`（0 禁用）。例如 `agenttomo-box playground --file-preview-max-bytes 131072 --file-preview-total-bytes 33554432`。只预览本地 ext/XFS/Btrfs/OverlayFS/tmpfs/ramfs/SquashFS 上的普通文件；目录、设备、管道、proc/sys、FUSE/远程文件系统、只写和 O_PATH 打开不读取内容。
+成功打开可读普通文件时，采集器从已知 FD 固定原文件对象，记录器异步保存有上限的前缀快照，不移动应用的读取位置。默认每个文件最多 **64 KiB**、每次运行最多 **64 MiB**；`run` 和 `playground` 都支持 `--file-preview-max-bytes`（最大 1 MiB，0 禁用）与 `--file-preview-total-bytes`（0 禁用）。例如 `agenttomo-box playground --file-preview-max-bytes 131072 --file-preview-total-bytes 134217728`。只预览本地 ext/XFS/Btrfs/OverlayFS/tmpfs/ramfs/SquashFS 上的普通文件；目录、设备、管道、proc/sys、FUSE/远程文件系统、只写和 O_PATH 打开不读取内容。
 
-Playground 点击 `file.open` 后显示文本行号、JSON 格式化/原始内容或 Hex，可复制路径与当前内容，原始事件详情仍在下方。失败、禁用、预算耗尽、空文件和截断分别展示；复制截断预览不会包含未保存的部分。内容通过带访问令牌的固定快照范围接口读取，进程退出后仍可查看，点击时不再访问目标路径。旧记录没有快照时明确显示未采集。快照是打开附近的尽力读取，不证明应用读取过这些字节，也不保证与并发写入原子一致；额外文件 I/O 会产生开销。详见[内容检查设计](../../docs/content-inspection-design.md)。
+重复打开时重新读取并比较前缀内容；相同内容复用保存范围，文件修改后保存新快照。去重缓存有独立的 16 MiB 权重上限，缓存淘汰后可能重复保存。总额度耗尽后，仍可查看历史快照和复用缓存中的内容；新内容需增大 `--file-preview-total-bytes` 后开启新会话，旧记录中未保存的内容无法补回。
+
+Playground 点击 `file.open` 后显示文本行号、JSON 格式化/原始内容或 Hex，通过图标按钮复制当前内容、关闭预览，原始事件详情仍在下方。失败、禁用、预算耗尽、空文件和截断分别展示；复制截断预览不会包含未保存的部分。内容通过带访问令牌的固定快照范围接口读取，进程退出后仍可查看，点击时不再访问目标路径。旧记录没有快照时明确显示未采集。快照是打开附近的尽力读取，不证明应用读取过这些字节，也不保证与并发写入原子一致；额外文件 I/O 会产生开销。详见[内容检查设计](../../docs/content-inspection-design.md)。
 
 `memory.mmap` 记录原生 mmap 的请求地址、长度、prot/flags、FD、字节偏移、返回地址或 errno、PID 和调用耗时。文件映射在入口处尽力读取 FD 路径快照，匿名映射不解析被忽略的 FD；地址使用十六进制字符串避免浏览器精度损失。Playground 在实际任务下显示摘要和原始字段。耗时包含跟踪开销；动态加载器的映射也会产生事件。这里只观察映射调用，不观察映射后的普通内存读写、缺页、回写或 munmap/mprotect；libc 在用户态拒绝的调用没有 syscall 事件。详见 [mmap 采集](../../docs/mmap-collection.md)。
 
@@ -145,7 +162,9 @@ Playground 点击 `file.open` 后显示文本行号、JSON 格式化/原始内�
 
 TCP 的 `network.upstream` 是代理实际连接上游的结果，`network.transfer` 记录上/下行字节；均来自 `tcp_proxy`。应用 getpeername 自然返回原始目标，不需要还原。`attribution=connect_initiator` 表示建连者；共享 FD 后的每次写入者不能据此推断。未及时得到元数据时标为 unavailable，不猜 PID。
 
-TCP/UDP 的 transfer 汇总另存 `started_unix_ns`、`completed_unix_ns` 和单调时钟 `duration_ns`。开始分别取自代理接收连接/首个数据报，`start_source` 明确来源；汇总仍在结束时生成。页面按开始时间显示和排序，原始 `observed_unix_ns` / `sequence` 保留写入时序，详情不丢失结束时间。旧日志未记录开始时间时沿用原时间；连接开始不等于 HTTP 请求开始。
+TCP/UDP 的 transfer 汇总另存 `started_unix_ns`、`completed_unix_ns` 和单调时钟 `duration_ns`。开始分别取自代理接收连接/首个数据报，`start_source` 明确来源。汇总在结束时生成，页面按开始时间显示和排序。文件打开和 mmap 同样记录 syscall 入口与返回时间。记录器在入队前采集 `observed_unix_ns` / `monotonic_ns`，写入前采集 `recorded_unix_ns`，`sequence` 保持 FIFO 顺序。旧日志沿用已有时间字段。
+
+事件与文件预览通过容量 256 的有界 FIFO 交给独立 Tokio 写入任务，按序保存内容和 JSONL。队列满时施加背压，写入失败反馈为采集失败。预览固定打开的文件对象，读取时机受队列和 I/O 延迟影响，实际快照时间单独保存。根命令退出时刷新标准流并通知前台，完整证据排空后才写入 `collection-status.json` 的 `complete`。
 
 UDP 来自 `udp_proxy`：实际上游 send 生成 `network.udp.send`，回包生成 `network.udp.receive`，流结束汇总 transfer，错误单独记录。保留零长度、批量发送、DNS 和原服务回包地址。`attribution=flow_participants`、`participants` 与 `socket_ids` 表示流内观察到的发送者；多个发送者或 socket 共享同一五元组时不冒充单个所有者。单族最多 1024 个活跃流，每流队列 64 个报文，空闲 120 秒回收。全部目标退出时排空队列。
 
@@ -186,7 +205,7 @@ flowchart LR
 
 两个完成时刻分别处理：
 
-1. **根命令退出**：使用最终 `waitpid` 状态，不把 `PTRACE_EVENT_EXIT` 或主线程提前结束当作整个进程结束。排空输出管道在该边界已经排队的字节，刷新日志，发送退出码给前台；不等待后代关闭输出管道。
+1. **根命令退出**使用最终 `waitpid` 状态。排空输出管道在该边界已经排队的字节，刷新标准流日志，再发送退出码给前台。后代的输出继续由采集器处理。
 2. **采集完成**：跟踪正常 fork/vfork/clone 创建的后代，包含重新托管、双重 fork 和 `setsid` 后代。采集器作为 subreaper 回收孤儿；全部目标退出后继续转发代理已接收的上行数据，停止等待发往已退出目标的下行数据，排空代理事件和剩余输出，再写入 `complete`。不使用 PPID 扫描判断采集是否结束。
 
 因此前台返回后，`exit-code.txt` 已可读取，但 `collection-status.json` 仍可能是 `running`。长期存活的后代会让采集器及其资源持续存在；后台采集失败会写入 `failed`，无法改变已经返回给调用方的退出码。
@@ -217,6 +236,12 @@ cargo test -p agenttomo-box --test playground -- --ignored
 
 ```bash
 node --test crates/agenttomo-box/tests/*.test.mjs
+```
+
+Traffic DOM 回归使用现有 Playwright 和 Chromium，验证突发事件合并、节点复用、焦点、筛选、详情、滚动和 1,000 条保留上限。可通过 `AGENTTOMO_PLAYWRIGHT_MODULE` 与 `AGENTTOMO_TEST_BROWSER` 指定测试工具路径。
+
+```bash
+node crates/agenttomo-box/tests/traffic-view.browser.mjs
 ```
 
 覆盖进程聚合、线程退出、父子关系、连续 exec、PID/TID 复用、非主线程 exec、乱序观察、晚到代理事件、历史保留边界，以及具体事件/类别通配符过滤和新增事件类型的选择继承。

@@ -7,7 +7,7 @@ event JSON details and network forwarding remain available.
 ## Delivery order
 
 1. **File previews (implemented):** associate bounded content snapshots
-   with real `file.open` events, display text/JSON/hex and copy paths/content.
+   with real `file.open` events, display text/JSON/hex and copy displayed content.
 2. **HTTP/HTTPS slice (implemented):** HTTP/1.1 request/response capture and a
    traffic inspector using real records; TLS interception with a task CA
    injected through OverlayFS. These parts form one verifiable HTTPS path.
@@ -29,9 +29,12 @@ upstream identity/certificate chains. An upstream verification or client
 handshake failure is recorded as `network.tls.error`; no insecure retry or
 silent encrypted fallback occurs. The handshake has a shared 15-second budget.
 
-Each run gets an ephemeral CA. Only its public PEM is written to `task-ca.pem`;
-the CA and leaf private keys stay in collector memory. Certificates are valid
-for 24 hours; this initial slice does not rotate trust for longer sessions.
+Each capture-enabled run generates a fresh CA named `AgentTomo Root CA`, valid
+for ten calendar years. February 29 anniversaries fall on February 28 when
+needed. Root and leaf keys stay in collector memory. The public PEM crosses the
+existing private Unix startup channel in a bounded, length-prefixed message and
+is materialized inside the target's tmpfs-backed trust overlay. The ordinary
+temporary directory supplies only an empty mountpoint, removed on scope cleanup.
 The single-threaded target helper creates a mount namespace owned by its existing
 user namespace, makes mount propagation private and mounts a small tmpfs for
 OverlayFS upper/work. The overlay covers `/etc/ssl/certs`, preserving lower
@@ -41,9 +44,32 @@ hashed CA directories or general Java/NSS/custom runtime stores. The optional
 Playground Chrome image has a separate launcher that imports this same public
 CA into its disposable container NSS database; see
 [Chrome integration](../docker/playground-chrome/README.md). Mounts and upper data
-die with the target namespace. The collector removes its temporary public-CA
-directory after the scope completes. Failed setup stops launch with a clear
+die with the target namespace. Failed setup stops launch with a clear
 error and does not run the target. Capabilities are dropped before target exec.
+
+Domain certificates last one day, with a five-minute allowance before issuance
+for clock skew. Their CN names the certificate identity. A run-local Moka cache
+holds shared TLS configurations with a fixed one-hour TTL from insertion and a
+configured maximum of 1,024 entries. Concurrent requests for the same identity
+share one signing operation. Expired entries are regenerated on the next use.
+Active TLS connections own their configuration for their connection lifetime.
+
+The PSL library, including private suffixes, determines safe wildcard groups.
+`www.baidu.com`, `a.baidu.com` and `baidu.com` share SANs `*.baidu.com` and
+`baidu.com`. `x.a.baidu.com` uses the `*.a.baidu.com` group. A tenant such as
+`alice.github.io` groups within `*.alice.github.io`. IP addresses, single-label
+names and unknown suffixes use exact certificates. DNS cache keys normalize case
+and one terminal dot, and IP keys use the parsed address representation. PSL
+data updates with the dependency. Upstream verification uses the requested host.
+
+Evidence stores trust-file open metadata with `task_trust_material` as the
+preview reason for the injected bundle, task CA and NSS certificate databases/journals.
+This keeps automatic file previews from archiving session trust material.
+The recorder owns this retention decision. File collectors pin handles and
+inspect metadata at syscall exit, and recording applies the trust exclusion
+before reading content or publishing a saved preview.
+Applications that explicitly print or copy public certificates can still place
+that data into their output or other observed resources.
 
 ```mermaid
 flowchart LR
@@ -79,14 +105,39 @@ bounded range reader, without accepting a user-controlled file path.
 `started_unix_ns` is the proxy's receipt of request headers, not body completion
 or record-write time. Body events carry actual completion/drop time and elapsed
 monotonic duration; response headers additionally carry their receipt time.
-`observed_unix_ns` remains the recorder's write time. This does not measure time
-before the request reaches the proxy or reconstruct earlier client activity.
+`observed_unix_ns` and `monotonic_ns` describe receipt by the recorder before
+queueing. `recorded_unix_ns` describes the JSONL write attempt after preview work.
+Source start/completion fields describe the operation independently of storage
+latency. HTTP start time covers activity from receipt at the proxy onward.
 
 The Traffic tab groups real requests with PID, URL, method and status; selecting
 one displays request/response headers and bounded text/JSON/hex body content.
-Copy URL/body, filtering, truncation/error states and the original event JSON
+Body copy icons, filtering, truncation/error states and the original event JSON
 details remain available. Its live list retains 1,000 exchanges; older records
-remain on disk. Bodies are currently viewable after the message ends/aborts.
+remain on disk. Event-driven list and selected-detail updates are batched with
+`requestAnimationFrame`. Request IDs key reusable DOM rows, with fields updated
+only when that request changes. Filtering retains cached rows within the same
+1,000-entry bound, and scrolling preserves either history position or bottom
+following. Bodies are currently viewable after the message ends/aborts.
+
+Headers and Body use matching sibling section headings. URLs, headers and body
+or stream-message text wrap to the available width without changing copied
+content. Copy buttons use shared icons with accessible names and tooltips;
+the inspector does not display a copy-URL button.
+
+The inspector defaults to **Decoded** and provides **Raw / Hex** for the retained
+entity bytes. Following Charles's documented [decompress-on-view behavior](https://www.charlesproxy.com/documentation/configuration/preferences/)
+and [compressed-data viewer](https://www.charlesproxy.com/documentation/using-charles/requests-responses/),
+the optional `decode` query on the HTTP body range API decompresses gzip or zlib
+deflate with the existing flate2 dependency, outside the asynchronous runtime.
+It does not rewrite recorded payloads or proxy traffic. Output is limited to
+1 MiB; `x-agenttomo-decoding` distinguishes complete, incomplete, output-limited,
+invalid and unsupported content. Incomplete streams expose only the recoverable
+prefix, with an explicit unverified-checksum label. Invalid or unsupported
+encodings (including Brotli, Zstandard and encoding chains) return original
+bytes with an explanation. The file preview endpoint continues serving raw ranges.
+Text rendering respects the HTTP Content-Type charset when supplied; JSON
+formatting requires complete, losslessly parsed text. HTML is displayed as text.
 
 ### Current limits
 
@@ -201,17 +252,30 @@ frames, parser overflow recovery and bounded storage reuse.
 
 ## File preview contract
 
-An open event alone does not prove content was read. The preview is a best-effort
-prefix snapshot collected shortly after a successful open, not a record of
-application `read` calls or an atomic filesystem snapshot. Concurrent writers
-can change the file during capture. A click never rereads the original path.
+The preview is a best-effort prefix snapshot of a successfully opened object.
+Capture starts when the persistence worker reaches that event, so queued I/O
+can delay the read and concurrent writers can change the content. The saved
+capture timestamp identifies that later observation. Application reads require
+separate evidence. Clicking the preview loads the saved bytes.
 
 At syscall exit the collector pins the opened object via its known `/proc` FD,
 checks its type/filesystem, and obtains an independent read handle. The recorder
-reads that handle asynchronously and saves the prefix separately from JSONL.
+queues this handle alongside other events in a bounded 256-item FIFO. One Tokio
+worker owns preview reads, payload persistence and ordered JSONL writes. Payload
+ranges become visible only after their writes succeed. Queue saturation applies
+backpressure, and event-write failures propagate to collection status.
 Renaming/unlinking/replacing the path after open cannot select a different inode,
 and the application's file position is not advanced. No FD-table scanning or
 additional target syscalls are introduced.
+
+Root-exit acknowledgement flushes standard streams independently of this worker.
+Normal collection completion waits for all queued events and previews to drain
+and for JSONL flush to finish. Consumers should use `collection-status.json`
+to distinguish a complete recording from a foreground command that has returned.
+`recorded_unix_ns` marks the write attempt, with flush completion represented by
+collection status. File opens and mmap use shared operation timing captured at
+syscall entry/exit, including `started_unix_ns`, `completed_unix_ns`,
+`duration_ns` and `start_source=syscall_entry`.
 
 Capture only readable regular files on local filesystems (ext, XFS, Btrfs,
 OverlayFS, tmpfs, ramfs and SquashFS). Do not read directories, devices, FIFOs,
@@ -220,18 +284,27 @@ Permission/read/storage failures produce an explicit unavailable state and do
 not replace the open result. Empty snapshots remain distinguishable from missing
 snapshots. No capabilities or permissions are added to bypass failed reads.
 
-Defaults: 64 KiB per preview and 16 MiB per run. CLI options
+Defaults: 64 KiB per preview and 64 MiB per run. CLI options
 `--file-preview-max-bytes` (0 disables, maximum 1 MiB) and
 `--file-preview-total-bytes` configure those limits for `run` and `playground`.
-The budget bounds payload bytes, not existing event metadata or filesystem I/O
-latency. Regular-file reads can still involve disk I/O.
+The budget bounds stored payload bytes, not existing event metadata or filesystem
+I/O latency. Regular-file reads can still involve disk I/O. An exact-content cache
+reuses saved ranges for identical prefixes, so repeated library/configuration
+opens do not repeatedly consume the budget. The cache uses the existing Moka
+dependency with a 16 MiB weight limit (content plus estimated entry overhead),
+independent of the configured disk budget. It compares the newly read bytes, not
+paths or timestamps; changed prefixes get new ranges. Cache eviction may cause a
+later identical prefix to be saved again. Historical ranges remain immutable.
 
 The recorder appends payloads to `file-previews.bin` (0600) in the run directory.
 `file.open.data.preview` records status, source, original size, captured bytes,
 byte offset, capture time and truncation. References are published only after
 their payload write finishes. A read/storage error stops that preview; the
-existing event log still records the open. The run budget stops further content
-capture without stopping collection.
+existing event log still records the open. Reused ranges have `reused: true` and
+retain each event's own capture time, size and truncation state. Once the budget
+is exhausted, cached identical prefixes and empty files remain available; new
+nonempty content is marked unavailable without stopping collection. Unavailable
+snapshots from earlier runs cannot be reconstructed from those recordings.
 
 The authenticated Playground API serves only bounded ranges of the retained
 snapshot file. Session identifiers and offsets are validated, all directory/file
@@ -247,8 +320,9 @@ event JSON details remain below it. Text has line numbers, JSON has pretty/raw
 views, and binary/invalid UTF-8 uses hex/ASCII. All file content is rendered as
 text. Loading/error/unavailable/empty/truncated states are explicit.
 
-Copy path and copy displayed content (hex for binary) act on the current preview;
-they never imply that truncated bytes are the whole file. Clipboard failures are
+The copy icon copies displayed content (hex for binary) from the current preview;
+it never implies that truncated bytes are the whole file. The close and copy
+icons retain accessible names and hover hints; there is no copy-path button. Clipboard failures are
 reported and HTTP previews have a browser copy fallback. A stale asynchronous
 fetch must not replace a newly selected file. Existing records without preview
 metadata show that content was not captured.

@@ -1,8 +1,10 @@
 import { copyText } from "./copy-text.mjs";
+import { closeIcon, copyIcon } from "./icons.mjs";
 
 const size = bytes => bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KiB`;
 const reasons = {
   disabled: "File content capture was disabled for this run.",
+  task_trust_material: "Task trust material is kept within this session and excluded from saved previews.",
   open_failed: "The file open failed; no content was captured.",
   write_only: "The file was opened for writing only; no content was read.",
   path_only: "O_PATH opens do not read file content.",
@@ -12,17 +14,17 @@ const reasons = {
   read_handle_unavailable: "A readable snapshot handle was unavailable.",
   read_error: "The file snapshot could not be read.",
   storage_error: "The file snapshot could not be saved.",
-  budget_exhausted: "The run's file-preview budget was exhausted. File events are still recorded.",
+  budget_exhausted: "The run's file-preview budget was exhausted; this snapshot was not saved. Start a new session with a larger --file-preview-total-bytes value to capture more unique content. File events and earlier saved previews are still available.",
 };
 
-export function previewContent(bytes, { pretty = false, truncated = false, forceHex = false } = {}) {
+export function previewContent(bytes, { pretty = false, truncated = false, forceHex = false, charset = "utf-8" } = {}) {
   let text, incompleteUtf8 = false;
   try {
     if (forceHex) throw new Error("binary");
-    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes, { stream: truncated });
+    text = new TextDecoder(charset, { fatal: true, ignoreBOM: true }).decode(bytes, { stream: truncated });
     if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) throw new Error("binary");
     if (truncated) {
-      try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { incompleteUtf8 = true; }
+      try { new TextDecoder(charset, { fatal: true }).decode(bytes); } catch { incompleteUtf8 = true; }
     }
   } catch {
     const rows = [];
@@ -72,14 +74,14 @@ export class FilePreview {
         root.querySelector(`[data-preview-format="${mode}"]`)?.focus({ preventScroll: true });
         return;
       }
-      if (button.dataset.previewCopy) {
+      if (button.dataset.previewCopy === "content") {
         const version = this.version;
-        const text = button.dataset.previewCopy === "path" ? this.path : this.displayed?.text;
+        const text = this.displayed?.text;
         if (text === undefined) return;
         button.disabled = true;
         try {
           await copyText(text);
-          if (version === this.version) this.status.textContent = button.dataset.previewCopy === "path" ? "Path copied." : this.event.data.preview?.status === "truncated" ? "Captured prefix copied; the full file was not captured." : "Displayed content copied.";
+          if (version === this.version) this.status.textContent = this.event.data.preview?.status === "truncated" ? "Captured prefix copied; the full file was not captured." : "Displayed content copied.";
         } catch (error) {
           if (version === this.version) this.status.textContent = error.message;
         } finally { if (button.isConnected) button.disabled = false; }
@@ -108,9 +110,8 @@ export class FilePreview {
     const preview = data.preview;
     this.path = data.resolved_path || data.path || "[path unavailable]";
     this.root.hidden = false;
-    this.root.innerHTML = `<div class="file-inspector-heading"><strong>File preview</strong><button type="button" data-preview-close aria-label="Close file preview">Close ×</button></div><div class="file-inspector-path"><code></code><button type="button" data-preview-copy="path">Copy path</button></div><p class="file-inspector-meta"></p><div class="file-inspector-body"></div><p class="file-inspector-status" role="status"></p>`;
+    this.root.innerHTML = `<div class="file-inspector-heading"><strong>File preview</strong><button type="button" class="file-inspector-icon" data-preview-close aria-label="Close file preview" title="Close file preview">${closeIcon}</button></div><div class="file-inspector-path"><code></code></div><p class="file-inspector-meta"></p><div class="file-inspector-body"></div><p class="file-inspector-status" role="status"></p>`;
     this.root.querySelector("code").textContent = this.path;
-    this.root.querySelector("[data-preview-copy=path]").disabled = !data.resolved_path && !data.path;
     this.root.querySelector(".file-inspector-meta").textContent = `PID ${data.pid ?? "—"} · ${data.syscall || "open"} · ${data.result >= 0 ? `FD ${data.result}` : `errno ${data.errno ?? "?"}`} · Event #${event.sequence}`;
     this.body = this.root.querySelector(".file-inspector-body");
     this.status = this.root.querySelector(".file-inspector-status");
@@ -149,9 +150,12 @@ export class FilePreview {
         button.setAttribute("aria-pressed", String((mode === "pretty") === this.pretty));
       }
     }
-    const copy = append(toolbar, "button", "", this.displayed.format === "hex" ? "Copy hex" : "Copy content");
+    const copy = append(toolbar, "button", "file-inspector-icon", "");
     copy.type = "button";
     copy.dataset.previewCopy = "content";
+    copy.title = this.displayed.format === "hex" ? "Copy hex" : "Copy content";
+    copy.setAttribute("aria-label", copy.title);
+    copy.innerHTML = copyIcon;
     if (this.bytes.length === 0) append(this.body, "p", "file-inspector-empty", "Empty file · 0 bytes captured.");
     else if (this.displayed.format === "hex") append(this.body, "pre", "file-inspector-code hex", this.displayed.text);
     else {

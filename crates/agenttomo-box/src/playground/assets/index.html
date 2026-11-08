@@ -17,11 +17,16 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark" aria-hidden="true">a<span>t</span></span><strong>AgentTomo</strong><span class="divider">/</span><span>Playground</span></div>
-    <div class="topbar-actions"><span id="status" class="status" data-state="starting" role="status">Starting</span><button id="new-session" type="button">New session <span aria-hidden="true">↗</span></button></div>
+    <div class="brand"><span class="brand-mark" aria-hidden="true">a<span>t</span></span><strong>AgentTomo</strong><span class="divider">/</span><span id="page-name">Playground</span></div>
+    <div class="topbar-actions">
+      <span id="status" class="status" data-state="starting" role="status">Starting</span>
+      <button id="toggle-monitor" class="monitor-control" type="button" aria-label="Hide monitor" title="Hide monitor" aria-expanded="true" aria-controls="monitor-panel"></button>
+      <a id="open-monitor" class="monitor-control" aria-label="Open monitor in new tab" title="Open monitor in new tab" aria-disabled="true" tabindex="-1" target="_blank" rel="noopener noreferrer"></a>
+      <button id="new-session" type="button">New session <span aria-hidden="true">↗</span></button>
+    </div>
   </header>
   <main>
-    <section class="terminal-panel" aria-labelledby="terminal-title">
+    <section id="workspace-panel" class="terminal-panel" aria-labelledby="terminal-title">
       <div class="panel-heading"><div><span class="eyebrow">WORKSPACE</span><h1 id="terminal-title">Container terminal</h1></div><span id="image" class="image-label">Docker</span></div>
       <div class="terminal-toolbar"><nav class="workspace-tabs" aria-label="Workspace view"><button type="button" data-workspace="terminal" aria-pressed="true">Terminal</button><button id="browser-tab" type="button" data-workspace="browser" aria-pressed="false" hidden>Browser</button></nav><span id="session-id">Creating a temporary container…</span></div>
       <div id="terminal" aria-label="Interactive container terminal"></div>
@@ -32,8 +37,9 @@
       </section>
       <div class="terminal-footer"><span><span class="small-dot"></span> Isolated Docker session</span><span id="workspace-hint">Ctrl-C to interrupt · Ctrl-D to exit</span></div>
     </section>
-    <section class="trace-panel" aria-labelledby="trace-title">
-      <div class="panel-heading"><div><span class="eyebrow">OBSERVABILITY</span><h2 id="trace-title">Activity <span id="event-count" class="count">0</span></h2></div><span class="trace-label"><span class="small-dot"></span> Live behaviors</span></div>
+    <div id="panel-resizer" role="separator" tabindex="0" aria-label="Resize workspace and activity panels" aria-orientation="vertical" aria-controls="workspace-panel" title="Drag to resize · Arrow keys to adjust · Double-click to reset"></div>
+    <section id="monitor-panel" class="trace-panel" aria-labelledby="trace-title">
+      <div class="panel-heading"><div><span class="eyebrow">OBSERVABILITY</span><h2 id="trace-title">Activity <span id="event-count" class="count">0</span></h2></div><span id="trace-session" class="trace-label"><span class="small-dot"></span> Live behaviors</span></div>
       <nav class="observation-tabs" aria-label="Observation view"><button type="button" data-observation="process" aria-pressed="true">Process tree</button><button type="button" data-observation="traffic" aria-pressed="false">Traffic</button></nav>
       <p class="trace-description">Expand a process to inspect its behavior and descendants.<br><span id="capture-description">Process lifecycle · file opens · mmap · TCP / UDP · HTTP Host / TLS SNI.</span></p>
       <div class="trace-tools">
@@ -57,6 +63,6 @@
     </section>
   </main>
   <div id="notice" role="alert" hidden></div>
-  <footer class="page-footer"><span>One page. One container. A visible execution trail.</span><span>Closing this page removes its container.</span></footer>
+  <footer class="page-footer"><span id="page-description">One session. Multiple views of its activity.</span><span id="page-lifecycle">Closing this workspace removes its container.</span></footer>
 </body>
 </html>

@@ -21,6 +21,7 @@ export class TrafficModel {
       this.entries.set(id, row);
     }
     row[field] = event;
+    if (Number.isSafeInteger(event.data.connection_id)) row.connectionId = event.data.connection_id;
     row.latest = event;
     if (this.entries.size > this.limit) {
       const inactive = [...this.entries.values()].filter(row => !row.stream || row.streamClosed);
@@ -31,9 +32,16 @@ export class TrafficModel {
     }
     return row;
   }
-  visible(query = "") {
+  matching(event) {
+    const id = event.data?.request_id;
+    if (Number.isSafeInteger(id)) return this.entries.has(id) ? [this.entries.get(id)] : [];
+    const connection = event.data?.connection_id;
+    return Number.isSafeInteger(connection) ? this.visible("", connection) : [];
+  }
+  visible(query = "", connectionId = null) {
     const filter = query.trim().toLowerCase();
     return [...this.entries.values()].sort((a, b) => a.id - b.id).filter(row => {
+      if (connectionId !== null && row.connectionId !== connectionId) return false;
       const data = row.request?.data || row.latest.data;
       return !filter || [data.url, data.method, data.pid, row.response?.data.status_code, row.error?.data.error, row.stream?.data.protocol].join(" ").toLowerCase().includes(filter);
     });

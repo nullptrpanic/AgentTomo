@@ -24,7 +24,7 @@ function timestamp(event) {
   time.title = date.toISOString() + " (UTC); displayed in your local time zone";
   if (Number.isFinite(event.data?.started_unix_ns) && event.data.started_unix_ns >= 0) {
     time.title += `\nStart: ${event.data.start_source || "operation"}`;
-    for (const [label, value] of [["Completed", event.data.completed_unix_ns], ["Recorded", event.observed_unix_ns]]) {
+    for (const [label, value] of [["Completed", event.data.completed_unix_ns], ["Recorded", event.recorded_unix_ns ?? event.observed_unix_ns]]) {
       const stamp = new Date(value / 1e6);
       if (Number.isFinite(value) && Number.isFinite(stamp.getTime())) time.title += `\n${label}: ${stamp.toISOString()}`;
     }

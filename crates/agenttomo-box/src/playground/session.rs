@@ -30,12 +30,16 @@ pub async fn serve(mut socket: WebSocket, app: App) {
     let id = uuid::Uuid::new_v4().simple().to_string();
     let name = format!("agenttomo-{id}");
     let directory = app.settings.output_dir.join(&id);
+    app.running
+        .lock()
+        .expect("session registry")
+        .insert(id.clone(), None);
     let result = async {
         tokio::fs::DirBuilder::new()
             .mode(0o700)
             .create(&directory)
             .await?;
-        let metadata = json!({"session_id":id,"container":name,"image":app.settings.image,"browser":app.settings.browser});
+        let metadata = json!({"session_id":id,"container":name,"image":app.settings.image,"browser":app.settings.browser,"http_capture":app.settings.http.enabled});
         let mut file = create_log(&directory, "session.json").await?;
         file.write_all(&serde_json::to_vec(&metadata)?).await?;
         file.flush().await?;
@@ -89,10 +93,18 @@ pub async fn serve(mut socket: WebSocket, app: App) {
         eprintln!("agenttomo-box: session {id}: {error}");
     }
     if let Ok(mut file) = create_log(&directory, "session-result.json").await {
-        let result = json!({"reason":result.as_ref().ok(), "error":error, "container_removed":cleanup.is_ok()});
+        let root_pid = app
+            .running
+            .lock()
+            .expect("session registry")
+            .get(&id)
+            .copied()
+            .flatten();
+        let result = json!({"reason":result.as_ref().ok(), "error":error, "container_removed":cleanup.is_ok(), "root_pid":root_pid});
         let _ = file.write_all(result.to_string().as_bytes()).await;
         let _ = file.flush().await;
     }
+    app.running.lock().expect("session registry").remove(&id);
     let _ = tokio::time::timeout(Duration::from_secs(2), socket.send(WsMessage::Close(None))).await;
 }
 
@@ -132,6 +144,10 @@ async fn drive(
                 };
                 let frame = match message {
                     Message::Started { pid } => {
+                        app.running
+                            .lock()
+                            .expect("session registry")
+                            .insert(id.to_owned(), Some(pid));
                         if app.settings.browser {
                             desktop = Some(desktop::start(name).await?);
                             app.desktops

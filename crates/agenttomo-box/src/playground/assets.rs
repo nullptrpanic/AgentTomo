@@ -7,6 +7,10 @@ use axum::{
 pub async fn get(Path(path): Path<String>) -> Response {
     let (mime, content) = match path.as_str() {
         "app.js" => ("text/javascript", include_str!("assets/app.js")),
+        "workspace.mjs" => ("text/javascript", include_str!("assets/workspace.mjs")),
+        "observation.mjs" => ("text/javascript", include_str!("assets/observation.mjs")),
+        "monitor.mjs" => ("text/javascript", include_str!("assets/monitor.mjs")),
+        "panel-resize.mjs" => ("text/javascript", include_str!("assets/panel-resize.mjs")),
         "browser-view.mjs" => ("text/javascript", include_str!("assets/browser-view.mjs")),
         "browser.css" => ("text/css", include_str!("assets/browser.css")),
         "vendor/novnc.mjs" => ("text/javascript", include_str!("assets/vendor/novnc.mjs")),
@@ -20,11 +24,13 @@ pub async fn get(Path(path): Path<String>) -> Response {
         ),
         "traffic-view.mjs" => ("text/javascript", include_str!("assets/traffic-view.mjs")),
         "traffic-model.mjs" => ("text/javascript", include_str!("assets/traffic-model.mjs")),
+        "http-preview.mjs" => ("text/javascript", include_str!("assets/http-preview.mjs")),
         "stream-view.mjs" => ("text/javascript", include_str!("assets/stream-view.mjs")),
         "stream-model.mjs" => ("text/javascript", include_str!("assets/stream-model.mjs")),
         "traffic.css" => ("text/css", include_str!("assets/traffic.css")),
         "file-preview.mjs" => ("text/javascript", include_str!("assets/file-preview.mjs")),
         "copy-text.mjs" => ("text/javascript", include_str!("assets/copy-text.mjs")),
+        "icons.mjs" => ("text/javascript", include_str!("assets/icons.mjs")),
         "file-preview.css" => ("text/css", include_str!("assets/file-preview.css")),
         "process-tree.mjs" => ("text/javascript", include_str!("assets/process-tree.mjs")),
         "legacy-process-tree.mjs" => (
