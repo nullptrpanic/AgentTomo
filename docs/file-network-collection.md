@@ -63,7 +63,7 @@ socket 成功创建时，读取该已知 FD 的 inode 并分配运行内 socket 
 
 `network.transfer` 与 `network.udp.transfer` 在收尾时才有完整字节计数，但事件的业务开始时间单独记录：TCP 在代理 `accept` 返回时取时，UDP 在代理收到该流的第一个数据报时取时，均早于关联查找与后台任务排队。字段为 `started_unix_ns`、`completed_unix_ns`、`duration_ns` 和 `start_source`（`proxy_accept` / `proxy_first_datagram`）。耗时使用单调时钟计算；这是代理连接/流的寿命，不是 HTTP 请求或目标 `connect` syscall 的开始时间。
 
-`observed_unix_ns`、`monotonic_ns` 与 `sequence` 继续保留记录器写入时序。Playground 对新记录优先显示开始时间，并仅在显示层按开始时间排序；结束和写入时间保留在原始详情及时间提示中。旧日志没有开始字段时沿用原记录时间，不推算或伪造开始时间。特别快退出的目标，其排队报文可能在退出后才被代理收到，此时代理开始时间晚于进程退出也是实际观察结果。
+`observed_unix_ns` 和 `monotonic_ns` 在记录器收到事件、入队前采集，`sequence` 保持 FIFO 顺序。独立写入任务在处理完预览、准备写 JSONL 时采集 `recorded_unix_ns`。文件打开和 mmap 也通过共享计时组件记录 syscall 入口与返回时间。Playground 优先显示开始时间，并在显示层按开始时间排序。原始详情和时间提示分别保留完成、写入时间，旧日志沿用已有字段。特别快退出的目标，其排队报文可能在退出后才被代理收到，此时代理开始时间晚于进程退出也是实际观察结果。
 
 ## 文件行为与生命周期
 

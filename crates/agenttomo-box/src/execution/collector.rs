@@ -28,7 +28,8 @@ pub async fn run(
     http: crate::proxy::http::Options,
 ) -> io::Result<()> {
     let parent_lost = signal(SignalKind::user_defined1())?;
-    let (mut recording, input_log) = Recording::create(command, directory, preview_limits).await?;
+    let (mut recording, input_log) =
+        Recording::create(command, directory, preview_limits, http.enabled).await?;
     let result = collect(
         command,
         with_terminal,
@@ -40,7 +41,7 @@ pub async fn run(
     )
     .await;
     if let Err(error) = &result {
-        let _ = recording.flush().await;
+        let _ = recording.finish().await;
         let _ = recording.status("failed", Some(&error.to_string())).await;
     }
     result
@@ -123,6 +124,7 @@ async fn collect(
             break;
         }
         tokio::select! {
+            result = recording.writer_failure() => result?,
             event = events.recv(), if !tracing_done => match event {
                 Some(Event::Process { kind, data }) => recording.event("ptrace", kind, data).await?,
                 Some(Event::FileOpen(opened)) => recording.file_open(opened).await?,
@@ -183,7 +185,7 @@ async fn collect(
     if let Some(stderr) = stderr.as_mut() {
         drain(stderr.as_mut(), &mut recording.stderr, &mut frontend, false).await?;
     }
-    recording.flush().await?;
+    recording.finish().await?;
     // Finished is the final message; the join cannot wait on a live tracee.
     thread
         .join()

@@ -82,7 +82,7 @@ pub struct FilePreviewArgs {
     #[arg(long = "file-preview-max-bytes", default_value_t = 65536, value_parser = clap::value_parser!(u32).range(0..=i64::from(crate::recording::file_preview::MAX_PREVIEW_BYTES)))]
     pub max_bytes: u32,
     /// Total file-preview payload budget per run (0 disables previews)
-    #[arg(long = "file-preview-total-bytes", default_value_t = 16777216)]
+    #[arg(long = "file-preview-total-bytes", default_value_t = crate::recording::file_preview::Limits::default().total_bytes)]
     pub total_bytes: u64,
 }
 

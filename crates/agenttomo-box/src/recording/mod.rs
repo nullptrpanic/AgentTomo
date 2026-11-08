@@ -1,5 +1,6 @@
 //! Run files and the separate completion states of the root and collection.
 
+mod events;
 pub mod file_preview;
 pub mod http;
 pub mod streams;
@@ -7,7 +8,7 @@ pub mod streams;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tokio::fs::{DirBuilder, File, OpenOptions};
@@ -41,10 +42,7 @@ pub struct Recording {
     pub stdout: File,
     pub stderr: File,
     exit: File,
-    events: File,
-    started: Instant,
-    sequence: u64,
-    previews: file_preview::Store,
+    events: events::Writer,
 }
 
 impl Recording {
@@ -55,6 +53,7 @@ impl Recording {
         command: &OsStr,
         directory: &Path,
         preview_limits: file_preview::Limits,
+        exclude_task_trust: bool,
     ) -> io::Result<(Self, File)> {
         if let Some(parent) = directory
             .parent()
@@ -88,37 +87,37 @@ impl Recording {
             stdout: create_log(directory, "stdout.log").await?,
             stderr: create_log(directory, "stderr.log").await?,
             exit: create_log(directory, "exit-code.txt").await?,
-            events: create_log(directory, "events.jsonl").await?,
-            started: Instant::now(),
-            sequence: 0,
-            previews: file_preview::Store::create(directory, preview_limits).await?,
+            events: events::Writer::start(
+                create_log(directory, "events.jsonl").await?,
+                file_preview::Store::create(directory, preview_limits, exclude_task_trust).await?,
+            ),
         };
         result.status("running", None).await?;
         Ok((result, input))
     }
 
-    pub async fn event(&mut self, source: &str, kind: &str, data: Value) -> io::Result<()> {
-        self.sequence += 1;
-        let value = json!({
-            "schema_version": 2, "sequence": self.sequence, "kind": kind,
-            "category": match kind.split('.').next() {
-                Some("network") => "network",
-                Some("file") => "file",
-                Some("process") => "process",
-                Some("memory") => "memory",
-                _ => "other",
-            },
-            "source": source, "observed_unix_ns": SystemTime::now().duration_since(UNIX_EPOCH).map_err(io::Error::other)?.as_nanos(),
-            "monotonic_ns": self.started.elapsed().as_nanos(), "data": data,
-        });
-        let mut bytes = serde_json::to_vec(&value)?;
-        bytes.push(b'\n');
-        self.events.write_all(&bytes).await
+    pub async fn event(
+        &mut self,
+        source: &'static str,
+        kind: &'static str,
+        data: Value,
+    ) -> io::Result<()> {
+        self.events
+            .send(events::Content::Event(Observation { source, kind, data }))
+            .await
     }
 
     pub async fn file_open(&mut self, opened: crate::collectors::file::Opened) -> io::Result<()> {
-        let data = self.previews.capture(opened).await;
-        self.event("ptrace", "file.open", data).await
+        self.events.send(events::Content::File(opened)).await
+    }
+
+    pub async fn writer_failure(&mut self) -> io::Result<()> {
+        self.events.failure().await
+    }
+
+    pub async fn finish(&mut self) -> io::Result<()> {
+        self.flush().await?;
+        self.events.finish().await
     }
 
     pub async fn root_exit(&mut self, code: u8) -> io::Result<()> {
@@ -128,11 +127,7 @@ impl Recording {
     }
 
     pub async fn flush(&mut self) -> io::Result<()> {
-        tokio::try_join!(
-            self.stdout.flush(),
-            self.stderr.flush(),
-            self.events.flush()
-        )?;
+        tokio::try_join!(self.stdout.flush(), self.stderr.flush())?;
         Ok(())
     }
 
