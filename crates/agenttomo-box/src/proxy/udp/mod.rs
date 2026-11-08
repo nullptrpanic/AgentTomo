@@ -29,11 +29,11 @@ use tokio_util::sync::CancellationToken;
 
 struct Datagram {
     bytes: Vec<u8>,
-    metadata: Option<Metadata>,
+    received: TransferTiming,
 }
 struct Route {
     id: u64,
-    socket_id: Option<u64>,
+    flow_id: Arc<AtomicU64>,
     sender: mpsc::Sender<Datagram>,
 }
 #[derive(Default)]
@@ -129,36 +129,37 @@ async fn serve(
             source,
             destination,
         };
-        let metadata = registry.resolve(&key).await;
-        let socket_id = metadata.as_ref().map(|m| m.socket_id);
         if routes
             .get(&key)
-            .is_some_and(|route| route.socket_id != socket_id || route.sender.is_closed())
+            .is_some_and(|route| route.sender.is_closed())
         {
             routes.remove(&key);
         }
         if !routes.contains_key(&key) {
             let id = ids.fetch_add(1, Ordering::Relaxed);
             if routes.len() >= 1024 {
-                emit(&events, event(key, id, metadata.as_ref(), "network.udp.error", json!({"stage":"capacity", "error":"UDP flow limit reached; datagram dropped"}))).await?;
+                emit(&events, event(key, id, None, "network.udp.error", json!({"stage":"capacity", "error":"UDP flow limit reached; datagram dropped"}))).await?;
                 continue;
             }
             let (sender, receiver) = mpsc::channel(64);
             let events = events.clone();
             let reply = reply.clone();
             let registry = registry.clone();
+            let ids = ids.clone();
+            let flow_id = Arc::new(AtomicU64::new(id));
+            let current_flow = flow_id.clone();
             tasks.spawn(async move {
                 (
                     key,
                     id,
-                    forward(key, id, receiver, reply, registry, events, timing).await,
+                    forward(key, current_flow, receiver, reply, registry, events, ids).await,
                 )
             });
             routes.insert(
                 key,
                 Route {
                     id,
-                    socket_id,
+                    flow_id,
                     sender,
                 },
             );
@@ -166,10 +167,13 @@ async fn serve(
         let route = routes.get(&key).unwrap();
         if let Err(error) = route.sender.try_send(Datagram {
             bytes: buffer[..size].to_vec(),
-            metadata,
+            received: timing,
         }) {
-            emit(&events, event(key, route.id, error.into_inner().metadata.as_ref(), "network.udp.error", json!({"stage":"queue", "error":"UDP flow queue unavailable; datagram dropped"}))).await?;
+            drop(error);
+            emit(&events, event(key, route.flow_id.load(Ordering::Relaxed), None, "network.udp.error", json!({"stage":"queue", "error":"UDP flow queue unavailable; datagram dropped"}))).await?;
         }
+        // Give flow workers a chance to drain their queues during ready bursts.
+        tokio::task::consume_budget().await;
     }
     drop(routes); // Drain queued requests; no reply wait after every tracee exits.
     while let Some(result) = tasks.join_next().await {
@@ -194,22 +198,24 @@ async fn raw_reply(
 
 async fn forward(
     key: Key,
-    id: u64,
+    flow_id: Arc<AtomicU64>,
     mut outgoing: mpsc::Receiver<Datagram>,
     reply: Arc<AsyncFd<OwnedFd>>,
     registry: Registry,
     events: mpsc::Sender<Observation>,
-    timing: TransferTiming,
+    ids: Arc<AtomicU64>,
 ) -> io::Result<()> {
+    let mut id = flow_id.load(Ordering::Relaxed);
     let ip = if key.destination.is_ipv4() {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     } else {
         IpAddr::V6(Ipv6Addr::UNSPECIFIED)
     };
-    let upstream = UdpSocket::bind((ip, 0)).await?;
+    let mut upstream = UdpSocket::bind((ip, 0)).await?;
     let mut incoming = vec![0; 65536];
     let mut counts = Counts::default();
     let mut metadata: Option<Metadata> = None;
+    let mut timing: Option<TransferTiming> = None;
     let idle = tokio::time::sleep(Duration::from_secs(120));
     tokio::pin!(idle);
     let status = loop {
@@ -217,7 +223,19 @@ async fn forward(
             biased;
             request = outgoing.recv() => {
                 let Some(request) = request else { break "scope_finished"; };
-                metadata = request.metadata;
+                let next = registry.resolve(&key).await;
+                if metadata.as_ref().map(|m| m.socket_id) != next.as_ref().map(|m| m.socket_id)
+                    && let Some(previous) = timing.take()
+                {
+                    emit(&events, summary(key, id, metadata.as_ref(), &counts, previous, "scope_finished")).await?;
+                    if let Some(metadata) = &metadata { registry.remove(&key, metadata.socket_id); }
+                    upstream = UdpSocket::bind((ip, 0)).await?;
+                    id = ids.fetch_add(1, Ordering::Relaxed);
+                    flow_id.store(id, Ordering::Relaxed);
+                    counts = Counts::default();
+                }
+                timing.get_or_insert(request.received);
+                metadata = next;
                 match upstream.send_to(&request.bytes, key.destination).await {
                     Ok(size) => {
                         counts.up += size as u64;
@@ -247,11 +265,203 @@ async fn forward(
     if let Some(metadata) = &metadata {
         registry.remove(&key, metadata.socket_id);
     }
-    let mut summary = json!({"status":status, "bytes_up":counts.up, "bytes_down":counts.down, "packets_up":counts.packets_up, "packets_down":counts.packets_down});
-    timing.complete(&mut summary);
-    emit(
-        &events,
-        event(key, id, metadata.as_ref(), "network.udp.transfer", summary),
-    )
-    .await
+    if let Some(timing) = timing {
+        emit(
+            &events,
+            summary(key, id, metadata.as_ref(), &counts, timing, status),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn summary(
+    key: Key,
+    id: u64,
+    metadata: Option<&Metadata>,
+    counts: &Counts,
+    timing: TransferTiming,
+    status: &str,
+) -> Observation {
+    let mut data = json!({"status":status, "bytes_up":counts.up, "bytes_down":counts.down, "packets_up":counts.packets_up, "packets_down":counts.packets_down});
+    timing.complete(&mut data);
+    event(key, id, metadata, "network.udp.transfer", data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::Identity;
+
+    fn reply_socket() -> Arc<AsyncFd<OwnedFd>> {
+        // These tests exercise forwarding only. The peer receives without replying.
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        // The owned, nonblocking descriptor is used only through this registration.
+        Arc::new(unsafe { AsyncFd::register(socket.into()) }.unwrap())
+    }
+
+    fn datagram(byte: u8) -> Datagram {
+        Datagram {
+            bytes: vec![byte],
+            received: TransferTiming::begin("proxy_first_datagram"),
+        }
+    }
+
+    #[tokio::test]
+    async fn waiting_flow_does_not_hold_other_flows_and_keeps_packet_order() {
+        let registry = Registry::default();
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first = Key {
+            transport: Transport::Udp,
+            source: "127.0.0.1:1001".parse().unwrap(),
+            destination: remote.local_addr().unwrap(),
+        };
+        let second = Key {
+            source: "127.0.0.1:1002".parse().unwrap(),
+            ..first
+        };
+        registry.register(
+            first,
+            1,
+            Identity {
+                pid: 1,
+                process_instance_id: 1,
+            },
+        );
+        registry.register(
+            second,
+            2,
+            Identity {
+                pid: 2,
+                process_instance_id: 2,
+            },
+        );
+        let pending = registry.begin_datagram(Some(first.source), &[Some(first.destination)]);
+        let (events, mut collected) = mpsc::channel(16);
+        let ids = Arc::new(AtomicU64::new(3));
+        let (first_sender, first_queue) = mpsc::channel(64);
+        let (second_sender, second_queue) = mpsc::channel(64);
+        let first_task = tokio::spawn(forward(
+            first,
+            Arc::new(AtomicU64::new(1)),
+            first_queue,
+            reply_socket(),
+            registry.clone(),
+            events.clone(),
+            ids.clone(),
+        ));
+        let second_task = tokio::spawn(forward(
+            second,
+            Arc::new(AtomicU64::new(2)),
+            second_queue,
+            reply_socket(),
+            registry.clone(),
+            events,
+            ids,
+        ));
+        first_sender.send(datagram(1)).await.unwrap();
+        first_sender.send(datagram(2)).await.unwrap();
+        second_sender.send(datagram(3)).await.unwrap();
+        let mut buffer = [0; 8];
+        tokio::time::timeout(Duration::from_millis(100), remote.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(buffer[0], 3);
+        drop(pending);
+        for expected in [1, 2] {
+            tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(buffer[0], expected);
+        }
+        drop(first_sender);
+        drop(second_sender);
+        first_task.await.unwrap().unwrap();
+        second_task.await.unwrap().unwrap();
+        let mut summaries = Vec::new();
+        while let Some(event) = collected.recv().await {
+            if event.kind == "network.udp.transfer" {
+                summaries.push(event.data);
+            }
+        }
+        assert_eq!(summaries.len(), 2);
+        assert!(
+            summaries
+                .iter()
+                .any(|data| data["pid"] == 1 && data["packets_up"] == 2)
+        );
+        assert!(
+            summaries
+                .iter()
+                .any(|data| data["pid"] == 2 && data["packets_up"] == 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn socket_generation_change_starts_a_new_flow_and_summary() {
+        let registry = Registry::default();
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let key = Key {
+            transport: Transport::Udp,
+            source: "127.0.0.1:1001".parse().unwrap(),
+            destination: remote.local_addr().unwrap(),
+        };
+        registry.register(
+            key,
+            1,
+            Identity {
+                pid: 1,
+                process_instance_id: 1,
+            },
+        );
+        let (events, mut collected) = mpsc::channel(16);
+        let (sender, outgoing) = mpsc::channel(64);
+        let flow_id = Arc::new(AtomicU64::new(1));
+        let task = tokio::spawn(forward(
+            key,
+            flow_id.clone(),
+            outgoing,
+            reply_socket(),
+            registry.clone(),
+            events,
+            Arc::new(AtomicU64::new(2)),
+        ));
+        sender.send(datagram(1)).await.unwrap();
+        let mut buffer = [0; 8];
+        tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        registry.remove(&key, 1);
+        registry.register(
+            key,
+            2,
+            Identity {
+                pid: 2,
+                process_instance_id: 2,
+            },
+        );
+        sender.send(datagram(2)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(sender);
+        task.await.unwrap().unwrap();
+        let mut summaries = Vec::new();
+        while let Some(event) = collected.recv().await {
+            if event.kind == "network.udp.transfer" {
+                summaries.push(event.data);
+            }
+        }
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0]["pid"], 1);
+        assert_eq!(summaries[1]["pid"], 2);
+        assert_ne!(summaries[0]["flow_id"], summaries[1]["flow_id"]);
+        assert_eq!(summaries[1]["flow_id"], flow_id.load(Ordering::Relaxed));
+        assert!(summaries.iter().all(|data| data["packets_up"] == 1));
+    }
 }

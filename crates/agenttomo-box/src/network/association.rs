@@ -5,10 +5,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::sync::Notify;
@@ -75,21 +72,73 @@ pub struct Registry(Arc<Inner>);
 struct Inner {
     entries: Mutex<HashMap<Key, (Metadata, Instant)>>,
     changed: Notify,
-    pending: AtomicUsize,
+    pending: Mutex<HashMap<PendingScope, usize>>,
 }
 
-pub struct Pending(Registry);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PendingScope {
+    source: Option<SocketAddr>,
+    destination: Option<SocketAddr>,
+}
+
+pub struct Pending {
+    registry: Registry,
+    scopes: Vec<PendingScope>,
+}
 impl Drop for Pending {
     fn drop(&mut self) {
-        self.0.0.pending.fetch_sub(1, Ordering::Release);
-        self.0.0.changed.notify_waiters();
+        let mut pending = self.registry.0.pending.lock().unwrap();
+        for scope in &self.scopes {
+            if let Some(count) = pending.get_mut(scope) {
+                *count -= 1;
+                if *count == 0 {
+                    pending.remove(scope);
+                }
+            }
+        }
+        drop(pending);
+        self.registry.0.changed.notify_waiters();
     }
 }
 
 impl Registry {
-    pub fn begin_datagram(&self) -> Pending {
-        self.0.pending.fetch_add(1, Ordering::AcqRel);
-        Pending(self.clone())
+    pub fn begin_datagram(
+        &self,
+        source: Option<SocketAddr>,
+        destinations: &[Option<SocketAddr>],
+    ) -> Pending {
+        let source = source.map(super::address::canonical);
+        let scopes: Vec<_> = destinations
+            .iter()
+            .map(|destination| PendingScope {
+                source,
+                destination: destination.map(super::address::canonical),
+            })
+            .collect();
+        let mut pending = self.0.pending.lock().unwrap();
+        for scope in &scopes {
+            *pending.entry(*scope).or_default() += 1;
+        }
+        Pending {
+            registry: self.clone(),
+            scopes,
+        }
+    }
+
+    fn has_pending(&self, key: &Key) -> bool {
+        let pending = self.0.pending.lock().unwrap();
+        // An auto-bound socket's source is known only after its first send.
+        // Unknown endpoints conservatively match that portion of the tuple.
+        [Some(key.source), None].into_iter().any(|source| {
+            [Some(key.destination), None]
+                .into_iter()
+                .any(|destination| {
+                    pending.contains_key(&PendingScope {
+                        source,
+                        destination,
+                    })
+                })
+        })
     }
     pub fn register(&self, key: Key, socket_id: u64, actor: Identity) {
         let key = key.canonical();
@@ -146,13 +195,14 @@ impl Registry {
         }
     }
     pub async fn resolve(&self, key: &Key) -> Option<Metadata> {
+        let key = key.canonical();
         let wait = async {
             loop {
                 let changed = self.0.changed.notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                if (key.transport != Transport::Udp || self.0.pending.load(Ordering::Acquire) == 0)
-                    && let Some(metadata) = self.lookup(key)
+                if (key.transport != Transport::Udp || !self.has_pending(&key))
+                    && let Some(metadata) = self.lookup(&key)
                 {
                     return metadata;
                 }
@@ -180,6 +230,90 @@ pub fn fields(key: Key, metadata: Option<&Metadata>, data: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn udp(source: u16, destination: u16) -> Key {
+        Key {
+            transport: Transport::Udp,
+            source: ([127, 0, 0, 1], source).into(),
+            destination: ([127, 0, 0, 2], destination).into(),
+        }
+    }
+
+    fn register(registry: &Registry, key: Key, id: u64) {
+        registry.register(
+            key,
+            id,
+            Identity {
+                pid: id as i32,
+                process_instance_id: id,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_send_does_not_hold_an_unrelated_registered_flow() {
+        let registry = Registry::default();
+        let first = udp(1001, 2000);
+        let second = udp(1002, 2000);
+        register(&registry, first, 1);
+        register(&registry, second, 2);
+        let _pending = registry.begin_datagram(Some(first.source), &[Some(first.destination)]);
+        let metadata =
+            tokio::time::timeout(Duration::from_millis(30), registry.resolve(&second)).await;
+        assert!(
+            metadata.is_ok_and(|value| value.is_some()),
+            "an unrelated flow waited for another socket's send"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_source_waits_only_for_its_destination_and_releases_on_drop() {
+        let registry = Registry::default();
+        let first = udp(1001, 2000);
+        let other = udp(1002, 2001);
+        register(&registry, first, 1);
+        register(&registry, other, 2);
+        let pending = registry.begin_datagram(None, &[Some(first.destination)]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), registry.resolve(&other))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), registry.resolve(&first))
+                .await
+                .is_err()
+        );
+        drop(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), registry.resolve(&first))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_sends_preserve_all_successful_writers_until_they_finish() {
+        let registry = Registry::default();
+        let key = udp(1001, 2000);
+        let first = registry.begin_datagram(Some(key.source), &[Some(key.destination)]);
+        let second = registry.begin_datagram(Some(key.source), &[Some(key.destination)]);
+        register(&registry, key, 1);
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), registry.resolve(&key))
+                .await
+                .is_err()
+        );
+        register(&registry, key, 2);
+        drop(second);
+        let metadata = registry.resolve(&key).await.unwrap();
+        assert_eq!(metadata.actors.len(), 2);
+        assert_eq!(metadata.socket_ids, vec![1, 2]);
+        assert!(registry.0.pending.lock().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn ipv6_flowinfo_is_not_a_sixth_tuple_component() {

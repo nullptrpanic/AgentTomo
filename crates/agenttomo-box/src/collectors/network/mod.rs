@@ -110,7 +110,10 @@ impl Collector {
         // owner while another writer's metadata is still being resolved.
         let pending = (socket.transport() == "udp"
             && !matches!(call.number, libc::SYS_connect | libc::SYS_bind))
-        .then(|| self.registry.begin_datagram());
+        .then(|| {
+            self.registry
+                .begin_datagram(self.sources.get(&socket.id).copied(), &destinations)
+        });
         Some(Attempt::Operation {
             call,
             socket,
