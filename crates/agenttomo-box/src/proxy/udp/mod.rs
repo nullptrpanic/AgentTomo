@@ -1,5 +1,5 @@
 //! Persistent transparent UDP ingress, independent of TCP and syscall collection.
-use super::timing::TransferTiming;
+use crate::timing::OperationTiming as TransferTiming;
 use crate::{
     network::{
         association::{self, Key, Metadata, Registry, Transport},

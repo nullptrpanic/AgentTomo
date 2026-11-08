@@ -3,7 +3,7 @@
 mod protocol;
 pub(super) mod transfer;
 
-use super::timing::TransferTiming;
+use crate::timing::OperationTiming as TransferTiming;
 
 use crate::{
     network::association::{self, Key, Metadata, Registry, Transport},

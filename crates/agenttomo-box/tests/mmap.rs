@@ -27,6 +27,10 @@ fn check_identity_and_result(event: &Value, sample: &Value) {
     assert!(data.get("tid").is_none());
     assert!(data["process_instance_id"].as_u64().unwrap() > 0);
     assert!(data["duration_ns"].as_u64().is_some());
+    let started = data["started_unix_ns"].as_u64().unwrap();
+    let completed = data["completed_unix_ns"].as_u64().unwrap();
+    assert!(started > 0 && completed >= started);
+    assert_eq!(data["start_source"], "syscall_entry");
     assert_eq!(data["address"], "0x0");
     assert_eq!(data["restart"], false);
     if let Some(address) = data["mapped_address"].as_str() {

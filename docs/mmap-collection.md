@@ -21,6 +21,8 @@
 | `path_capture` / `capture_error` | 文件路径读取成功为 `complete`，失败为 `unreadable` 并记录错误；匿名映射不读取路径 |
 | `result` / `errno` / `restart` | 原始 syscall 返回值、错误号及内核重启标记，与现有事件约定一致 |
 | `mapped_address` | 成功时返回的映射地址（十六进制字符串），失败或重启时为 null |
+| `started_unix_ns` / `completed_unix_ns` | 采集器观察到 syscall 入口和返回时的绝对时间 |
+| `start_source` | `syscall_entry`，与记录器接收及写入时间分别保存 |
 | `duration_ns` | 采集入口处理到观察到 syscall 返回的单调时间差，包含跟踪开销 |
 
 地址使用字符串避免浏览器 JSON 数值精度损失。文件路径是入口观察到的 FD 路径，可能与并发关闭/复用/重命名竞态；不能作为不可变文件身份。读取失败不改变目标调用，路径不是系统调用直接传入的参数。原始参数和返回值始终保留。

@@ -1,8 +1,8 @@
-//! The proxy's transfer lifetime is distinct from the recorder's arrival time.
+//! Source observation times and duration, captured before content persistence.
 use serde_json::{Value, json};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-pub struct TransferTiming {
+pub struct OperationTiming {
     started: Instant,
     unix_ns: Option<u128>,
     source: &'static str,
@@ -15,7 +15,7 @@ fn unix_ns() -> Option<u128> {
         .map(|time| time.as_nanos())
 }
 
-impl TransferTiming {
+impl OperationTiming {
     pub fn begin(source: &'static str) -> Self {
         Self {
             started: Instant::now(),

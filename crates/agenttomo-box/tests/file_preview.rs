@@ -31,6 +31,15 @@ fn snapshot_survives_path_replacement_and_preserves_application_read_offset() {
     );
     assert_eq!(output.stdout, b"FILE_PREVIEW_OK\n");
     let events = fixture.events();
+    let opened = open(&events, "example.json");
+    let start = opened["started_unix_ns"]
+        .as_u64()
+        .expect("syscall start time");
+    let end = opened["completed_unix_ns"]
+        .as_u64()
+        .expect("syscall completion time");
+    assert!(end >= start);
+    assert_eq!(opened["start_source"], "syscall_entry");
     let preview = &open(&events, "example.json")["preview"];
     assert_eq!(preview["status"], "complete");
     assert_eq!(preview["captured_bytes"], 13);

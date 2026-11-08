@@ -8,6 +8,7 @@ mod proxy;
 mod recording;
 mod syscall;
 mod terminal;
+mod timing;
 mod tracing;
 
 use clap::Parser;

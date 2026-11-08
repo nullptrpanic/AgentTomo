@@ -3,10 +3,10 @@
 mod preview;
 
 use crate::syscall::{Call, memory, result_fields};
+use crate::timing::OperationTiming;
 use nix::libc;
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::time::Instant;
 
 pub const SYSCALLS: &[(i64, &str)] = &[
     #[cfg(target_arch = "x86_64")]
@@ -20,7 +20,7 @@ pub const SYSCALLS: &[(i64, &str)] = &[
 pub struct Attempt {
     pub data: Value,
     handle: nix::unistd::Pid,
-    started: Instant,
+    timing: OperationTiming,
 }
 
 pub struct Opened {
@@ -33,6 +33,7 @@ pub fn enter(call: &Call) -> Option<Attempt> {
         .iter()
         .find(|(number, _)| *number == call.number)?
         .1;
+    let timing = OperationTiming::begin("syscall_entry");
     let at = matches!(name, "openat" | "openat2");
     let dirfd = if at {
         call.args[0] as i32
@@ -95,14 +96,14 @@ pub fn enter(call: &Call) -> Option<Attempt> {
     Some(Attempt {
         data,
         handle: call.tid,
-        started: Instant::now(),
+        timing,
     })
 }
 
 impl Attempt {
     pub fn finish(mut self, result: i64, capture: bool) -> Opened {
         result_fields(&mut self.data, result);
-        self.data["duration_ns"] = json!(self.started.elapsed().as_nanos());
+        self.timing.complete(&mut self.data);
         if result >= 0
             && let Ok(path) =
                 std::fs::read_link(PathBuf::from(format!("/proc/{}/fd/{result}", self.handle)))

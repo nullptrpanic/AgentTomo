@@ -1,23 +1,23 @@
 //! Memory-mapping observations; never change the target's mapping or contents.
 
 use crate::syscall::{Call, result_fields};
+use crate::timing::OperationTiming;
 use nix::libc;
 use serde_json::{Value, json};
 use std::os::unix::ffi::OsStrExt;
-use std::time::Instant;
 
 pub const SYSCALLS: &[i64] = &[libc::SYS_mmap];
 
 pub struct Attempt {
     data: Value,
-    started: Instant,
+    timing: OperationTiming,
 }
 
 pub fn enter(call: &Call) -> Option<Attempt> {
     if call.number != libc::SYS_mmap {
         return None;
     }
-    let started = Instant::now();
+    let timing = OperationTiming::begin("syscall_entry");
     let anonymous = call.args[3] & libc::MAP_ANONYMOUS as u64 != 0;
     let fd = call.args[4] as i32;
     let mut data = json!({
@@ -41,7 +41,7 @@ pub fn enter(call: &Call) -> Option<Attempt> {
             }
         }
     }
-    Some(Attempt { data, started })
+    Some(Attempt { data, timing })
 }
 
 impl Attempt {
@@ -52,7 +52,7 @@ impl Attempt {
         } else {
             Value::Null
         };
-        self.data["duration_ns"] = json!(self.started.elapsed().as_nanos());
+        self.timing.complete(&mut self.data);
         self.data
     }
 }
