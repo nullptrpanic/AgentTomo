@@ -1,8 +1,8 @@
 # Chrome Playground
 
-This optional image adds an interactive Chrome window to the existing terminal
-and process/traffic inspector. The ordinary Playground image and CLI defaults
-are unchanged.
+This is the default Playground image. It provides an interactive Chrome window
+alongside the terminal and process/traffic inspector. Select another local image
+with `--image`.
 
 Build from the repository root (local base image required):
 
@@ -23,17 +23,24 @@ Start the Playground:
 ```sh
 ./target/debug/agenttomo-box playground \
   --listen 0.0.0.0:18889 \
-  --image agenttomo-playground-chrome:24.04 \
-  --browser --capture-http
+  --capture-http
 ```
 
 Use the printed token with `http://101.132.185.173:18889/`. Each page opens its own
 container. The Browser tab shows Chrome; Terminal remains available and the
 process/traffic inspector stays on the right. Chrome starts automatically in the
 traced process tree. To reopen a closed window, run `google-chrome` in Terminal.
-`Reconnect display` reconnects to the same desktop without launching a browser
-or creating another session. Omit `--browser` for an ordinary terminal session;
-omit `--capture-http` to retain encrypted HTTPS forwarding.
+`Reconnect display` reconnects to the same desktop. Select
+`--image agenttomo-playground:24.04` for a terminal session. `--capture-http`
+enables HTTP content capture and HTTPS decryption.
+
+Browser mode is detected from executable `agenttomo-browser-session`,
+`agenttomo-desktop` and `agenttomo-chrome` helpers in `/usr/local/bin`.
+Detection works with custom image names and the existing Chrome image.
+All three absent selects terminal mode. A partial installation or failed Docker
+probe produces an error. Detection uses a short-lived, read-only container with
+networking disabled, then removes it. Sessions use the same inspected image ID.
+Remove `--browser` from older startup commands.
 
 ## Ownership and transport
 
@@ -74,8 +81,10 @@ the signing private key remains only in collector memory.
 The wrapper disables QUIC so requests use the current TCP/HTTP inspector. It
 keeps Chrome's sandbox and certificate verification enabled. The upstream TLS
 peer is still independently verified with the collector's original trust store.
-HTTP/1.1, per-body/run storage limits, and the existing 24-hour task CA lifetime
-still apply. HTTP/2-only services, pinned certificates, client certificates,
+Each session generates a fresh `AgentTomo Root CA` with ten-year validity.
+Domain certificates last one day and use a run-local wildcard cache with a
+one-hour TTL. Public trust arrives through the memory-only startup channel and
+the target's temporary OverlayFS. HTTP/2-only services, pinned certificates, client certificates,
 and QUIC remain unsupported. SSE events and WebSocket messages now have a live
 Messages tab with sliding retention, including gzip/deflate SSE and
 permessage-deflate WebSockets. Ordinary compressed HTTP bodies retain their

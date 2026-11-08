@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
     time::timeout,
 };
@@ -53,7 +53,7 @@ async fn start_server() -> Server {
 }
 
 async fn start_server_with_docker_wrapper(wrapper: Option<&str>) -> Server {
-    start_server_with_options(wrapper, &[]).await
+    start_server_with_options(wrapper, &["--image", "agenttomo-playground:24.04"]).await
 }
 
 async fn start_server_with_options(wrapper: Option<&str>, options: &[&str]) -> Server {
@@ -79,6 +79,12 @@ async fn start_server_with_options(wrapper: Option<&str>, options: &[&str]) -> S
         let bin = directory.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let script = bin.join("docker");
+        // These faults target live sessions, after the startup image probe.
+        let wrapper = wrapper.replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\ncase \"$*\" in *agenttomo-probe-*) exec \"$AGENTTOMO_TEST_REAL_DOCKER\" \"$@\" ;; esac\n",
+            1,
+        );
         std::fs::write(&script, wrapper).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         command
@@ -113,16 +119,7 @@ async fn start_server_with_options(wrapper: Option<&str>, options: &[&str]) -> S
 #[tokio::test]
 #[ignore = "requires Docker access and the local agenttomo-playground-chrome:24.04 image"]
 async fn browser_bridge_requires_auth_and_a_live_owned_session() {
-    let mut server = start_server_with_options(
-        None,
-        &[
-            "--browser",
-            "--image",
-            "agenttomo-playground-chrome:24.04",
-            "--capture-http",
-        ],
-    )
-    .await;
+    let mut server = start_server_with_options(None, &["--capture-http"]).await;
     let (mut terminal, _) = connect_async(&server.ws_url).await.unwrap();
     let (container, id) = ready(&mut terminal).await;
     let _guard = ContainerGuard(container.clone());
@@ -195,11 +192,20 @@ async fn browser_bridge_requires_auth_and_a_live_owned_session() {
 #[tokio::test]
 #[ignore = "requires Docker access and the local agenttomo-playground-chrome:24.04 image"]
 async fn server_shutdown_closes_an_active_desktop_without_http_capture() {
-    let mut server = start_server_with_options(
-        None,
-        &["--browser", "--image", "agenttomo-playground-chrome:24.04"],
-    )
-    .await;
+    let image = format!(
+        "agenttomo-browser-test-{}:local",
+        uuid::Uuid::new_v4().simple()
+    );
+    assert!(
+        Command::new("docker")
+            .args(["tag", "agenttomo-playground-chrome:24.04", &image])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    let _image = ImageGuard(image.clone());
+    let mut server = start_server_with_options(None, &["--image", &image]).await;
     let (mut terminal, _) = connect_async(&server.ws_url).await.unwrap();
     let (container, id) = ready(&mut terminal).await;
     let _guard = ContainerGuard(container.clone());
@@ -228,9 +234,17 @@ async fn server_shutdown_closes_an_active_desktop_without_http_capture() {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker access and the local agenttomo-playground:24.04 image"]
+#[ignore = "requires Docker access and the local agenttomo-playground-chrome:24.04 image"]
 async fn browser_mode_reports_missing_image_helpers_and_removes_the_container() {
-    let mut server = start_server_with_options(None, &["--browser"]).await;
+    // The image passes detection, then a desktop launch failure must still clean up.
+    let wrapper = r#"#!/bin/sh
+if [ "$1" = exec ] && [ "$3" = /usr/local/bin/agenttomo-desktop ]; then
+    echo 'desktop helper unavailable' >&2
+    exit 42
+fi
+exec "$AGENTTOMO_TEST_REAL_DOCKER" "$@"
+"#;
+    let mut server = start_server_with_options(Some(wrapper), &[]).await;
     let (mut socket, _) = connect_async(&server.ws_url).await.unwrap();
     let (container, message) = timeout(Duration::from_secs(15), async {
         let mut container = String::new();
@@ -247,7 +261,7 @@ async fn browser_mode_reports_missing_image_helpers_and_removes_the_container() 
     })
     .await
     .unwrap();
-    assert!(message.contains("agenttomo-playground-chrome"), "{message}");
+    assert!(message.contains("desktop helper unavailable"), "{message}");
     removed(&container).await;
     server.stop().await;
     let _ = std::fs::remove_dir_all(&server.directory);
@@ -262,6 +276,86 @@ impl Drop for ContainerGuard {
             .args(["rm", "--force", "--volumes", &self.0])
             .output();
     }
+}
+
+struct ImageGuard(String);
+impl Drop for ImageGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["image", "rm", &self.0])
+            .output();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker access and the local agenttomo-playground-chrome:24.04 image"]
+async fn incomplete_browser_image_fails_detection_and_cleans_up_the_probe() {
+    let image = format!(
+        "agenttomo-broken-browser-{}:local",
+        uuid::Uuid::new_v4().simple()
+    );
+    let _image = ImageGuard(image.clone());
+    let mut build = Command::new("docker")
+        .args([
+            "build",
+            "--pull=false",
+            "--network=none",
+            "--tag",
+            &image,
+            "-",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    build.stdin.take().unwrap().write_all(
+        b"FROM agenttomo-playground-chrome:24.04\nRUN chmod -x /usr/local/bin/agenttomo-desktop\n",
+    ).await.unwrap();
+    let built = timeout(Duration::from_secs(30), build.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let output = timeout(
+        Duration::from_secs(40),
+        Command::new(env!("CARGO_BIN_EXE_agenttomo-box"))
+            .args(["playground", "--image", &image, "--listen", "127.0.0.1:0"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("cannot detect browser support"), "{error}");
+    assert!(
+        error.contains("/usr/local/bin/agenttomo-desktop"),
+        "{error}"
+    );
+    let remaining = Command::new("docker")
+        .args([
+            "ps",
+            "--all",
+            "--filter",
+            &format!("ancestor={image}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(remaining.status.success());
+    assert!(
+        remaining.stdout.is_empty(),
+        "image probe survived startup failure"
+    );
 }
 
 type Connection =
@@ -329,7 +423,12 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
     );
 
     let (mut socket, _) = connect_async(ws_url).await.unwrap();
-    let (container, _) = ready(&mut socket).await;
+    let (container, id) = ready(&mut socket).await;
+    let session: Value = serde_json::from_slice(
+        &std::fs::read(server.directory.join(id).join("session.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(session["browser"], false);
     socket
         .send(Message::Text(
             json!({"type":"resize","rows":33,"cols":101})

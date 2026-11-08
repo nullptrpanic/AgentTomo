@@ -54,7 +54,7 @@ pub async fn serve(mut socket: WebSocket, app: App) {
         // common cleanup below removes the known container even if start fails.
         docker::create(
             &name,
-            &app.settings.image,
+            &app.settings.image_id,
             &app.settings.binary,
             &directory,
             app.settings.file_preview,

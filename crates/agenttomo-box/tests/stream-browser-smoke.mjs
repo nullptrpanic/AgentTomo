@@ -34,7 +34,7 @@ const wss = new WebSocketServer({ server: fixture, perMessageDeflate: { threshol
 wss.on("connection", socket => socket.on("message", bytes => socket.send(JSON.stringify({ echo: JSON.parse(bytes.toString()), server: "live reply" }))));
 fixture.listen(0, bridge); await once(fixture, "listening");
 const fixtureUrl = `http://${bridge}:${fixture.address().port}/`;
-const server = spawn(`${repo}/target/debug/agenttomo-box`, ["playground", "--browser", "--capture-http", "--listen", "127.0.0.1:0", "--output-dir", directory, "--image", "agenttomo-playground-chrome:24.04", "--stream-window-messages", "30", "--stream-window-bytes", "65536", "--stream-message-max-bytes", "128", "--file-preview-max-bytes", "0"], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+const server = spawn(`${repo}/target/debug/agenttomo-box`, ["playground", "--capture-http", "--listen", "127.0.0.1:0", "--output-dir", directory, "--image", "agenttomo-playground-chrome:24.04", "--stream-window-messages", "30", "--stream-window-bytes", "65536", "--stream-message-max-bytes", "128", "--file-preview-max-bytes", "0"], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
 let output = "", errors = "", browser, session;
 server.stdout.on("data", bytes => output += bytes);
 server.stderr.on("data", bytes => errors += bytes);

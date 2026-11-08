@@ -19,7 +19,7 @@ async fn execute(command: &mut Command) -> io::Result<Output> {
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Docker command timed out"))?
 }
 
-pub async fn check(image: &str) -> io::Result<()> {
+pub async fn check(image: &str) -> io::Result<String> {
     let output =
         execute(Command::new("docker").args(["image", "inspect", "--format", "{{.Id}}", image]))
             .await?;
@@ -29,7 +29,63 @@ pub async fn check(image: &str) -> io::Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(())
+    Ok(String::from_utf8(output.stdout)
+        .map_err(io::Error::other)?
+        .trim()
+        .to_owned())
+}
+
+pub async fn supports_browser(image: &str) -> io::Result<bool> {
+    let name = format!("agenttomo-probe-{}", uuid::Uuid::new_v4().simple());
+    let output = execute(
+        Command::new("docker")
+            .args([
+                "run",
+                "--pull=never",
+                "--rm",
+                "--name",
+                &name,
+                "--network=none",
+                "--read-only",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--user",
+            ])
+            .arg(format!(
+                "{}:{}",
+                nix::unistd::getuid(),
+                nix::unistd::getgid()
+            ))
+            .args([
+                "--entrypoint",
+                "/bin/sh",
+                image,
+                "-c",
+                r#"if [ ! -e /usr/local/bin/agenttomo-browser-session ] &&
+   [ ! -e /usr/local/bin/agenttomo-desktop ] &&
+   [ ! -e /usr/local/bin/agenttomo-chrome ]; then
+    exit 10
+fi
+for helper in agenttomo-browser-session agenttomo-desktop agenttomo-chrome; do
+    if [ ! -x "/usr/local/bin/$helper" ]; then
+        printf 'Missing executable browser helper: /usr/local/bin/%s\n' "$helper" >&2
+        exit 1
+    fi
+done"#,
+            ]),
+    )
+    .await;
+    // Also remove the named probe after a timeout or failed Docker client.
+    remove(&name).await?;
+    let output = output?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(10) => Ok(false),
+        _ => Err(io::Error::other(format!(
+            "cannot detect browser support in Docker image {image}: {}",
+            command_failure(&output)
+        ))),
+    }
 }
 
 fn mount(source: &Path, destination: &str, readonly: bool) -> io::Result<String> {

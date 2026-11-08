@@ -19,8 +19,8 @@ fixture.listen(0, bridge);
 await once(fixture, "listening");
 const httpUrl = `http://${bridge}:${fixture.address().port}/chrome-observation`;
 const server = spawn(`${repo}/target/debug/agenttomo-box`, [
-  "playground", "--browser", "--listen", "127.0.0.1:0", "--output-dir", directory,
-  "--image", "agenttomo-playground-chrome:24.04", "--capture-http", "--file-preview-max-bytes", "0",
+  "playground", "--listen", "127.0.0.1:0", "--output-dir", directory,
+  "--capture-http",
 ], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
 let output = "", errors = "", browser, page, session;
 const events = [], pageErrors = [], warnings = [];
@@ -96,7 +96,9 @@ try {
   assert.ok(events.some(e => e.kind === "network.protocol" && e.data.tls_intercepted && e.data.domain === new URL(httpsUrl).hostname));
   const forbidden = ["--no-sandbox", "--ignore-certificate-errors", "--ignore-certificate-errors-spki-list"];
   assert.ok(events.filter(e => e.kind === "process.exec").every(e => !e.data.argv?.some(arg => forbidden.some(flag => arg === flag || arg.startsWith(`${flag}=`)))));
-  const ca = await readFile(`${directory}/${session.id}/run/task-ca.pem`, "utf8");
+  await assert.rejects(readFile(`${directory}/${session.id}/run/task-ca.pem`), { code: "ENOENT" });
+  const rootPid = events.find(event => event.kind === "process.exec").data.pid;
+  const ca = docker("exec", session.container, "cat", `/proc/${rootPid}/root/etc/ssl/certs/agenttomo-task-ca.pem`);
   const nss = docker("exec", session.container, "certutil", "-d", "sql:/tmp/.local/share/pki/nssdb", "-L", "-a", "-n", "AgentTomo task CA");
   assert.equal(nss.replace(/\s/g, ""), ca.replace(/\s/g, ""));
   assert.equal(docker("exec", session.container, "cat", "/etc/ssl/certs/ca-certificates.crt").includes(ca), false);

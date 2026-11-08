@@ -28,6 +28,7 @@ use crate::cli::PlaygroundArgs;
 struct Settings {
     browser: bool,
     image: String,
+    image_id: String,
     binary: PathBuf,
     output_dir: PathBuf,
     token: String,
@@ -55,7 +56,8 @@ impl Access {
 }
 
 pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
-    docker::check(&options.image).await?;
+    let image_id = docker::check(&options.image).await?;
+    let browser = docker::supports_browser(&image_id).await?;
     tokio::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -63,8 +65,9 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
         .await?;
     let app = App {
         settings: Arc::new(Settings {
-            browser: options.browser,
+            browser,
             image: options.image,
+            image_id,
             binary: std::fs::canonicalize(std::env::current_exe()?)?,
             output_dir: tokio::fs::canonicalize(options.output_dir).await?,
             token: uuid::Uuid::new_v4().simple().to_string(),
@@ -216,6 +219,7 @@ mod tests {
             settings: Arc::new(Settings {
                 browser: false,
                 image: String::new(),
+                image_id: String::new(),
                 binary: PathBuf::new(),
                 output_dir: directory.clone(),
                 token: "test-token".into(),
@@ -315,6 +319,7 @@ mod tests {
             settings: Arc::new(Settings {
                 browser: false,
                 image: String::new(),
+                image_id: String::new(),
                 binary: PathBuf::new(),
                 output_dir: directory.clone(),
                 token: "test-token".into(),
@@ -426,6 +431,7 @@ mod tests {
             settings: Arc::new(Settings {
                 browser: false,
                 image: String::new(),
+                image_id: String::new(),
                 binary: PathBuf::new(),
                 output_dir: PathBuf::new(),
                 token: "test-token".into(),

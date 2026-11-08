@@ -58,14 +58,11 @@ pub struct RunArgs {
 
 #[derive(Args)]
 pub struct PlaygroundArgs {
-    /// Show a traced Chrome window (requires the Playground Chrome image)
-    #[arg(long)]
-    pub browser: bool,
     /// HTTP address; use 0.0.0.0:8080 to accept connections from other hosts
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
-    /// Local Docker image containing /bin/bash; images are never pulled automatically
-    #[arg(long, default_value = "agenttomo-playground:24.04")]
+    /// Local Docker image; compatible images open Chrome automatically
+    #[arg(long, default_value = "agenttomo-playground-chrome:24.04")]
     pub image: String,
     /// Directory for retained session recordings
     #[arg(long, default_value = ".agenttomo/playground")]

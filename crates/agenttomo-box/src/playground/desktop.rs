@@ -43,7 +43,7 @@ pub async fn start(container: &str) -> io::Result<Child> {
         let _ = stderr.take(4096).read_to_string(&mut error).await;
     }
     Err(io::Error::other(format!(
-        "cannot start desktop: {}; --browser requires the agenttomo-playground-chrome image",
+        "cannot start desktop: {}; check the selected image's desktop helpers",
         if error.trim().is_empty() {
             "display did not become ready"
         } else {

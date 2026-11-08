@@ -1,8 +1,8 @@
 # Playground 工具镜像
 
-`agenttomo-playground:24.04` 基于 Ubuntu 24.04，是 `agenttomo-box playground` 的默认镜像。
+`agenttomo-playground:24.04` 基于 Ubuntu 24.04，供终端诊断使用。通过 `--image agenttomo-playground:24.04` 选择。
 
-需要网页内操作 Chrome 并观察其行为时，使用可选的 [Chrome 镜像](../playground-chrome/README.md) 和 `--browser`；加上 `--capture-http` 可注入 Chrome 的 CA 信任并采集 HTTPS 内容。
+Playground 默认选择 Chrome 镜像并自动打开浏览器。加上 `--capture-http` 可注入 Chrome 的 CA 信任并采集 HTTPS 内容。详见 [Chrome 镜像](../playground-chrome/README.md)。
 
 在仓库根目录构建：
 
@@ -39,4 +39,4 @@ cargo run -p agenttomo-box -- playground --image my-compatible-image:latest
 
 已有容器不会随镜像重建而变化；使用新版本启动 Playground，再创建会话即可使用新镜像。
 
-验证时使用 UID/GID 1000、cap-drop=ALL 和 no-new-privileges 检查工具存在及基本操作；Playground 的 Docker 集成测试还会在默认镜像的终端中运行 ifconfig、ip、curl、dig、jq 和 Python。真实浏览器验证包含 curl 请求本地 HTTP 服务及 dig 查询 DNS，对应 TCP/UDP 事件均正常记录。
+验证时使用 UID/GID 1000、cap-drop=ALL 和 no-new-privileges 检查工具存在及基本操作。Playground 的 Docker 集成测试通过 `--image` 选择工具镜像，在终端中运行 ifconfig、ip、curl、dig、jq 和 Python。真实浏览器验证包含 curl 请求本地 HTTP 服务及 dig 查询 DNS，对应 TCP/UDP 事件均正常记录。
