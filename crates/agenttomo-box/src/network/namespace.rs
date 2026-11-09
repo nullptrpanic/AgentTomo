@@ -7,7 +7,7 @@ use nix::{
     sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg},
 };
 use std::{
-    io::{self, IoSlice, IoSliceMut, Read},
+    io::{self, IoSlice, IoSliceMut, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::net::UnixStream,
@@ -59,7 +59,7 @@ struct CapData {
     inheritable: u32,
 }
 
-fn capabilities(setup: bool) -> io::Result<()> {
+fn capabilities(setup: bool, root_session: bool) -> io::Result<()> {
     let header = CapHeader {
         version: 0x20080522,
         pid: 0,
@@ -68,12 +68,21 @@ fn capabilities(setup: bool) -> io::Result<()> {
     if setup {
         Errno::result(unsafe { libc::syscall(libc::SYS_capget, &header, caps.as_mut_ptr()) })?;
         caps[0].inheritable |= (1 << 12) | (1 << 13);
+    } else if root_session {
+        // SETGID/SETUID allow the root terminal to launch an unprivileged
+        // browser. Network and mount administration stay out of the workload.
+        let identity = (1 << 6) | (1 << 7);
+        caps[0] = CapData {
+            effective: identity,
+            permitted: identity,
+            inheritable: identity,
+        };
     }
     Errno::result(unsafe { libc::syscall(libc::SYS_capset, &header, caps.as_ptr()) })?;
-    if setup {
-        // Keep the caller's numeric UID/GID inside the new namespace. Ambient
-        // NET_ADMIN/NET_RAW let ip/iptables run without mapping the caller to root.
-        for cap in [12, 13] {
+    if setup || root_session {
+        // Ambient capabilities survive exec for the namespace setup tools, or
+        // for dropping the root terminal's child to the browser's ordinary UID.
+        for cap in if setup { [12, 13] } else { [6, 7] } {
             Errno::result(unsafe {
                 libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_RAISE, cap, 0, 0)
             })?;
@@ -93,7 +102,8 @@ fn capabilities(setup: bool) -> io::Result<()> {
 }
 
 pub fn prepare(
-    control: &UnixStream,
+    mut control: &UnixStream,
+    root_session: bool,
     prepare_filesystem: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     let ipv6_egress = has_outer_ipv6_route()?;
@@ -101,10 +111,19 @@ pub fn prepare(
     let gid = nix::unistd::getgid().as_raw();
     Errno::result(unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) })
         .map_err(|e| io::Error::other(format!("cannot create private user/network namespace: {e}; namespace/netfilter permissions are required (no fallback)")))?;
-    std::fs::write("/proc/self/setgroups", "deny")?;
-    std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1\n"))?;
-    std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1\n"))?;
-    capabilities(true)?;
+    if root_session {
+        control.write_all(b"U")?;
+        let mut mapped = [0];
+        control.read_exact(&mut mapped)?;
+        if mapped != *b"M" {
+            return Err(io::Error::other("root session identity mapping failed"));
+        }
+    } else {
+        std::fs::write("/proc/self/setgroups", "deny")?;
+        std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1\n"))?;
+        std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1\n"))?;
+    }
+    capabilities(true, root_session)?;
     let directory = std::env::temp_dir().join(format!("agenttomo-net-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&directory)?;
     let result = setup(&directory.join("xtables.lock"), ipv6_egress);
@@ -114,12 +133,15 @@ pub fn prepare(
     // A root-mapped caller must not regain capabilities at exec, either.
     Errno::result(unsafe { libc::prctl(libc::PR_SET_SECUREBITS, 3, 0, 0, 0) })?;
     for cap in 0..64 {
+        if root_session && [6, 7].contains(&cap) {
+            continue;
+        }
         let result = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) };
         if result < 0 && Errno::last() != Errno::EINVAL {
             return Err(Errno::last().into());
         }
     }
-    capabilities(false)?;
+    capabilities(false, root_session)?;
     nix::sys::prctl::set_no_new_privs()?;
     // Mapping credentials clears dumpability. Restore only this same-UID helper
     // so its parent tracer can inspect known FDs and memory after the gate.
@@ -136,6 +158,34 @@ pub fn prepare(
         None,
     )?;
     Ok(())
+}
+
+pub fn map_root_session(control: &mut UnixStream, child: nix::unistd::Pid) -> io::Result<()> {
+    let mut ready = [0];
+    control.read_exact(&mut ready)?;
+    if ready != *b"U" {
+        let mut error = String::new();
+        control.take(4096).read_to_string(&mut error)?;
+        return Err(io::Error::other(format!(
+            "cannot initialize root session: {error}"
+        )));
+    }
+    // Only the parent can map multiple identities. Reuse its mapped ranges so
+    // Chrome can drop privileges and create its own normal user namespace.
+    for map in ["uid_map", "gid_map"] {
+        let outer = std::fs::read_to_string(format!("/proc/self/{map}"))?;
+        let mut inner = String::new();
+        for line in outer.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if let [start, _, count] = fields.as_slice() {
+                inner.push_str(&format!("{start} {start} {count}\n"));
+            } else {
+                return Err(io::Error::other("invalid parent identity map"));
+            }
+        }
+        std::fs::write(format!("/proc/{child}/{map}"), inner)?;
+    }
+    control.write_all(b"M")
 }
 
 fn has_outer_ipv6_route() -> io::Result<bool> {

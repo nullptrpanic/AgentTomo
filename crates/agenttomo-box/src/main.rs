@@ -1,5 +1,6 @@
 mod cli;
 mod collectors;
+mod credentials;
 mod execution;
 mod network;
 mod playground;
@@ -20,9 +21,25 @@ fn main() -> ExitCode {
     if let cli::Command::Tracee {
         command,
         trust_overlay,
+        root_session,
     } = &cli.command
     {
-        return ExitCode::from(execution::child::exec(command, trust_overlay.as_deref()));
+        return ExitCode::from(execution::child::exec(
+            command,
+            trust_overlay.as_deref(),
+            *root_session,
+        ));
+    }
+    if let cli::Command::Collector {
+        record_uid: Some(uid),
+        record_gid: Some(gid),
+        ..
+    } = &cli.command
+    {
+        if let Err(error) = credentials::filesystem_identity(*uid, *gid) {
+            eprintln!("agenttomo-box: {error}");
+            return ExitCode::from(125);
+        }
     }
     let result = Builder::new_current_thread()
         .enable_all()
@@ -46,6 +63,7 @@ fn main() -> ExitCode {
                         terminal,
                         file_preview,
                         http,
+                        ..
                     } => {
                         let result = execution::collector::run(
                             &command,

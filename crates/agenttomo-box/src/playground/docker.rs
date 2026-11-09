@@ -124,16 +124,27 @@ pub async fn create(
                 "--interactive",
                 "--init",
                 "--cap-drop=ALL",
+                // Root bootstrap needs credential mapping; DAC_OVERRIDE lets
+                // the collector inspect the browser's private files. Target
+                // capabilities are restricted in its own user namespace.
+                "--cap-add=SETUID",
+                "--cap-add=SETGID",
+                "--cap-add=SETFCAP",
+                "--cap-add=DAC_OVERRIDE",
                 "--security-opt=no-new-privileges",
                 // This development playground must allow nested user/net
-                // namespaces. Keep host capabilities dropped; rules are only
-                // configured in a new namespace owned by the launch helper.
+                // namespaces. Network/mount administration is only available
+                // in a new namespace owned by the launch helper.
                 "--security-opt=seccomp=unconfined",
                 "--security-opt=apparmor=unconfined",
                 "--workdir",
-                "/tmp",
+                "/root",
                 "--env",
-                "HOME=/tmp",
+                "HOME=/root",
+                "--env",
+                "USER=root",
+                "--env",
+                "LOGNAME=root",
                 "--env",
                 "TERM=xterm-256color",
                 "--env",
@@ -145,11 +156,7 @@ pub async fn create(
                 vec![]
             })
             .arg("--user")
-            .arg(format!(
-                "{}:{}",
-                nix::unistd::getuid(),
-                nix::unistd::getgid()
-            ))
+            .arg("0:0")
             .arg("--mount")
             .arg(mount(binary, "/agenttomo-box", true)?)
             .arg("--mount")
@@ -169,6 +176,10 @@ pub async fn create(
                     "exec /bin/bash --noprofile --norc -i"
                 },
             ])
+            .arg("--record-uid")
+            .arg(nix::unistd::getuid().as_raw().to_string())
+            .arg("--record-gid")
+            .arg(nix::unistd::getgid().as_raw().to_string())
             .arg("--file-preview-max-bytes")
             .arg(preview_limits.max_bytes.to_string())
             .arg("--file-preview-total-bytes")

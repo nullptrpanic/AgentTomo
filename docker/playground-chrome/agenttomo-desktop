@@ -10,6 +10,9 @@ if [ "$desktop_nofile" = unlimited ] || [ "$desktop_nofile" -gt 4096 ]; then
 fi
 state=/tmp/agenttomo-desktop
 mkdir -p "$state"
+# The root terminal waits for ready from its nested user namespace. Allow path
+# traversal while keeping the cookie and display logs private to the browser.
+chmod 0711 "$state"
 export DISPLAY=:99 XAUTHORITY="$state/Xauthority"
 touch "$XAUTHORITY"
 xauth -f "$XAUTHORITY" add "$DISPLAY" . "$(python3 -c 'import secrets; print(secrets.token_hex(16))')"

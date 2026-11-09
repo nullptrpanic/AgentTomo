@@ -16,7 +16,9 @@ The Chrome image installs the official Google Chrome stable amd64 Debian package
 Xvfb, x11vnc, Openbox, xauth, X11 utilities, NSS certificate tools, and CJK fonts.
 It requires network access while building, not while starting a session. Chrome
 is proprietary software; its package is downloaded from Google during the build.
-Run the Playground as a non-root user so Chrome can retain its normal sandbox.
+The host Playground service can run as a non-root user. Container terminals run
+as root, while the Chrome wrapper drops to nobody (UID/GID 65534) and retains
+Chrome's normal sandbox. Rebuild this image when updating its helper scripts.
 
 Start the Playground:
 
@@ -45,10 +47,15 @@ Remove `--browser` from older startup commands.
 ## Ownership and transport
 
 - The traced startup script launches Chrome as a child and then becomes Bash.
+  Bash uses UID/GID 0 and `/root`; Chrome uses UID/GID 65534 and `HOME=/tmp`.
+  The wrapper uses `setpriv` to drop the browser's root identity, including when
+  `google-chrome` is invoked again from the terminal. No `--no-sandbox` is added.
   Chrome's descendants inherit the existing tracing and proxy configuration.
   Network requests are attributed to the actual network service PID; this is
   process attribution, not a mapping to browser tabs or individual renderers.
 - Xvfb, Openbox and x11vnc run in the same container outside the traced tree.
+  They share Chrome's unprivileged identity; the ready directory allows traversal
+  by the root terminal, while the X11 cookie and logs remain private.
   X11 uses a cookie-authenticated filesystem socket and has TCP disabled.
   Only the display helpers have their FD limit capped at 4096: x11vnc otherwise
   scans enormous Docker FD limits during startup. The traced workload's limit

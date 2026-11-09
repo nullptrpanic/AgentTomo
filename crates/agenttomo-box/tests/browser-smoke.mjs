@@ -78,9 +78,12 @@ try {
   assert.equal(await page.evaluate(() => window.isSecureContext), false);
   await until(async () => await page.locator("#browser-status").textContent() === "Connected · Chrome");
   assert.equal(session.browser, true);
+  assert.equal(docker("exec", session.container, "id", "-u").trim(), "0", "the container collector runs as root");
   await until(() => docker("exec", session.container, "xwininfo", "-root", "-tree").includes("Google Chrome"));
   await navigate(httpUrl);
   const request = events.find(e => e.kind === "network.http.request" && e.data.url === httpUrl);
+  const browserStatus = docker("exec", session.container, "cat", `/proc/${request.data.pid}/status`);
+  assert.match(browserStatus, /^Uid:\s+65534\s+65534\s+65534\s+65534$/m, "the observed browser keeps an unprivileged identity");
   assert.ok(events.some(e => e.kind === "process.exec" && e.data.pid === request.data.pid && e.data.argv?.includes("--utility-sub-type=network.mojom.NetworkService")));
   assert.ok(events.some(e => e.kind === "file.open"));
   assert.ok(!events.some(e => e.kind === "process.exec" && ["Xvfb", "x11vnc", "openbox"].includes(e.data.argv?.[0]?.split("/").pop())));
@@ -107,6 +110,7 @@ try {
   assert.ok(events.filter(e => e.kind === "process.exec").every(e => !e.data.argv?.some(arg => forbidden.some(flag => arg === flag || arg.startsWith(`${flag}=`)))));
   await assert.rejects(readFile(`${directory}/${session.id}/run/task-ca.pem`), { code: "ENOENT" });
   const rootPid = events.find(event => event.kind === "process.exec").data.pid;
+  assert.match(docker("exec", session.container, "cat", `/proc/${rootPid}/status`), /^Uid:\s+0\s+0\s+0\s+0$/m, "the terminal workload runs as root");
   const ca = docker("exec", session.container, "cat", `/proc/${rootPid}/root/etc/ssl/certs/agenttomo-task-ca.pem`);
   const nss = docker("exec", session.container, "certutil", "-d", "sql:/tmp/.local/share/pki/nssdb", "-L", "-a", "-n", "AgentTomo task CA");
   assert.equal(nss.replace(/\s/g, ""), ca.replace(/\s/g, ""));
@@ -168,6 +172,9 @@ try {
   console.log(JSON.stringify({ result: "PASS", networkPid: request.data.pid, https: httpsUrl, checks: ["connection to Traffic", "panel drag and keyboard resize", "file preview after Chrome startup", "snapshot reuse", "raw event details", "narrow layout"], warnings }));
 } catch (error) {
   console.error("Playground stderr:", errors);
+  if (session) {
+    try { console.error("Chrome log:", docker("exec", session.container, "tail", "-30", "/tmp/agenttomo-chrome.log")); } catch { /* session may already be removed */ }
+  }
   throw error;
 } finally {
   await browser?.close();

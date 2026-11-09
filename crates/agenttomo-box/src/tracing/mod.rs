@@ -82,11 +82,23 @@ fn run(
     capture_files: bool,
     trust_overlay: Option<(std::path::PathBuf, String)>,
 ) -> io::Result<()> {
+    let root_session = with_terminal && nix::unistd::geteuid().is_root();
+    if root_session {
+        // This thread reads target memory/FDs and spawns the root shell. Only
+        // the recording/runtime threads retain the host filesystem identity.
+        crate::credentials::filesystem_identity(
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        )?;
+    }
     // The helper cannot exec user code until we arm ptrace and send its gate byte.
     // SEIZE supports group-stop/LISTEN and avoids a pre_exec SIGSTOP/spawn deadlock.
     let (mut control, child_control) = UnixStream::pair()?;
     let mut launch = Command::new(std::env::current_exe()?);
     launch.arg("__tracee").arg("-c").arg(command);
+    if root_session {
+        launch.arg("--root-session");
+    }
     if let Some((path, _)) = &trust_overlay {
         launch.arg("--trust-overlay").arg(path);
     }
@@ -129,6 +141,9 @@ fn run(
             let length = u32::try_from(pem.len()).map_err(io::Error::other)?;
             control.write_all(&length.to_be_bytes())?;
             control.write_all(pem.as_bytes())?;
+        }
+        if root_session {
+            crate::network::namespace::map_root_session(&mut control, root)?;
         }
         crate::network::namespace::receive(&mut control)
     })();

@@ -53,7 +53,11 @@ flowchart LR
 
 Docker CLI 子进程使用独立进程组，宿主终端的 Ctrl-C 由 Playground 处理，连续按键不会打断创建、attach 或清理命令；网页终端中的 Ctrl-C 仍通过 PTY 作用于目标前台任务。控制命令保留 30 秒超时。`docker rm` 失败或超时时，再查询该名称的容器：只有查询成功且确认不存在才把清理记为成功；容器仍存在或无法查询时，记录原命令的退出码/信号或 I/O 错误，以及复核结果，不把 Docker 权限/连接错误视为容器已删除。
 
-默认使用本地 `agenttomo-playground-chrome:24.04` 并自动启动 Chrome，镜像包含 Ubuntu 24.04 工具集和桌面组件。构建方法见[镜像说明](../docker/playground-chrome/README.md)。可由 `--image` 指定其他兼容镜像，不自动拉取或构建。只挂载只读的 box 二进制和该会话日志目录；不挂载项目、宿主根目录或 Docker socket 到目标容器。目标保持当前用户 UID/GID、cap-drop=ALL 和 no-new-privileges，不使用 privileged。为允许嵌套 user/net namespace，开发容器设置 seccomp=unconfined、apparmor=unconfined；这放宽了容器策略。网络工具与内核 TPROXY 能力不足时启动失败，不回退旧路径。
+默认使用本地 `agenttomo-playground-chrome:24.04` 并自动启动 Chrome，镜像包含 Ubuntu 24.04 工具集和桌面组件。构建方法见[镜像说明](../docker/playground-chrome/README.md)。可由 `--image` 指定其他兼容镜像，不自动拉取或构建。只挂载只读的 box 二进制和该会话日志目录；不挂载项目、宿主根目录或 Docker socket 到目标容器。
+
+容器采集器及终端使用 root（UID/GID 0），终端的 HOME 和初始工作目录为 `/root`。容器从 `cap-drop=ALL` 开始，仅为身份映射和文件检查增加 SETUID、SETGID、SETFCAP、DAC_OVERRIDE，保留 no-new-privileges，不使用 privileged。启动器在独立 user/net namespace 中完成配置，父采集器写入与外层相同的有效 UID/GID 范围，使终端可以切换到普通浏览器用户。目标执行前收回网络、挂载等管理能力，只保留身份切换能力；root 账号仍受这些能力限制，并非无限制的系统管理权限。为允许嵌套 user/net namespace，开发容器设置 seccomp=unconfined、apparmor=unconfined；这放宽了容器策略。网络工具与内核 TPROXY 能力不足时启动失败，不回退旧路径。
+
+采集器在创建 Tokio/文件写入线程前，把 FSUID/FSGID 设置为宿主日志用户，保持记录目录 0700、文件 0600 且由宿主用户所有；不通过放宽日志权限共享内容。专用 tracer 线程恢复 root 的文件访问身份后启动目标和检查进程，避免把宿主日志身份带入终端。普通 `run` 沿用调用者身份。
 
 终端使用独立 PTY，支持输入、ANSI 显示、Ctrl-C、窗口 resize 和 Bash 作业控制。PTY 的 stdout/stderr 天然合并，保存到 stdout.log，不能再声称两个流可以分开。普通 `run` 继续使用原来的独立管道。
 
@@ -64,7 +68,7 @@ Docker CLI 子进程使用独立进程组，宿主终端的 Ctrl-C 由 Playgroun
 启动时检查所选镜像中的浏览器启动、桌面和 Chrome wrapper 三个可执行脚本。完整安装自动启用浏览器，全部缺省进入终端模式，部分安装或 Docker 探测失败则报告错误。检查在网络禁用、只读的临时容器中执行并清理，后续会话使用同一镜像 ID。`--image` 保留镜像选择能力，旧命令应删除 `--browser`。
 浏览器模式下左侧显示 Terminal / Browser 标签页，右侧展示观察视图和原始事件详情。
 被跟踪的启动脚本等待图形环境就绪后启动 Chrome，再 exec 为交互 Bash；
-Chrome 的网络服务及其他后代复用同一采集链路。Xvfb/Openbox/x11vnc 作为
+Chrome wrapper 使用 setpriv 切换为 nobody（UID/GID 65534，HOME=/tmp），保留 Chrome 自身沙箱及证书校验，不加入 --no-sandbox。Chrome 的网络服务及其他后代复用同一采集链路。Xvfb/Openbox/x11vnc 同样使用 nobody，作为
 会话内显示基础设施运行，不放入目标进程树。独立 desktop 模块负责就绪检查、
 `/api/sessions/{session}/desktop` WebSocket 的 token/Origin/存活会话校验、
 有界转发和取消；仅通过 Docker exec 连接容器 loopback VNC，无额外公开端口。

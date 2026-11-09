@@ -1,6 +1,13 @@
 #!/bin/sh
 set -eu
 umask 077
+if [ "$(id -u)" -eq 0 ]; then
+    # The terminal is root, but Chrome keeps its own sandbox. Drop all root
+    # identities before re-entering this wrapper to set up the private NSS store.
+    cd /tmp
+    exec setpriv --reuid=65534 --regid=65534 --clear-groups \
+        env HOME=/tmp USER=nobody LOGNAME=nobody "$0" "$@"
+fi
 # Chrome uses NSS, not the system PEM bundle. Only the disposable container's
 # user store is changed; the task CA is read from the existing trust overlay.
 ca=/etc/ssl/certs/agenttomo-task-ca.pem

@@ -2,7 +2,11 @@
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::{os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
+use std::{
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::PathBuf,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
@@ -238,9 +242,13 @@ async fn server_shutdown_closes_an_active_desktop_without_http_capture() {
 async fn browser_mode_reports_missing_image_helpers_and_removes_the_container() {
     // The image passes detection, then a desktop launch failure must still clean up.
     let wrapper = r#"#!/bin/sh
-if [ "$1" = exec ] && [ "$3" = /usr/local/bin/agenttomo-desktop ]; then
-    echo 'desktop helper unavailable' >&2
-    exit 42
+if [ "$1" = exec ]; then
+    for argument do
+        if [ "$argument" = /usr/local/bin/agenttomo-desktop ]; then
+            echo 'desktop helper unavailable' >&2
+            exit 42
+        fi
+    done
 fi
 exec "$AGENTTOMO_TEST_REAL_DOCKER" "$@"
 "#;
@@ -425,7 +433,7 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
     let (mut socket, _) = connect_async(ws_url).await.unwrap();
     let (container, id) = ready(&mut socket).await;
     let session: Value = serde_json::from_slice(
-        &std::fs::read(server.directory.join(id).join("session.json")).unwrap(),
+        &std::fs::read(server.directory.join(&id).join("session.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(session["browser"], false);
@@ -439,7 +447,7 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
         .unwrap();
     socket
         .send(Message::Binary(
-            b"test -t 0 && printf 'PTY_OK\\n'; stty size; if ifconfig lo >/dev/null && ip link show lo >/dev/null && curl --version >/dev/null && dig -v >/dev/null && jq -n -e '1 + 1 == 2' >/dev/null && python3 -c 'import socket'; then printf 'TOOLS_OK\\n'; else printf 'TOOLS_MISSING\\n'; fi; /bin/echo TRACE_VERIFIED\n"
+            b"test -t 0 && printf 'PTY_OK\\n'; stty size; if [ \"$(id -u):$(id -g):$HOME\" = '0:0:/root' ] && [ \"$(whoami)\" = root ] && printf root > /etc/agenttomo-root-check; then printf 'ROOT_OK\\n'; else printf 'ROOT_MISSING\\n'; fi; if ifconfig lo >/dev/null && ip link show lo >/dev/null && curl --version >/dev/null && dig -v >/dev/null && jq -n -e '1 + 1 == 2' >/dev/null && python3 -c 'import socket'; then printf 'TOOLS_OK\\n'; else printf 'TOOLS_MISSING\\n'; fi; /bin/echo TRACE_VERIFIED\n"
                 .to_vec()
                 .into(),
         ))
@@ -471,6 +479,11 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
     .expect("terminal output or matching trace was missing");
     assert!(String::from_utf8_lossy(&terminal).contains("PTY_OK\r\n"));
     assert!(
+        String::from_utf8_lossy(&terminal).contains("ROOT_OK\r\n"),
+        "{}",
+        String::from_utf8_lossy(&terminal)
+    );
+    assert!(
         String::from_utf8_lossy(&terminal).contains("TOOLS_OK\r\n"),
         "{}",
         String::from_utf8_lossy(&terminal)
@@ -479,6 +492,26 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
     socket.close(None).await.unwrap();
     removed(&container).await;
     server.stop().await;
+    let run = server.directory.join(&id).join("run");
+    for path in [
+        run.clone(),
+        run.join("events.jsonl"),
+        run.join("stdout.log"),
+        run.join("collection-status.json"),
+    ] {
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            metadata.uid(),
+            nix::unistd::getuid().as_raw(),
+            "{}",
+            path.display()
+        );
+        assert_eq!(
+            metadata.permissions().mode() & 0o077,
+            0,
+            "recordings remain private"
+        );
+    }
     let _ = std::fs::remove_dir_all(&server.directory);
 }
 

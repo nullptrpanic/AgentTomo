@@ -25,6 +25,10 @@ pub enum Command {
         output_dir: PathBuf,
         #[arg(long)]
         terminal: bool,
+        #[arg(long, requires = "record_gid")]
+        record_uid: Option<u32>,
+        #[arg(long, requires = "record_uid")]
+        record_gid: Option<u32>,
         #[command(flatten)]
         file_preview: FilePreviewArgs,
         #[command(flatten)]
@@ -36,6 +40,8 @@ pub enum Command {
         command: OsString,
         #[arg(long)]
         trust_overlay: Option<PathBuf>,
+        #[arg(long)]
+        root_session: bool,
     },
 }
 

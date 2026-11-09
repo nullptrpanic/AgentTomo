@@ -21,7 +21,21 @@ use super::{Access, App, same_origin};
 
 pub async fn start(container: &str) -> io::Result<Child> {
     let mut child = Command::new("docker")
-        .args(["exec", container, "/usr/local/bin/agenttomo-desktop"])
+        .args([
+            "exec",
+            "--user",
+            "65534:65534",
+            "--workdir",
+            "/tmp",
+            "--env",
+            "HOME=/tmp",
+            "--env",
+            "USER=nobody",
+            "--env",
+            "LOGNAME=nobody",
+            container,
+            "/usr/local/bin/agenttomo-desktop",
+        ])
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
