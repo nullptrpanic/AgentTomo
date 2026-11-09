@@ -10,6 +10,7 @@
   <link rel="stylesheet" href="/assets/style.css">
   <link rel="stylesheet" href="/assets/file-preview.css">
   <link rel="stylesheet" href="/assets/traffic.css">
+  <link rel="stylesheet" href="/assets/behavior-graph.css">
   <link rel="stylesheet" href="/assets/browser.css">
   <script defer src="/assets/vendor/xterm.js"></script>
   <script defer src="/assets/vendor/addon-fit.js"></script>
@@ -40,8 +41,8 @@
     <div id="panel-resizer" role="separator" tabindex="0" aria-label="Resize workspace and activity panels" aria-orientation="vertical" aria-controls="workspace-panel" title="Drag to resize · Arrow keys to adjust · Double-click to reset"></div>
     <section id="monitor-panel" class="trace-panel" aria-labelledby="trace-title">
       <div class="panel-heading"><div><span class="eyebrow">OBSERVABILITY</span><h2 id="trace-title">Activity <span id="event-count" class="count">0</span></h2></div><span id="trace-session" class="trace-label"><span class="small-dot"></span> Live behaviors</span></div>
-      <nav class="observation-tabs" aria-label="Observation view"><button type="button" data-observation="process" aria-pressed="true">Process tree</button><button type="button" data-observation="traffic" aria-pressed="false">Traffic</button></nav>
-      <p class="trace-description">Expand a process to inspect its behavior and descendants.<br><span id="capture-description">Process lifecycle · file opens · mmap · TCP / UDP · HTTP Host / TLS SNI.</span></p>
+      <nav class="observation-tabs" aria-label="Observation view"><button type="button" data-observation="process" aria-pressed="true">Process tree</button><button type="button" data-observation="graph" aria-pressed="false">Graph</button><button type="button" data-observation="traffic" aria-pressed="false">Traffic</button></nav>
+      <p class="trace-description"><span id="view-description">Expand a process to inspect its behavior and descendants.</span><br><span id="capture-description">Process lifecycle · file opens · mmap · TCP / UDP · HTTP Host / TLS SNI.</span></p>
       <div class="trace-tools">
         <details id="event-filter" class="event-filter">
           <summary>Event filters <span class="filter-state">All events</span></summary>
@@ -56,6 +57,11 @@
         <div id="empty-trace"><span class="empty-icon" aria-hidden="true">⌁</span><strong>Waiting for activity</strong><p>Try <code>ls /tmp</code> or <code>uname -a</code> in the terminal.</p></div>
         <ul id="process-tree" aria-label="Process tree"></ul>
       </div>
+      <section id="graph-scroll" tabindex="0" aria-label="Process and event graph" hidden>
+        <div class="graph-legend" aria-label="Node categories"><span data-category="process">Process</span><span data-category="file">File</span><span data-category="network">Network</span><span data-category="memory">Memory</span></div>
+        <p id="empty-graph">Waiting for process activity</p>
+        <div id="behavior-graph"><ul class="graph-roots" aria-label="Processes and their event cards"></ul></div>
+      </section>
       <section id="traffic" aria-label="Traffic inspector" hidden></section>
       <aside id="file-preview" aria-label="File preview" hidden></aside>
       <details id="event-detail"><summary>Selected event <span id="selected-sequence"></span></summary><pre id="event-json">Select a trace row to inspect its fields.</pre></details>

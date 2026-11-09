@@ -87,10 +87,7 @@ try {
   await page.locator(`.process-node[data-pid="${request.data.pid}"]`).last().evaluate(node => {
     for (let parent = node; parent; parent = parent.parentElement) if (parent.tagName === "DETAILS") parent.open = true;
   });
-  const connections = events.filter(e => e.kind === "network.upstream" && e.data.destination === `${bridge}:${fixture.address().port}`);
-  const connectionIndex = connections.findIndex(e => e.data.connection_id === request.data.connection_id);
-  assert.ok(connectionIndex >= 0);
-  await page.locator(".event-row").filter({ has: page.locator(".event-type", { hasText: /^network\.upstream$/ }) }).filter({ hasText: `${bridge}:${fixture.address().port}` }).nth(connectionIndex).click();
+  await page.locator(`.trace-network-flow[data-connection-id="${request.data.connection_id}"] > .event-row`).click();
   assert.ok(await page.locator("#traffic").isVisible(), "connection event must open Traffic");
   assert.ok((await page.locator(".traffic-navigation").textContent()).includes(`Connection #${request.data.connection_id}`));
   await until(async () => (await page.locator(".traffic-body").textContent()).includes("chrome-observed"));

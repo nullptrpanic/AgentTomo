@@ -1,9 +1,13 @@
+import { eventTime } from "./event-time.mjs";
+
 const fields = new Map([
   ["network.http.request", "request"], ["network.http.response", "response"],
   ["network.http.request.body", "requestBody"], ["network.http.response.body", "responseBody"],
   ["network.http.error", "error"],
   ["network.stream.open", "stream"], ["network.stream.closed", "streamClosed"],
 ]);
+
+export const httpEventField = kind => fields.get(kind);
 
 export class TrafficModel {
   constructor(limit = 1000) {
@@ -13,7 +17,7 @@ export class TrafficModel {
     this.omitted = 0;
   }
   add(event) {
-    const field = fields.get(event.kind), id = event.data?.request_id;
+    const field = httpEventField(event.kind), id = event.data?.request_id;
     if (!field || !Number.isSafeInteger(id) || id <= this.evictedThrough && !this.entries.has(id)) return null;
     let row = this.entries.get(id);
     if (!row) {
@@ -40,7 +44,9 @@ export class TrafficModel {
   }
   visible(query = "", connectionId = null) {
     const filter = query.trim().toLowerCase();
-    return [...this.entries.values()].sort((a, b) => a.id - b.id).filter(row => {
+    return [...this.entries.values()].sort((a, b) =>
+      (eventTime(a.request || a.latest) ?? Infinity) - (eventTime(b.request || b.latest) ?? Infinity) || a.id - b.id
+    ).filter(row => {
       if (connectionId !== null && row.connectionId !== connectionId) return false;
       const data = row.request?.data || row.latest.data;
       return !filter || [data.url, data.method, data.pid, row.response?.data.status_code, row.error?.data.error, row.stream?.data.protocol].join(" ").toLowerCase().includes(filter);

@@ -2,6 +2,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { TrafficModel } from "../src/playground/assets/traffic-model.mjs";
 
+test("Traffic orders complete exchanges by request start, regardless of ID or response arrival", () => {
+  const model = new TrafficModel();
+  model.add({ kind: "network.http.request", data: { request_id: 1, connection_id: 9, started_unix_ns: 30, url: "/second" } });
+  model.add({ kind: "network.http.request", data: { request_id: 2, connection_id: 9, started_unix_ns: 20, url: "/first" } });
+  model.add({ kind: "network.http.response.body", data: { request_id: 2, connection_id: 9, started_unix_ns: 20, body: { observed_bytes: 5 } } });
+  assert.deepEqual(model.visible().map(row => row.id), [2, 1]);
+  assert.equal(model.entries.size, 2);
+  assert.deepEqual(model.matching({ data: { connection_id: 9 } }).map(row => row.id), [2, 1]);
+});
+
 const event = (kind, id, fields = {}) => ({ kind: `network.http.${kind}`, data: { request_id: id, started_unix_ns: id * 1000000, ...fields } });
 
 test("traffic joins separate body records by request id, including keep-alive and late events", () => {

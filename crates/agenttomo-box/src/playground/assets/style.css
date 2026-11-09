@@ -101,6 +101,12 @@ h1, h2 { font-size: 17px; font-weight: 600; letter-spacing: -.3px; margin: 0; }
 .event-type.memory { color: #c4a7dc; }
 .event-type.network { color: #88b9ed; }
 .event-description { overflow-wrap: anywhere; white-space: pre-wrap; }
+.event-evidence { position: relative; z-index: 1; color: #96aaba; font-size: 11px; margin: 6px 0 12px; min-width: 0; }
+.event-evidence summary { cursor: pointer; padding: 5px 8px; }
+.evidence-records { max-height: 220px; overflow: auto; background: #101c25; border-radius: 6px; }
+.evidence-record { display: block; width: 100%; min-width: 0; padding: 7px 10px; border: 0; border-bottom: 1px solid #263947; border-radius: 0; text-align: left; font: 11px/1.6 ui-monospace, Consolas, monospace; color: #a8b7c7; background: transparent; overflow-wrap: anywhere; }
+.evidence-record:hover { background: #20313e; }
+.evidence-records { list-style: none; margin: 0; padding: 0; min-width: 0; }
 #empty-trace { padding: 50px 20px; text-align: center; color: #8b9bae; font-size: 12px; }
 .empty-icon { display: block; font-size: 40px; color: #a8b7c7; margin-bottom: 16px; }
 #empty-trace strong { color: #d3dee8; font-weight: 500; }
@@ -149,3 +155,10 @@ button:focus-visible, summary:focus-visible, #trace-scroll:focus-visible { outli
   .topbar { flex-basis: auto; height: auto; min-height: 65px; flex-wrap: wrap; gap: 10px; padding-block: 12px; }
   .topbar-actions { margin-left: auto; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 }
+
+.process-command { display: block; margin-top: 5px; font: 10px/1.5 ui-monospace, Consolas, monospace; color: #a8b7c7; overflow-wrap: anywhere; }
+.trace-network-flow { position: relative; min-width: 0; }
+.trace-network-flow > .event-row { padding-right: 28px; }
+.flow-behaviors { list-style: none; margin: 0 0 12px 10px; padding: 0 0 0 10px; border-left: 1px solid #314656; min-width: 0; }
+.flow-toggle { position: absolute; top: 10px; right: 2px; padding: 0 5px; border: 0; background: transparent; color: #96aaba; font-size: 19px; line-height: 1; }
+.flow-toggle[aria-expanded="true"] { transform: rotate(90deg); }

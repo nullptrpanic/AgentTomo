@@ -1,11 +1,17 @@
 import { TraceView } from "./trace-view.mjs";
 import { FilePreview } from "./file-preview.mjs";
 import { TrafficView } from "./traffic-view.mjs";
+import { ProcessTree } from "./process-tree.mjs";
+import { EventFilter, FilterMenu } from "./event-filter.mjs";
+import { activitySnapshot } from "./activity-model.mjs";
+import { BehaviorGraph } from "./behavior-graph.mjs";
 
 // Shared by the workspace page and independent read-only monitor pages.
 export function createObservation(token) {
   const $ = id => document.getElementById(id);
-  let sessionId = null;
+  let sessionId = null, activeView = "process", scheduled = false;
+  const tree = new ProcessTree(), filter = new EventFilter();
+  const filters = new FilterMenu($("event-filter"), filter, schedule);
   async function loadPayload(kind, preview, signal, encoding = "") {
     if (!Number.isSafeInteger(preview.offset) || preview.offset < 0 || !Number.isSafeInteger(preview.captured_bytes) || preview.captured_bytes < 0 || preview.captured_bytes > 1048576) throw new Error("Invalid snapshot reference");
     const target = new URL(`/api/sessions/${sessionId}/${kind}`, location.href);
@@ -38,31 +44,53 @@ export function createObservation(token) {
     $("event-json").textContent = JSON.stringify(event, null, 2);
   }
   function observationView(name) {
+    activeView = name;
     for (const button of document.querySelectorAll("[data-observation]")) button.setAttribute("aria-pressed", String(button.dataset.observation === name));
     $("traffic").hidden = name !== "traffic";
     $("trace-scroll").hidden = name !== "process";
-    document.querySelector(".trace-tools").hidden = name !== "process";
-    document.querySelector(".trace-description").hidden = name !== "process";
+    $("graph-scroll").hidden = name !== "graph";
+    document.querySelector(".trace-tools").hidden = name === "traffic";
+    document.querySelector(".trace-description").hidden = name === "traffic";
+    $("view-description").textContent = name === "graph" ? "Expand a process to reveal event cards and child processes." : "Expand a process to inspect its behavior and descendants.";
     if (name === "traffic") files.close();
+    schedule();
   }
   for (const button of document.querySelectorAll("[data-observation]")) button.addEventListener("click", () => observationView(button.dataset.observation));
+  function selectEvent(event, connectionId = null) {
+    selectRaw(event);
+    if (event.kind === "file.open") {
+      $("event-detail").open = false;
+      files.show(event);
+    } else if (event.kind.startsWith("network.")) {
+      observationView("traffic");
+      traffic.select(connectionId === null ? event : { data: { connection_id: connectionId } });
+      $("event-detail").open = traffic.selected === null;
+    } else {
+      files.close();
+      $("event-detail").open = true;
+    }
+  }
+  function inspectEvidence(event) { selectRaw(event); files.close(); $("event-detail").open = true; }
   const trace = new TraceView({
-    root: $("process-tree"), scroll: $("trace-scroll"), empty: $("empty-trace"), count: $("event-count"), summary: $("trace-summary"), filters: $("event-filter"),
-    onSelect(event) {
-      selectRaw(event);
-      if (event.kind === "file.open") {
-        $("event-detail").open = false;
-        files.show(event);
-      } else if (event.kind.startsWith("network.")) {
-        observationView("traffic");
-        traffic.select(event);
-        $("event-detail").open = traffic.selected === null;
-      } else {
-        files.close();
-        $("event-detail").open = true;
-      }
-    },
+    root: $("process-tree"), scroll: $("trace-scroll"), empty: $("empty-trace"), onSelect: selectEvent, onInspect: inspectEvidence,
   });
+  const graph = new BehaviorGraph({ root: $("behavior-graph"), scroll: $("graph-scroll"), empty: $("empty-graph"), onSelect: selectEvent,
+    onInspect: inspectEvidence,
+  });
+
+  function schedule() {
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      const snapshot = activitySnapshot(tree, filter);
+      filters.update();
+      if (activeView === "process") trace.render(snapshot);
+      if (activeView === "graph") graph.render(snapshot);
+      $("event-count").textContent = snapshot.behaviorCount.toLocaleString();
+      $("trace-summary").textContent = `${snapshot.nodes.size} process${snapshot.nodes.size === 1 ? "" : "es"} · ${snapshot.behaviorCount}/${snapshot.totalBehaviorCount} behaviors${tree.total > tree.limit ? " · recent history" : ""}`;
+    });
+  }
 
   return {
     session(message) {
@@ -70,7 +98,7 @@ export function createObservation(token) {
       traffic.setEnabled(Boolean(message.http_capture));
       $("capture-description").textContent = message.http_capture ? "Process lifecycle · files · TCP / UDP · HTTP/HTTPS content available in Traffic." : "Process lifecycle · files · TCP / UDP · HTTP Host / TLS SNI. HTTPS stays encrypted.";
     },
-    start(pid) { trace.start(pid); },
-    add(event) { trace.add(event); traffic.add(event); },
+    start(pid) { tree.start(pid); schedule(); },
+    add(event) { filter.observe(event.kind); tree.add(event); traffic.add(event); schedule(); },
   };
 }

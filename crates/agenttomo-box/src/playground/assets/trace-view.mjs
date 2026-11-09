@@ -1,6 +1,6 @@
-import { ProcessTree } from "./process-tree.mjs";
-import { EventFilter, FilterMenu } from "./event-filter.mjs";
-import { eventTime, orderByStart } from "./event-time.mjs";
+import { eventTime } from "./event-time.mjs";
+import { EventEvidence } from "./event-evidence.mjs";
+import { formatCommand } from "./event-description.mjs";
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -13,8 +13,7 @@ function setText(node, text) {
   if (node.textContent !== text) node.textContent = text;
 }
 
-function timestamp(event) {
-  const ns = eventTime(event);
+function timestamp(event, ns = eventTime(event)) {
   const time = element("time", "event-time", "—");
   if (!Number.isFinite(ns)) return time;
   const date = new Date(ns / 1e6);
@@ -41,40 +40,15 @@ function duration(node) {
 }
 
 export class TraceView {
-  constructor({ root, scroll, empty, count, summary, filters, onSelect }) {
-    this.tree = new ProcessTree();
-    this.filter = new EventFilter();
-    this.filterMenu = filters ? new FilterMenu(filters, this.filter, () => this.schedule()) : null;
+  constructor({ root, scroll, empty, onSelect, onInspect }) {
     this.root = root;
     this.scroll = scroll;
     this.empty = empty;
-    this.count = count;
-    this.summary = summary;
     this.onSelect = onSelect;
+    this.onInspect = onInspect;
     this.nodes = new Map();
     this.events = new Map();
-    this.scheduled = false;
     this.selected = null;
-  }
-
-  start(tid) {
-    this.tree.start(tid);
-    this.schedule();
-  }
-
-  add(event) {
-    this.filter.observe(event.kind);
-    this.tree.add(event);
-    this.schedule();
-  }
-
-  schedule() {
-    if (this.scheduled) return;
-    this.scheduled = true;
-    requestAnimationFrame(() => {
-      this.scheduled = false;
-      this.render();
-    });
   }
 
   createNode(node) {
@@ -88,12 +62,13 @@ export class TraceView {
     const identity = element("span", "process-identity");
     const name = element("span", "process-name");
     const meta = element("span", "process-meta");
+    const command = element("span", "process-command");
     const elapsed = element("span", "process-duration");
     elapsed.title = "Elapsed time from process creation (or first observed exec) to exit";
     const elapsedValue = element("span", "duration-value");
     elapsed.append(element("span", "duration-label", "Elapsed"), elapsedValue);
     const state = element("span", "process-state");
-    identity.append(name, meta);
+    identity.append(name, command, meta);
     summary.append(chevron, identity, elapsed, state);
     const body = element("div", "process-body");
     const omitted = element("p", "omitted-events");
@@ -102,13 +77,14 @@ export class TraceView {
     const children = element("ul", "process-children");
     children.setAttribute("aria-label", "Child processes");
     const filtered = element("p", "filtered-events", "No matching events");
-    body.append(omitted, filtered, events, children);
+    const evidence = new EventEvidence("Process details", this.onInspect);
+    body.append(evidence.details, omitted, filtered, events, children);
     details.append(summary, body);
     item.append(details);
     details.addEventListener("animationend", (event) => {
       if (event.animationName === "trace-activity") details.classList.remove("has-activity");
     });
-    const view = { item, details, name, meta, elapsedValue, state, omitted, filtered, events, children, activity: 0 };
+    const view = { item, details, name, command, meta, elapsedValue, state, omitted, filtered, events, children, evidence, activity: 0 };
     this.nodes.set(node.id, view);
     return view;
   }
@@ -120,38 +96,93 @@ export class TraceView {
     button.type = "button";
     button.dataset.category = event.category || String(event.kind).split(".")[0];
     button.setAttribute("aria-pressed", "false");
-    const time = timestamp(event);
-    const shortKind = String(event.kind).replace(/^process\./, "");
+    const ns = entry.started ?? eventTime(event);
+    const time = timestamp(event, ns);
+    const shortKind = entry.label || String(event.kind).replace(/^process\./, "");
     const kind = element("span", "event-type", shortKind);
     if (["exec", "exit", "fork", "vfork", "clone"].includes(shortKind)) kind.classList.add(shortKind);
     if (shortKind.startsWith("file.")) kind.classList.add("file");
     if (shortKind.startsWith("memory.")) kind.classList.add("memory");
-    if (shortKind.startsWith("network.")) kind.classList.add("network");
+    if (event.kind.startsWith("network.")) kind.classList.add("network");
     const detail = element("span", "event-description");
     button.append(time, kind, detail);
+    const view = { item, button, time, timeNs: ns, kind, detail, entry, expanded: true };
+    if (entry.type === "tcp" || entry.type === "udp") {
+      item.classList.add("trace-network-flow");
+      view.evidence = new EventEvidence("Raw events", this.onInspect, () => this.updateExpansion(view));
+      view.evidence.details.id = `trace-evidence-${entry.id}`;
+      view.children = element("ol", "flow-behaviors");
+      view.children.id = `trace-requests-${entry.id}`;
+      view.children.setAttribute("aria-label", "HTTP exchanges in request start order");
+      if (entry.type === "tcp") {
+        view.toggle = element("button", "flow-toggle", "›");
+        view.toggle.type = "button";
+        view.toggle.title = "Expand or collapse HTTP exchanges";
+        view.toggle.setAttribute("aria-label", view.toggle.title);
+        view.toggle.setAttribute("aria-controls", view.children.id);
+        view.toggle.addEventListener("click", () => { view.expanded = !view.expanded; this.updateExpansion(view); });
+      } else button.setAttribute("aria-controls", view.evidence.details.id);
+    }
     button.addEventListener("click", () => {
+      if (view.entry.type === "udp") { view.evidence.details.open = !view.evidence.details.open; return; }
       this.selected?.setAttribute("aria-pressed", "false");
       this.selected = button;
       button.setAttribute("aria-pressed", "true");
-      this.onSelect(event);
+      this.onSelect(view.entry.event, view.entry.type === "tcp" ? view.entry.connectionId : null);
     });
     item.append(button);
-    this.events.set(entry.id, item);
-    return item;
+    if (view.toggle) item.append(view.toggle);
+    if (view.evidence) item.append(view.evidence.details, view.children);
+    this.events.set(entry.id, view);
+    return view;
   }
 
-  render() {
+  updateExpansion(view) {
+    if (!view.children) return;
+    view.children.hidden = !view.expanded || !view.entry.children.length;
+    if (view.toggle) {
+      view.toggle.hidden = !view.entry.children.length;
+      view.toggle.setAttribute("aria-expanded", String(view.expanded));
+    } else view.button.setAttribute("aria-expanded", String(view.evidence.details.open));
+  }
+
+  renderBehaviors(behaviors, destination, retained) {
+    let cursor = destination.firstChild;
+    for (const entry of behaviors) {
+      retained.add(entry.id);
+      const view = this.events.get(entry.id) || this.createEvent(entry);
+      view.entry = entry;
+      if (view.item !== cursor) destination.insertBefore(view.item, cursor);
+      cursor = view.item.nextSibling;
+      view.button.dataset.kind = entry.type ? `network.${entry.type}` : entry.event.kind;
+      if (!view.children) view.button.dataset.sequence = entry.event.sequence;
+      if (entry.type === "http") view.button.dataset.requestId = entry.requestId;
+      setText(view.kind, entry.label || entry.event.kind.replace(/^process\./, ""));
+      const ns = entry.started ?? eventTime(entry.event);
+      if (view.timeNs !== ns) {
+        const time = timestamp(entry.event, ns);
+        view.time.replaceWith(time);
+        view.time = time; view.timeNs = ns;
+      }
+      const description = entry.title ? `${entry.title}\n${entry.description}` : entry.description;
+      setText(view.detail, description.length > 320 ? description.slice(0, 320) + "…" : description);
+      view.detail.title = description;
+      if (view.children) {
+        if (entry.type === "tcp") {
+          view.item.dataset.connectionId = entry.connectionId;
+          view.button.title = "Inspect this connection in Traffic";
+        } else view.item.dataset.flowId = entry.flowId;
+        view.evidence.update(entry.records);
+        this.updateExpansion(view);
+        this.renderBehaviors(entry.children, view.children, retained);
+      }
+    }
+  }
+
+  render({ nodes, behaviors, behaviorCounts: counts, totalBehaviorCounts, processRecords }) {
     // Measure before changing the tree. Readers who scroll up keep their place;
     // returning to the bottom resumes following newly appended commands.
     const follow = this.scroll.scrollHeight - this.scroll.clientHeight - this.scroll.scrollTop <= 24;
-    const { nodes, entries } = this.tree.processView();
-    const visible = orderByStart(entries.filter(entry => this.filter.allows(entry.event.kind)));
-    const counts = new Map();
-    for (const entry of visible) {
-      counts.set(entry.nodeId, (counts.get(entry.nodeId) ?? 0) + 1);
-      for (let node = nodes.get(entry.nodeId); node; node = nodes.get(node.parentId)) node.activity = Math.max(node.activity, entry.id);
-    }
-    this.filterMenu?.update();
     // Reuse DOM nodes: new events must not reopen collapsed branches or replace
     // the focused summary/button. A late fork can move an existing subtree.
     for (const node of nodes.values()) {
@@ -160,11 +191,18 @@ export class TraceView {
       setText(view.name, name.length > 80 ? name.slice(0, 80) + "…" : name);
       view.name.title = node.name || "Executable was not captured";
       view.details.dataset.pid = node.pid ?? "unknown";
+      view.details.dataset.instance = node.instanceId ?? node.id;
       view.details.dataset.state = node.state;
       const origin = node.root ? "root" : node.birth || "parent not observed";
       const count = counts.get(node.id) ?? 0;
-      const events = count === node.events.length ? `${count}` : `${count}/${node.events.length}`;
-      setText(view.meta, `PID ${node.pid ?? "—"} · ${origin} · ${events} events`);
+      const total = totalBehaviorCounts.get(node.id) ?? 0;
+      const events = count === total ? `${count}` : `${count}/${total}`;
+      setText(view.meta, `PID ${node.pid ?? "—"} · ${origin} · ${events} behaviors`);
+      const argv = node.events.findLast(entry => entry.event.kind === "process.exec")?.event.data.argv;
+      const command = Array.isArray(argv) && argv.length > 1 ? formatCommand(argv) : "";
+      view.command.hidden = !command;
+      setText(view.command, command.length > 240 ? command.slice(0, 240) + "…" : command);
+      view.command.title = command;
       setText(view.state, node.exit || node.state);
       setText(view.elapsedValue, duration(node));
       view.state.dataset.state = node.state;
@@ -172,8 +210,9 @@ export class TraceView {
       else if (node.activity > view.activity) view.details.classList.add("has-activity");
       view.activity = Math.max(view.activity, node.activity);
       view.omitted.hidden = node.omitted === 0;
-      view.filtered.hidden = count > 0 || node.events.length === 0;
-      setText(view.omitted, `${node.omitted} earlier events omitted from this view`);
+      view.filtered.hidden = count > 0 || processRecords.has(node.id) || node.events.length === 0;
+      setText(view.omitted, `${node.omitted} earlier records omitted from this view`);
+      view.evidence.update(processRecords.get(node.id) || []);
     }
     for (const node of nodes.values()) {
       const view = this.nodes.get(node.id);
@@ -184,23 +223,16 @@ export class TraceView {
       if (!nodes.has(id)) { view.item.remove(); this.nodes.delete(id); }
     }
     const retained = new Set();
-    const cursors = new Map([...this.nodes].map(([id, view]) => [id, view.events.firstChild]));
-    for (const entry of visible) {
-      retained.add(entry.id);
-      const item = this.events.get(entry.id) || this.createEvent(entry);
-      const cursor = cursors.get(entry.nodeId);
-      if (item !== cursor) this.nodes.get(entry.nodeId).events.insertBefore(item, cursor);
-      cursors.set(entry.nodeId, item.nextSibling);
-      const detail = item.querySelector(".event-description");
-      setText(detail, entry.description.length > 240 ? entry.description.slice(0, 240) + "…" : entry.description);
-      detail.title = entry.description;
+    const byOwner = new Map();
+    for (const entry of behaviors) {
+      if (!byOwner.has(entry.nodeId)) byOwner.set(entry.nodeId, []);
+      byOwner.get(entry.nodeId).push(entry);
     }
-    for (const [id, item] of this.events) {
-      if (!retained.has(id)) { item.remove(); this.events.delete(id); }
+    for (const [id, view] of this.nodes) this.renderBehaviors(byOwner.get(id) || [], view.events, retained);
+    for (const [id, view] of this.events) {
+      if (!retained.has(id)) { view.item.remove(); this.events.delete(id); }
     }
     this.empty.hidden = nodes.size > 0;
-    setText(this.count, visible.length.toLocaleString());
-    setText(this.summary, `${nodes.size} process${nodes.size === 1 ? "" : "es"} · ${visible.length}/${entries.length} events${this.tree.total > this.tree.limit ? " · recent history" : ""}`);
     if (follow) this.scroll.scrollTop = this.scroll.scrollHeight;
   }
 }
