@@ -42,9 +42,9 @@ struct Settings {
     file_preview: crate::recording::file_preview::Limits,
     http: crate::proxy::http::Options,
     rootfs: crate::execution::rootfs::Options,
-    codex: Option<crate::agent::codex::Installation>,
+    agent: Option<Arc<dyn crate::agent::Installation>>,
     proxy: Option<crate::proxy::outbound::Proxy>,
-    credential_gateway: Option<Arc<crate::agent::codex::credentials::gateway::Gateway>>,
+    credential_gateway: Option<Arc<crate::proxy::credentials::gateway::Gateway>>,
 }
 
 #[derive(Clone)]
@@ -75,10 +75,10 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
     let browser = docker::supports_browser(&image_id).await?;
     let shutdown = CancellationToken::new();
     let proxy_peers = agent_egress::Peers::default();
-    let codex = crate::agent::codex::Installation::discover();
-    let credential_gateway = codex
+    let agent = crate::agent::discover();
+    let credential_gateway = agent
         .as_ref()
-        .map(|_| crate::agent::codex::credentials::gateway::Gateway::new().map(Arc::new))
+        .map(|_| crate::proxy::credentials::gateway::Gateway::new().map(Arc::new))
         .transpose()?;
     let proxy = agent_egress::configure(
         options.proxy,
@@ -89,7 +89,7 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
     )
     .await?;
     let mut http = options.http.options();
-    if codex.is_some() {
+    if agent.is_some() {
         http.enabled = true;
     }
     let app = App {
@@ -104,7 +104,7 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
             file_preview: options.file_preview.limits(),
             http,
             rootfs: options.rootfs.options(),
-            codex,
+            agent,
             proxy,
             credential_gateway,
         }),
@@ -281,7 +281,7 @@ mod tests {
                 file_preview: Default::default(),
                 http: Default::default(),
                 rootfs: Default::default(),
-                codex: None,
+                agent: None,
                 proxy: None,
                 credential_gateway: None,
             }),
@@ -389,7 +389,7 @@ mod tests {
                 file_preview: Default::default(),
                 http: Default::default(),
                 rootfs: Default::default(),
-                codex: None,
+                agent: None,
                 proxy: None,
                 credential_gateway: None,
             }),
@@ -560,7 +560,7 @@ mod tests {
                 file_preview: Default::default(),
                 http: Default::default(),
                 rootfs: Default::default(),
-                codex: None,
+                agent: None,
                 proxy: None,
                 credential_gateway: None,
             }),

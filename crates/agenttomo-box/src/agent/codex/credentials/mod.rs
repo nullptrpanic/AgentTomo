@@ -1,11 +1,13 @@
-//! Codex authentication policy. Only sanitized files cross the Docker boundary.
+//! Codex login/config formats and allowed credential endpoints.
 mod audit;
 mod config;
-pub mod gateway;
 #[cfg(test)]
 mod tests;
-
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Uri, uri::Authority};
+use super::super::adapter::Prepared;
+use crate::proxy::credentials::{Grant, MARKER, Policy, Scope, Source, marker, secret_header};
+#[cfg(test)]
+use axum::http::{HeaderMap, Method};
+use axum::http::{HeaderName, HeaderValue};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use std::{
@@ -13,264 +15,95 @@ use std::{
     io,
     path::{Path, PathBuf},
 };
-use tokio_util::sync::CancellationToken;
-
-const MARKER: &str = "agenttomo-credential-";
-pub struct Prepared {
-    pub files: BTreeMap<String, String>,
-    pub policy: Policy,
+fn invalid(message: &str) -> io::Error {
+    io::Error::other(message)
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct Origin {
-    pub host: String,
-    pub port: u16,
-    pub tls: bool,
+struct Login {
+    path: PathBuf,
+    account: Option<String>,
+    chatgpt: bool,
 }
-impl Origin {
-    pub fn matches(&self, authority: &Authority) -> bool {
-        let host = authority.host().trim_matches(['[', ']']);
-        let port = authority.port_u16();
-        !authority.as_str().contains('@')
-            && self.host.eq_ignore_ascii_case(host)
-            && (port.is_some() || authority.as_str().len() == authority.host().len())
-            && port.unwrap_or(if self.tls { 443 } else { 80 }) == self.port
-    }
-}
-
-#[derive(Clone)]
-struct Scope {
-    origin: Origin,
-    path: String,
-    chatgpt_backend: bool,
-}
-impl Scope {
-    fn parse(base: &str) -> io::Result<Self> {
-        let uri: Uri = base
-            .parse()
-            .map_err(|_| invalid("invalid Codex provider URL"))?;
-        let tls = match uri.scheme_str() {
-            Some("https") => true,
-            Some("http") => false,
-            _ => {
+impl Login {
+    fn header(&self) -> io::Result<HeaderValue> {
+        let Self {
+            path,
+            account,
+            chatgpt,
+        } = self;
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes))
+            .map_err(|_| {
+                invalid("cannot read the host Codex login; sign in on the host and retry")
+            })?;
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(invalid("host Codex login exceeds the size limit"));
+        }
+        let auth: Value =
+            serde_json::from_slice(&bytes).map_err(|_| invalid("invalid host Codex login"))?;
+        let value = if *chatgpt {
+            if auth["tokens"]["account_id"].as_str() != account.as_deref() {
                 return Err(invalid(
-                    "Codex credential forwarding requires HTTP or HTTPS",
+                    "host Codex account changed; open a new Playground session",
                 ));
             }
-        };
-        let authority = uri
-            .authority()
-            .ok_or_else(|| invalid("missing Codex provider authority"))?;
-        if authority.as_str().contains('@') || uri.query().is_some() {
-            return Err(invalid(
-                "credentials in provider URLs are unsupported; use authentication headers",
-            ));
-        }
-        if authority.port_u16() == Some(0)
-            || (authority.port_u16().is_none()
-                && authority.as_str().len() != authority.host().len())
-        {
-            return Err(invalid("invalid Codex provider port"));
-        }
-        Ok(Self {
-            origin: Origin {
-                host: authority
-                    .host()
-                    .trim_matches(['[', ']'])
-                    .to_ascii_lowercase(),
-                port: authority.port_u16().unwrap_or(if tls { 443 } else { 80 }),
-                tls,
-            },
-            path: uri.path().trim_end_matches('/').to_owned(),
-            chatgpt_backend: false,
-        })
-    }
-    fn chatgpt_backend(base: &str) -> io::Result<Self> {
-        let mut scope = Self::parse(base)?;
-        scope.chatgpt_backend = true;
-        Ok(scope)
-    }
-    fn permits(&self, origin: &Origin, method: &Method, path: &str) -> bool {
-        if self.origin != *origin {
-            return false;
-        }
-        let Some(relative) = path
-            .strip_prefix(&self.path)
-            .and_then(|suffix| suffix.strip_prefix('/'))
-        else {
-            return false;
-        };
-        // These are the model operations for which this adapter holds credentials.
-        // Other endpoints on the same host cannot borrow the authentication grant.
-        let backend = self.chatgpt_backend;
-        let model = if backend {
-            relative.strip_prefix("codex/").unwrap_or("")
+            let token = text(&auth["tokens"]["access_token"])?;
+            if jwt_claims(token)
+                .ok()
+                .and_then(|claims| claims["exp"].as_i64())
+                .is_some_and(|expiry| expiry <= time::OffsetDateTime::now_utc().unix_timestamp())
+            {
+                return Err(invalid(
+                    "host Codex authentication has expired; sign in on the host and retry",
+                ));
+            }
+            token
         } else {
-            relative
+            text(&auth["OPENAI_API_KEY"])?
         };
-        matches!(
-            (method.as_str(), model),
-            ("GET" | "HEAD", "models")
-                | ("GET" | "POST", "responses")
-                | ("POST", "responses/compact")
-        ) || backend
-            && matches!(
-                (method.as_str(), relative),
-                (
-                    "GET" | "HEAD",
-                    "wham/accounts/check"
-                        | "wham/settings/user"
-                        | "plugins/featured"
-                        | "ps/plugins/installed"
-                        | "ps/plugins/list"
-                        | "ps/plugins/suggested/codex"
-                ) | ("POST", "ps/mcp" | "codex/analytics-events/events")
-            )
+        secret_header(value, true)
     }
 }
 
-#[derive(Clone)]
-enum Source {
-    Static(HeaderValue),
-    Login {
-        path: PathBuf,
-        account: Option<String>,
-        chatgpt: bool,
-    },
+fn provider_scope(base: &str) -> io::Result<Scope> {
+    Scope::new(
+        base,
+        &[
+            ("GET", "models"),
+            ("HEAD", "models"),
+            ("GET", "responses"),
+            ("POST", "responses"),
+            ("POST", "responses/compact"),
+        ],
+    )
 }
-impl Source {
-    fn header(&self) -> io::Result<HeaderValue> {
-        match self {
-            Self::Static(value) => Ok(value.clone()),
-            Self::Login {
-                path,
-                account,
-                chatgpt,
-            } => {
-                use std::io::Read;
-                let mut bytes = Vec::new();
-                std::fs::File::open(path)
-                    .and_then(|file| file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes))
-                    .map_err(|_| {
-                        invalid("cannot read the host Codex login; sign in on the host and retry")
-                    })?;
-                if bytes.len() > 16 * 1024 * 1024 {
-                    return Err(invalid("host Codex login exceeds the size limit"));
-                }
-                let auth: Value = serde_json::from_slice(&bytes)
-                    .map_err(|_| invalid("invalid host Codex login"))?;
-                let value = if *chatgpt {
-                    if auth["tokens"]["account_id"].as_str() != account.as_deref() {
-                        return Err(invalid(
-                            "host Codex account changed; open a new Playground session",
-                        ));
-                    }
-                    let token = text(&auth["tokens"]["access_token"])?;
-                    if jwt_claims(token)
-                        .ok()
-                        .and_then(|claims| claims["exp"].as_i64())
-                        .is_some_and(|expiry| {
-                            expiry <= time::OffsetDateTime::now_utc().unix_timestamp()
-                        })
-                    {
-                        return Err(invalid(
-                            "host Codex authentication has expired; sign in on the host and retry",
-                        ));
-                    }
-                    token
-                } else {
-                    text(&auth["OPENAI_API_KEY"])?
-                };
-                secret_header(value, true)
-            }
-        }
-    }
-}
-struct Grant {
-    scope: Scope,
-    name: HeaderName,
-    placeholder: HeaderValue,
-    source: Source,
-}
-
-pub struct Policy {
-    grants: Vec<Grant>,
-    pub lifetime: CancellationToken,
-}
-impl Policy {
-    pub fn origin(&self, authority: &Authority) -> Option<Origin> {
-        self.grants
-            .iter()
-            .find(|grant| grant.scope.origin.matches(authority))
-            .map(|grant| grant.scope.origin.clone())
-    }
-
-    /// Validate all routing information before exposing a host header upstream.
-    pub fn inject(
-        &self,
-        origin: &Origin,
-        method: &Method,
-        uri: &Uri,
-        headers: &mut HeaderMap,
-    ) -> io::Result<()> {
-        if self.lifetime.is_cancelled() {
-            return Err(invalid("Playground credential session has ended"));
-        }
-        let host = headers.get_all("host");
-        let mut hosts = host.iter();
-        let authority = hosts
-            .next()
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<Authority>().ok());
-        if hosts.next().is_some()
-            || !authority
-                .as_ref()
-                .is_some_and(|value| origin.matches(value))
-            || uri.authority().is_some_and(|value| !origin.matches(value))
-            || uri
-                .scheme_str()
-                .is_some_and(|scheme| scheme != if origin.tls { "https" } else { "http" })
-        {
-            return Err(invalid(
-                "credential request authority does not match the connection",
-            ));
-        }
-        let path = uri.path();
-        let encoded = path.to_ascii_lowercase();
-        if path.split('/').any(|part| matches!(part, "." | ".."))
-            || path.contains('\\')
-            || ["%2e", "%2f", "%5c"]
-                .iter()
-                .any(|value| encoded.contains(value))
-        {
-            return Err(invalid("credential request contains an ambiguous path"));
-        }
-        let mut replacements = Vec::new();
-        for (name, value) in headers.iter() {
-            if !is_placeholder(value) {
-                continue;
-            }
-            if headers.get_all(name).iter().count() != 1 {
-                return Err(invalid("duplicate credential request header"));
-            }
-            let grant = self
-                .grants
-                .iter()
-                .find(|grant| {
-                    grant.name == *name
-                        && grant.placeholder == *value
-                        && grant.scope.permits(origin, method, path)
-                })
-                .ok_or_else(|| {
-                    invalid("credential placeholder is outside its session or provider scope")
-                })?;
-            replacements.push((name.clone(), grant.source.header()?));
-        }
-        for (name, value) in replacements {
-            headers.insert(name, value);
-        }
-        Ok(())
-    }
+fn chatgpt_scope(base: &str) -> io::Result<Scope> {
+    Scope::new(
+        base,
+        &[
+            ("GET", "codex/models"),
+            ("HEAD", "codex/models"),
+            ("GET", "codex/responses"),
+            ("POST", "codex/responses"),
+            ("POST", "codex/responses/compact"),
+            ("GET", "wham/accounts/check"),
+            ("HEAD", "wham/accounts/check"),
+            ("GET", "wham/settings/user"),
+            ("HEAD", "wham/settings/user"),
+            ("GET", "plugins/featured"),
+            ("HEAD", "plugins/featured"),
+            ("GET", "ps/plugins/installed"),
+            ("HEAD", "ps/plugins/installed"),
+            ("GET", "ps/plugins/list"),
+            ("HEAD", "ps/plugins/list"),
+            ("GET", "ps/plugins/suggested/codex"),
+            ("HEAD", "ps/plugins/suggested/codex"),
+            ("POST", "ps/mcp"),
+            ("POST", "codex/analytics-events/events"),
+        ],
+    )
 }
 
 struct Builder {
@@ -301,24 +134,16 @@ impl Builder {
         {
             self.secrets.push(token.trim().to_owned());
         }
-        if matches!(
-            name.as_str(),
-            "host" | "connection" | "upgrade" | "content-length" | "transfer-encoding"
-        ) {
-            return Err(invalid(
-                "transport headers cannot be used for Codex credentials",
-            ));
-        }
         let source = source.unwrap_or(Source::Static(secret_header(value, bearer)?));
         let marker = placeholder.unwrap_or_else(marker);
         let placeholder = secret_header(&marker, bearer)?;
         for scope in scopes {
-            self.grants.push(Grant {
-                scope: scope.clone(),
-                name: name.clone(),
-                placeholder: placeholder.clone(),
-                source: source.clone(),
-            });
+            self.grants.push(Grant::new(
+                scope.clone(),
+                name.clone(),
+                placeholder.clone(),
+                source.clone(),
+            )?);
         }
         Ok(marker)
     }
@@ -376,7 +201,7 @@ pub fn prepare(
         builder.environment(&scopes.keys, "authorization", name, true)?;
     }
     if let Some(base) = builder.host_environment.get("OPENAI_BASE_URL") {
-        Scope::parse(base)?;
+        provider_scope(base)?;
         builder
             .environment
             .insert("OPENAI_BASE_URL".into(), base.clone());
@@ -451,7 +276,7 @@ pub fn prepare(
                 URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?),
                 marker()
             );
-            let source = Source::Login {
+            let source = Login {
                 path: home.join("auth.json"),
                 account: tokens["account_id"].as_str().map(str::to_owned),
                 chatgpt: true,
@@ -461,7 +286,7 @@ pub fn prepare(
                 "authorization",
                 access,
                 true,
-                Some(source),
+                Some(Source::Reload(std::sync::Arc::new(move || source.header()))),
                 // A future expiry keeps Codex from attempting to refresh the
                 // placeholder. Real token expiry is checked by the host source.
                 Some(id.clone()),
@@ -476,13 +301,20 @@ pub fn prepare(
             .as_str()
             .filter(|key| !key.is_empty())
         {
-            let source = Source::Login {
+            let source = Login {
                 path: home.join("auth.json"),
                 account: None,
                 chatgpt: false,
             };
             sanitized["OPENAI_API_KEY"] = builder
-                .bind(&scopes.keys, "authorization", key, true, Some(source), None)?
+                .bind(
+                    &scopes.keys,
+                    "authorization",
+                    key,
+                    true,
+                    Some(Source::Reload(std::sync::Arc::new(move || source.header()))),
+                    None,
+                )?
                 .into();
         } else {
             return Err(invalid(
@@ -498,25 +330,10 @@ pub fn prepare(
     audit::verify(&files, &builder.secrets)?;
     Ok(Prepared {
         files,
-        policy: Policy {
-            grants: builder.grants,
-            lifetime: CancellationToken::new(),
-        },
+        policy: Policy::new(builder.grants),
     })
 }
 
-fn marker() -> String {
-    format!("{MARKER}{}", uuid::Uuid::new_v4().simple())
-}
-fn is_placeholder(value: &HeaderValue) -> bool {
-    value
-        .as_bytes()
-        .windows(MARKER.len())
-        .any(|part| part == MARKER.as_bytes())
-}
-fn invalid(message: &str) -> io::Error {
-    io::Error::other(message)
-}
 fn text(value: &Value) -> io::Result<&str> {
     value
         .as_str()
@@ -532,15 +349,4 @@ fn jwt_claims(token: &str) -> io::Result<Value> {
         .decode(payload.trim_end_matches('='))
         .map_err(|_| invalid("invalid Codex identity token"))?;
     serde_json::from_slice(&bytes).map_err(|_| invalid("invalid Codex identity token"))
-}
-fn secret_header(value: &str, bearer: bool) -> io::Result<HeaderValue> {
-    let value = if bearer {
-        format!("Bearer {value}")
-    } else {
-        value.to_owned()
-    };
-    let mut value = HeaderValue::from_str(&value)
-        .map_err(|_| invalid("invalid Codex credential header value"))?;
-    value.set_sensitive(true);
-    Ok(value)
 }

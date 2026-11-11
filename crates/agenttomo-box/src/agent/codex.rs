@@ -1,21 +1,83 @@
 //! The only adapter that knows Codex installation, configuration and CLI flags.
-pub mod credentials;
+mod credentials;
 use std::{
     io,
     path::{Path, PathBuf},
 };
 
-pub fn is_runtime(argv: &serde_json::Value) -> bool {
-    argv[0]
-        .as_str()
-        .and_then(|path| Path::new(path).file_name())
-        .is_some_and(|name| name == "codex" || name == "codex-code-mode-host")
+use super::adapter::{
+    self, Adapter, AgentAdapter, Launch, LaunchRequest, Metadata, ObservationRules, Prepared,
+    RuntimeOutput, RuntimeReader,
+};
+use futures_util::future::BoxFuture;
+use std::sync::Arc;
+
+pub struct Codex;
+
+impl AgentAdapter for Codex {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            id: "codex",
+            name: "Codex",
+            avatar: ">_",
+            authentication_hint: "Codex authentication failed. Check the server's Codex login. A new sandbox reloads that login.",
+        }
+    }
+    fn observation_rules(&self) -> ObservationRules {
+        ObservationRules {
+            runtime_executables: vec!["codex".into(), "codex-code-mode-host".into()],
+            private_paths: vec![
+                HOME.into(),
+                "/root/.agenttomo-codex".into(),
+                "/root/.agenttomo-config".into(),
+            ],
+        }
+    }
+
+    fn discover(&self) -> Option<Arc<dyn adapter::Installation>> {
+        Installation::discover()
+            .map(|installation| Arc::new(installation) as Arc<dyn adapter::Installation>)
+    }
+    fn home(&self) -> &'static Path {
+        Path::new(HOME)
+    }
+    fn configuration_file(&self, name: &str) -> bool {
+        sandbox_configuration_file(name)
+    }
+    fn configure(&self, command: &mut tokio::process::Command) -> io::Result<()> {
+        configure(command)
+    }
+    fn launch(&self, request: &LaunchRequest<'_>) -> io::Result<Launch> {
+        Ok(Launch {
+            command: command(request.conversation)?,
+            input: request.prompt.as_bytes().to_vec(),
+        })
+    }
+    fn read_output(
+        &self,
+        input: RuntimeReader,
+        diagnostics: tokio::sync::mpsc::Sender<String>,
+    ) -> BoxFuture<'_, io::Result<RuntimeOutput>> {
+        Box::pin(read_runtime_output(input, diagnostics))
+    }
 }
 
 #[derive(Clone)]
 pub struct Installation {
     pub distribution: PathBuf,
     pub home: PathBuf,
+}
+
+impl adapter::Installation for Installation {
+    fn adapter(&self) -> Adapter {
+        Adapter::new(&Codex)
+    }
+    fn mount(&self) -> (&Path, &'static str) {
+        (&self.distribution, DISTRIBUTION)
+    }
+    fn snapshot(&self) -> BoxFuture<'_, io::Result<Prepared>> {
+        Box::pin(self.snapshot())
+    }
 }
 
 impl Installation {
@@ -65,7 +127,7 @@ impl Installation {
     }
 
     /// Prepare sandbox configuration and keep authentication grants on the host.
-    pub async fn snapshot(&self) -> io::Result<credentials::Prepared> {
+    pub async fn snapshot(&self) -> io::Result<Prepared> {
         let mut files = std::collections::BTreeMap::new();
         let mut total = 0;
         let entries = match std::fs::read_dir(&self.home) {
@@ -104,10 +166,15 @@ impl Installation {
 }
 
 pub const HOME: &str = "/records/codex";
+pub const DISTRIBUTION: &str = "/opt/agenttomo-codex";
 
 pub fn configuration_file(name: &str) -> bool {
     !name.contains('/') && matches!(name, "auth.json" | "config.toml" | "models_cache.json")
         || (!name.contains('/') && name.ends_with(".config.toml"))
+}
+
+pub fn sandbox_configuration_file(name: &str) -> bool {
+    configuration_file(name) || name == "agenttomo-environment.json"
 }
 
 pub fn configure(command: &mut tokio::process::Command) -> io::Result<()> {
@@ -128,29 +195,20 @@ pub fn configure(command: &mut tokio::process::Command) -> io::Result<()> {
     Ok(())
 }
 
-pub fn command(scope: &super::Scope, thread: Option<&str>) -> io::Result<tokio::process::Command> {
+fn command(thread: Option<&str>) -> io::Result<tokio::process::Command> {
     let mut command = tokio::process::Command::new("/opt/agenttomo-codex/bin/codex");
     configure(&mut command)?;
     command.arg("exec");
     if let Some(thread) = thread {
         command.arg("resume").arg(thread);
     }
-    command
-        .args([
-            "--skip-git-repo-check",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--json",
-            "-",
-        ])
-        .env("AGENTTOMO_AGENT_ID", &scope.agent_instance_id)
-        .env("AGENTTOMO_TASK_ID", &scope.task_id);
+    command.args([
+        "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--json",
+        "-",
+    ]);
     Ok(command)
-}
-
-#[derive(Default)]
-pub struct RuntimeOutput {
-    pub thread: Option<String>,
-    pub error: Option<String>,
 }
 
 /// CLI lifecycle diagnostics only. Model and tool evidence comes from traffic.
@@ -186,7 +244,7 @@ pub async fn read_runtime_output(
             continue;
         };
         if value["type"] == "thread.started" {
-            output.thread = value["thread_id"].as_str().map(str::to_owned);
+            output.conversation_id = value["thread_id"].as_str().map(str::to_owned);
         }
         let error = match value["type"].as_str() {
             Some("error") => value["message"].as_str(),
@@ -237,7 +295,7 @@ mod tests {
             .unwrap();
         drop(write);
         let output = output.await.unwrap().unwrap();
-        assert_eq!(output.thread.as_deref(), Some("thread-1"));
+        assert_eq!(output.conversation_id.as_deref(), Some("thread-1"));
         assert_eq!(output.error.as_deref(), Some("HTTP 401 Unauthorized"));
         assert!(received.recv().await.is_none());
     }

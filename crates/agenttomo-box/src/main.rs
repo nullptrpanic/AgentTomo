@@ -81,10 +81,10 @@ fn main() -> ExitCode {
                         ..
                     } => {
                         let result = async {
-                            let proxy = if let Some(id) = &playground_session {
+                            let (proxy, adapter) = if let Some(id) = &playground_session {
                                 playground::sandbox::initialize(id).await?
                             } else {
-                                proxy
+                                (proxy, agent::Adapter::selected()?)
                             };
                             execution::collector::run(
                                 &command,
@@ -94,6 +94,7 @@ fn main() -> ExitCode {
                                 http.options(),
                                 rootfs.options(),
                                 proxy,
+                                agent::observation_rules(adapter),
                             )
                             .await?;
                             if let Some(id) = &playground_session {

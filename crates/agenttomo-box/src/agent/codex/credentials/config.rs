@@ -1,5 +1,5 @@
 //! Provider credential fields are interpreted only in the Codex adapter.
-use super::{Builder, Scope, invalid};
+use super::{Builder, Scope, chatgpt_scope, invalid, provider_scope};
 use std::{collections::BTreeMap, io};
 
 pub(super) struct Scopes {
@@ -17,8 +17,8 @@ pub(super) fn sanitize(
         .map(String::as_str)
         .unwrap_or("https://api.openai.com/v1");
     let mut scopes = Scopes {
-        keys: vec![Scope::parse(base)?],
-        chatgpt: vec![Scope::chatgpt_backend("https://chatgpt.com/backend-api")?],
+        keys: vec![provider_scope(base)?],
+        chatgpt: vec![chatgpt_scope("https://chatgpt.com/backend-api")?],
     };
     // Read base providers first, then overlay each named configuration. A profile
     // can inherit a base URL while supplying its own credential field.
@@ -45,7 +45,7 @@ pub(super) fn sanitize(
             } else {
                 format!("{base}/backend-api")
             };
-            scopes.chatgpt.push(Scope::chatgpt_backend(&base)?);
+            scopes.chatgpt.push(chatgpt_scope(&base)?);
         }
         if document
             .get("mcp_servers")
@@ -88,7 +88,7 @@ pub(super) fn sanitize(
                 .get("base_url")
                 .and_then(toml::Value::as_str)
                 .unwrap_or("https://api.openai.com/v1");
-            let scope = Scope::parse(base)?;
+            let scope = provider_scope(base)?;
             if id == "openai"
                 || effective
                     .get("requires_openai_auth")

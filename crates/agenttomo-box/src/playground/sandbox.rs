@@ -11,6 +11,8 @@ const MAX_BOOTSTRAP: usize = 32 * 1024 * 1024;
 #[derive(Serialize, Deserialize)]
 pub struct Bootstrap {
     pub metadata: Value,
+    #[serde(default)]
+    pub agent: Option<crate::agent::Adapter>,
     pub configuration: BTreeMap<String, String>,
     pub proxy: Option<crate::proxy::outbound::Proxy>,
     pub proxy_ca: Option<String>,
@@ -31,7 +33,12 @@ pub fn stdin() -> io::Result<tokio::net::unix::pipe::Receiver> {
     tokio::net::unix::pipe::Receiver::from_owned_fd(nix::unistd::dup(std::io::stdin())?)
 }
 
-pub async fn initialize(id: &str) -> io::Result<Option<crate::proxy::outbound::Proxy>> {
+pub async fn initialize(
+    id: &str,
+) -> io::Result<(
+    Option<crate::proxy::outbound::Proxy>,
+    Option<crate::agent::Adapter>,
+)> {
     if !super::valid_session(id) {
         return Err(io::Error::other("invalid session id"));
     }
@@ -43,6 +50,9 @@ pub async fn initialize(id: &str) -> io::Result<Option<crate::proxy::outbound::P
     let mut bytes = vec![0; length];
     input.read_exact(&mut bytes).await?;
     let bootstrap: Bootstrap = serde_json::from_slice(&bytes)?;
+    if bootstrap.agent.is_none() && !bootstrap.configuration.is_empty() {
+        return Err(io::Error::other("agent configuration requires an adapter"));
+    }
     let directory = Path::new(ROOT).join(id);
     tokio::fs::DirBuilder::new()
         .mode(0o700)
@@ -53,10 +63,12 @@ pub async fn initialize(id: &str) -> io::Result<Option<crate::proxy::outbound::P
         .write_all(&serde_json::to_vec(&bootstrap.metadata)?)
         .await?;
     metadata.flush().await?;
-    tokio::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(crate::agent::codex::HOME)
-        .await?;
+    if let Some(adapter) = bootstrap.agent {
+        tokio::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(adapter.home())
+            .await?;
+    }
     tokio::fs::DirBuilder::new()
         .mode(0o777)
         .create(Path::new(ROOT).join("control"))
@@ -74,17 +86,19 @@ pub async fn initialize(id: &str) -> io::Result<Option<crate::proxy::outbound::P
         file.flush().await?;
     }
     for (name, contents) in bootstrap.configuration {
-        if !crate::agent::codex::configuration_file(&name) && name != "agenttomo-environment.json" {
+        let adapter = bootstrap
+            .agent
+            .ok_or_else(|| io::Error::other("agent configuration requires an adapter"))?;
+        if !adapter.configuration_file(&name) {
             return Err(io::Error::other("invalid configuration filename"));
         }
-        let mut file =
-            crate::recording::create_log(Path::new(crate::agent::codex::HOME), &name).await?;
+        let mut file = crate::recording::create_log(adapter.home(), &name).await?;
         file.write_all(contents.as_bytes()).await?;
         // Tokio write_all may only enqueue the last write. Configuration must
-        // be fully visible (or fail) before any Codex process is launched.
+        // be fully visible (or fail) before any agent process is launched.
         file.flush().await?;
     }
-    Ok(bootstrap.proxy)
+    Ok((bootstrap.proxy, bootstrap.agent))
 }
 
 pub async fn completed(id: &str) -> io::Result<()> {

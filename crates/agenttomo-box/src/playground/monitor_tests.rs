@@ -32,7 +32,7 @@ impl Fixture {
                 file_preview: Default::default(),
                 http: Default::default(),
                 rootfs: Default::default(),
-                codex: None,
+                agent: None,
                 proxy: None,
                 credential_gateway: None,
             }),

@@ -1,4 +1,5 @@
 //! Independent protocol services; lifecycle coordination belongs to execution.
+pub mod credentials;
 pub mod http;
 pub mod outbound;
 mod replay;

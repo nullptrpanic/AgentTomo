@@ -36,17 +36,18 @@ export function taskProgress(task) {
   return task.stopping ? "Stopping task…" : task.phase;
 }
 
-function errorHint(error) {
+function errorHint(error, agent) {
   if (/tls handshake|certificate|tls.*eof/i.test(error)) return "TLS connection failed. The connection closed before a secure session was established.";
-  if (/\b401\b|unauthorized|not logged in|authentication|refresh.?token/i.test(error)) return "Codex authentication failed. Check the server's Codex login. A new sandbox reloads that login.";
+  if (/\b401\b|unauthorized|not logged in|authentication|refresh.?token/i.test(error)) return agent.authentication_hint || "Agent authentication failed. Check its login on the server.";
   if (/\b403\b|forbidden|permission denied/i.test(error)) return "Access was denied. Check account permissions and the model configuration.";
   if (/timed? ?out|timeout|connection|connect error|network|dns/i.test(error)) return "The model connection failed. Check the server proxy and network connection.";
-  return "Codex reported an error. Expand the details for the original message.";
+  return `${agent.name} reported an error. Expand the details for the original message.`;
 }
 
 export class AgentChat {
   constructor({root, section, onTool, onMessage, onTask, onModel}) {
     Object.assign(this, {root, section, onTool, onMessage, onTask, onModel});
+    this.agent = {name:"Agent", avatar:">_"};
     this.records = new Map();
     this.follow = true;
     this.latest = root.parentElement.querySelector(".agent-latest");
@@ -58,6 +59,7 @@ export class AgentChat {
     });
     new ResizeObserver(() => this.scroll()).observe(root);
   }
+  configure(agent) { this.agent = agent; if (this.tasks) this.render(this.tasks); }
   render(tasks) {
     this.tasks = tasks;
     if (this.frame) return;
@@ -69,6 +71,9 @@ export class AgentChat {
       let record = this.records.get(task.id);
       if (!record) { record = this.createTask(task); this.records.set(task.id, record); }
       text(record.prompt, task.prompt || "Observed task");
+      text(record.agentName, this.agent.name);
+      text(record.avatar, this.agent.avatar);
+      record.reply.setAttribute("aria-label", `${this.agent.name} reply`);
       timestamp(record.user.timestamp, time(task.started) || task.queuedAt);
       const placements = new Map([[record.timeline, []], [record.answers, []]]);
       const groups = orderedRounds(task).map((round, index) => ({round, id:round.id, title:`Model call ${index + 1}`, entries:[]}));
@@ -91,6 +96,7 @@ export class AgentChat {
           record.responses.set(group.id, response);
         }
         text(response.title, group.title);
+        text(response.label, this.agent.name);
         response.messages = group.entries.filter(entry => entry.type === "message").map(entry => task.messages.get(entry.id));
         response.copy.hidden = !response.messages.length;
         const primary = response.messages.some(message => isFinalMessage(task, message));
@@ -132,7 +138,7 @@ export class AgentChat {
       record.error.hidden = !error;
       if (error) {
         const value = typeof error === "string" ? error : JSON.stringify(error, null, 2);
-        text(record.hint, errorHint(value)); text(record.errorBody, value);
+        text(record.hint, errorHint(value, this.agent)); text(record.errorBody, value);
       }
       record.pending.hidden = task.state !== "running" || Boolean(error);
       const label = {running:"Task in progress",completed:"Task completed",cancelled:"Task stopped",failed:"Task failed",rejected:"Task rejected",interrupted:"Task interrupted"}[task.state] || task.state;
@@ -156,7 +162,7 @@ export class AgentChat {
       }
     }
     if (!this.records.size) {
-      this.welcome = el("p", "agent-welcome", "Send a task to Codex. Follow its responses and tool calls here, and inspect the evidence in the trajectory.");
+      this.welcome = el("p", "agent-welcome", `Send a task to ${this.agent.name}. Follow its responses and tool calls here, and inspect the evidence in the trajectory.`);
       this.root.append(this.welcome);
     }
     this.updateProgress();
@@ -174,11 +180,12 @@ export class AgentChat {
     const user = this.bubble("user", () => task.prompt, () => this.onTask(task.id));
     const prompt = user.body;
     const reply = el("article", "agent-reply");
-    reply.setAttribute("aria-label", "Codex reply");
+    reply.setAttribute("aria-label", `${this.agent.name} reply`);
     const heading = el("header", "agent-reply-heading");
-    const avatar = el("span", "agent-avatar", ">_"); avatar.setAttribute("aria-hidden", "true");
+    const avatar = el("span", "agent-avatar", this.agent.avatar); avatar.setAttribute("aria-hidden", "true");
     const roundTitle = el("span", "agent-response-title");
-    heading.append(avatar, el("strong", "", "Codex"), roundTitle);
+    const agentName = el("strong", "", this.agent.name);
+    heading.append(avatar, agentName, roundTitle);
     const work = el("details", "agent-work"); work.open = true;
     const summary = el("summary", "agent-work-summary");
     const indicator = el("span", "agent-state-dot"); indicator.setAttribute("aria-hidden", "true");
@@ -198,7 +205,7 @@ export class AgentChat {
     work.append(summary, pending, error, timeline);
     reply.append(heading, answers, work);
     root.append(user.root, reply); this.root.append(root);
-    return {root,user,prompt,reply,roundTitle,indicator,work,workTitle,workCount,timeline,answers,error,hint,errorBody,pending,progress,outcome,entries:new Map(),responses:new Map()};
+    return {root,user,prompt,reply,agentName,avatar,roundTitle,indicator,work,workTitle,workCount,timeline,answers,error,hint,errorBody,pending,progress,outcome,entries:new Map(),responses:new Map()};
   }
   bubble(role, content, inspect) {
     const root = el("article", `agent-chat-message agent-${role}`);
@@ -210,7 +217,8 @@ export class AgentChat {
       avatar.innerHTML = userIcon;
       heading.append(avatar);
     }
-    heading.append(el("span", "agent-label", role === "user" ? "You" : "Codex"));
+    const label = el("span", "agent-label", role === "user" ? "You" : this.agent.name);
+    heading.append(label);
     const body = el("div", "agent-message-text", "");
     const actions = el("footer", "agent-message-actions");
     const copy = el("button", "agent-icon agent-copy"); copy.type = "button";
@@ -222,7 +230,7 @@ export class AgentChat {
     });
     actions.append(copy, this.inspect(inspect), timestamp);
     root.append(heading, body, actions);
-    return {root,heading,body,timestamp,copy};
+    return {root,heading,label,body,timestamp,copy};
   }
   createResponse(task, group) {
     const response = this.bubble("answer", () => response.messages.map(message => message.text).join("\n\n"), () => {

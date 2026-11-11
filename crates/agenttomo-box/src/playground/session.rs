@@ -34,24 +34,26 @@ pub async fn serve(mut socket: WebSocket, app: App) {
         .expect("session registry")
         .insert(id.clone(), None);
     let result = async {
-        let configuration = match &app.settings.codex {
-            Some(codex) => {
-                let prepared = codex.snapshot().await?;
+        let configuration = match &app.settings.agent {
+            Some(agent) => {
+                let prepared = agent.snapshot().await?;
                 app.settings.credential_gateway.as_ref().ok_or_else(|| io::Error::other("host credential gateway is unavailable"))?.register(name.clone(), prepared.policy);
                 prepared.files
             },
             None => Default::default(),
         };
-        let metadata = json!({"session_id":id,"container":name,"image":app.settings.image,"browser":app.settings.browser,"http_capture":app.settings.http.enabled,"agent_available":app.settings.codex.is_some()});
+        let agent = app.settings.agent.as_ref().map(|installation| installation.adapter());
+        let metadata = json!({"session_id":id,"container":name,"image":app.settings.image,"browser":app.settings.browser,"http_capture":app.settings.http.enabled,"agent_available":app.settings.agent.is_some(),"agent":agent.map(|adapter| adapter.metadata())});
         let bootstrap = sandbox::Bootstrap {
             metadata,
+            agent,
             configuration,
             proxy: app.settings.proxy.clone(),
             proxy_ca: app.settings.credential_gateway.as_ref().map(|gateway| gateway.certificate()),
         };
         socket
             .send(WsMessage::Text(
-                json!({"type":"session","id":id,"container":name,"image":app.settings.image,"http_capture":app.settings.http.enabled,"browser":app.settings.browser,"agent_available":app.settings.codex.is_some()})
+                json!({"type":"session","id":id,"container":name,"image":app.settings.image,"http_capture":app.settings.http.enabled,"browser":app.settings.browser,"agent_available":app.settings.agent.is_some(),"agent":agent.map(|adapter| adapter.metadata())})
                     .to_string()
                     .into(),
             ))
@@ -71,7 +73,7 @@ pub async fn serve(mut socket: WebSocket, app: App) {
             http: app.settings.http,
             browser: app.settings.browser,
             rootfs: &app.settings.rootfs,
-            codex: app.settings.codex.as_ref(),
+            agent: app.settings.agent.as_deref(),
             agent_id: &id,
         })
         .await?;
@@ -236,7 +238,7 @@ async fn drive(
                 }
                 WsMessage::Text(text) => match serde_json::from_str::<Control>(&text)? {
                     Control::AgentPrompt { task_id, prompt }
-                        if app.settings.codex.is_some()
+                        if app.settings.agent.is_some()
                             && task_id.len() == 32
                             && task_id.bytes().all(|byte| byte.is_ascii_hexdigit())
                             && !prompt.trim().is_empty()
@@ -244,7 +246,7 @@ async fn drive(
                     {
                         Input::AgentPrompt { task_id, prompt }
                     }
-                    Control::AgentCancel if app.settings.codex.is_some() => Input::AgentCancel,
+                    Control::AgentCancel if app.settings.agent.is_some() => Input::AgentCancel,
                     Control::Resize { rows, cols }
                         if (1..=1000).contains(&rows) && (1..=1000).contains(&cols) =>
                     {

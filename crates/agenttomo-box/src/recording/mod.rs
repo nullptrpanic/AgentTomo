@@ -54,6 +54,7 @@ impl Recording {
         directory: &Path,
         preview_limits: file_preview::Limits,
         exclude_task_trust: bool,
+        excluded_paths: Vec<PathBuf>,
     ) -> io::Result<(Self, File)> {
         if let Some(parent) = directory
             .parent()
@@ -89,7 +90,13 @@ impl Recording {
             exit: create_log(directory, "exit-code.txt").await?,
             events: events::Writer::start(
                 create_log(directory, "events.jsonl").await?,
-                file_preview::Store::create(directory, preview_limits, exclude_task_trust).await?,
+                file_preview::Store::create(
+                    directory,
+                    preview_limits,
+                    exclude_task_trust,
+                    excluded_paths,
+                )
+                .await?,
             ),
         };
         result.status("running", None).await?;

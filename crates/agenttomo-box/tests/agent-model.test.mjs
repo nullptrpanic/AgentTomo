@@ -1,6 +1,52 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { AgentModel } from "../src/playground/assets/agent-model.mjs";
+import { AgentModel, isFinalMessage } from "../src/playground/assets/agent-model.mjs";
+
+test("normalized message kinds override protocol fields and survive streaming completion", () => {
+  const model = new AgentModel(); let sequence = 0;
+  const add = (kind,data={}) => model.add({kind,sequence:++sequence,data:{task_id:"t",request_id:1,...data}});
+  add("agent.message.delta",{item_id:"answer",delta:"Answer"});
+  const message = model.task("t").messages.get("answer");
+  assert.equal(isFinalMessage(model.task("t"),message),false);
+  add("agent.message",{item_id:"answer",message_kind:"final",phase:"commentary",preview:"Full answer"});
+  assert.equal(model.task("t").messages.get("answer"),message,"completion updates the existing entry");
+  assert.equal(isFinalMessage(model.task("t"),message),true);
+  assert.equal(message.event.data.phase,"commentary","raw protocol evidence is retained");
+  add("agent.message",{item_id:"progress",message_kind:"intermediate",phase:"final_answer",preview:"Progress"});
+  add("agent.task.finished",{exit_code:0});
+  assert.equal(isFinalMessage(model.task("t"),model.task("t").messages.get("progress")),false);
+});
+
+test("unknown message semantics use the completed-task fallback without guessing during execution", () => {
+  const model = new AgentModel(); let sequence = 0;
+  const add = (kind,data={}) => model.add({kind,sequence:++sequence,data:{task_id:"t",request_id:1,...data}});
+  add("agent.message",{item_id:"answer",message_kind:"unknown",phase:"final_answer",preview:"Reply"});
+  const task = model.task("t"), message = task.messages.get("answer");
+  assert.equal(isFinalMessage(task,message),false,"unknown does not read raw phase");
+  add("agent.task.finished",{exit_code:0});
+  assert.equal(isFinalMessage(task,message),true);
+  add("agent.tool.call",{agenttomo_toolcall_id:"later-tool",name:"shell"});
+  assert.equal(isFinalMessage(task,message),false,"a later tool means this was not the last answer");
+  add("agent.message",{item_id:"later",message_kind:"unknown",preview:"Later reply"});
+  add("agent.task.finished",{cancelled:true});
+  assert.equal(isFinalMessage(task,task.messages.get("later")),false,"interruption cannot imply a final answer");
+});
+
+test("legacy message events keep their final-answer and fallback behavior", () => {
+  for (const [data,running,completed] of [
+    [{phase:"final_answer"},true,true],
+    [{phase:"commentary"},false,false],
+    [{phase:"other_legacy_phase"},false,false],
+    [{},false,true],
+  ]) {
+    const model = new AgentModel();
+    model.add({kind:"agent.message",sequence:1,data:{task_id:"t",item_id:"m",preview:"Reply",...data}});
+    const task=model.task("t"), message=task.messages.get("m");
+    assert.equal(isFinalMessage(task,message),running);
+    model.add({kind:"agent.task.finished",sequence:2,data:{task_id:"t",exit_code:0}});
+    assert.equal(isFinalMessage(task,message),completed);
+  }
+});
 test("chat keeps first-observed message and tool order while later updates reuse their entries", () => {
   const model = new AgentModel(); let sequence = 0;
   const add = (kind,data={}) => model.add({kind,sequence:++sequence,data:{task_id:"t",request_id:1,...data}});

@@ -152,13 +152,17 @@ struct MessageContext {
     response: bool,
     connect: bool,
     agent: Option<crate::agent::Scope>,
+    model_protocol: Option<crate::agent::Protocol>,
     encoding: String,
 }
 impl MessageContext {
     fn model_observer(&self) -> Option<crate::agent::Observer> {
         self.agent
             .clone()
-            .map(|scope| crate::agent::Observer::new(scope, self.session.inspection.agents.clone()))
+            .zip(self.model_protocol)
+            .map(|(scope, protocol)| {
+                crate::agent::Observer::new(scope, self.session.inspection.agents.clone(), protocol)
+            })
     }
     fn semantic(&self, events: Vec<crate::agent::Event>) {
         if events.is_empty() {
@@ -416,27 +420,24 @@ async fn handle(
     sender: Arc<Mutex<hyper::client::conn::http1::SendRequest<body::Observed>>>,
     session: Session,
 ) -> Result<Response<HttpBody>, stdio::Error> {
-    let agent = (matches!(*request.method(), Method::POST | Method::GET)
-        && request
-            .uri()
-            .path()
-            .trim_end_matches('/')
-            .ends_with("/responses"))
-    .then(|| {
-        session
-            .context
-            .metadata
-            .as_ref()
-            .filter(|metadata| metadata.actors.len() == 1)
-            .and_then(|metadata| {
-                session
-                    .inspection
-                    .agents
-                    .binding(metadata.actors[0].process_instance_id)
-            })
-            .map(|binding| binding.scope)
-    })
-    .flatten();
+    let model_protocol = crate::agent::Protocol::detect(request.method(), request.uri());
+    let agent = model_protocol
+        .is_some()
+        .then(|| {
+            session
+                .context
+                .metadata
+                .as_ref()
+                .filter(|metadata| metadata.actors.len() == 1)
+                .and_then(|metadata| {
+                    session
+                        .inspection
+                        .agents
+                        .binding(metadata.actors[0].process_instance_id)
+                })
+                .map(|binding| binding.scope)
+        })
+        .flatten();
     let encoding = request
         .headers()
         .get("content-encoding")
@@ -452,6 +453,7 @@ async fn handle(
         response: false,
         connect,
         agent,
+        model_protocol,
         encoding,
     };
     let authority = request
@@ -583,7 +585,11 @@ async fn handle(
             .to_owned(),
         ..message
     };
-    let sse = response_message.agent.is_some() && !upgrade_requested
+    let sse = response_message.agent.is_some()
+        && response_message
+            .model_protocol
+            .is_some_and(crate::agent::Protocol::expects_sse)
+        && !upgrade_requested
         || response
             .headers()
             .get("content-type")

@@ -1,5 +1,5 @@
 //! Reach a host-loopback proxy from owned Docker sessions without host networking.
-use crate::agent::codex::credentials::gateway::Gateway;
+use crate::proxy::credentials::gateway::Gateway;
 use std::{
     collections::{HashMap, HashSet},
     io,

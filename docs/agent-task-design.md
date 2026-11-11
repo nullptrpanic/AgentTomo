@@ -59,9 +59,31 @@ sg docker -c './target/debug/agenttomo-box playground --proxy http://127.0.0.1:8
 
 CLI stdout supplies thread lifecycle and immediate runtime diagnostics, including `error` and `turn.failed`. These diagnostics update the task while Codex retries, with authentication and connection hints plus expandable original details. Nonzero exits always carry an error message even if stderr is empty. Model and tool contents continue to come from observed traffic. Chat shows the current phase and elapsed time, and permits drafting the next prompt while a task is running.
 
+## Agent and protocol boundaries
+
+Shared launch, tracing, recording, forwarding and UI code consume built-in trait implementations. `agent/adapter.rs` registers `AgentAdapter` implementations by ID. Each adapter supplies display metadata, configuration rules, launch arguments and stdin encoding, runtime rules and lifecycle output parsing. Its host-side `Installation` owns discovery results, the read-only distribution mount and sanitized configuration preparation. Codex flags, filenames, environment setup and control-record parsing remain in `agent/codex.rs`. The registry serializes only the registered ID (`"codex"` remains unchanged); unknown IDs fail instead of silently selecting another adapter.
+
+`agent/workspace.rs` owns process creation, AgentTomo correlation environment variables, cancellation, pipe draining and conversation continuation. The current launch contract is one CLI invocation per turn with bounded prompt input followed by stdin EOF; persistent RPC agents need a separate design. The adapter supplies the invocation and interprets only lifecycle output. Model and tool evidence still comes from traffic.
+
+At the executable boundary, the selected adapter supplies runtime executable names to the correlation hub. The collector receives these rules without selecting or depending on Codex. With no adapter selected, ordinary `run` has no implicit Codex runtime classification. Registered adapters' private preview paths remain excluded even in that mode, preserving sensitive-file protection while retaining file-open events. `run` does not discover a host login, snapshot configuration or activate the host credential gateway. Playground assembles those optional integration pieces.
+
+`proxy/credentials` owns the existing host-only gateway, placeholder matching, exact origin/method/path enforcement, session revocation and static or reloadable header sources. `agent/codex/credentials` supplies the allowed operations and interprets Codex login/config formats. Host login reload still checks account consistency and token expiry. Credential sources and policies are never serialized; bootstrap sends only sanitized files. The gateway continues to reuse the common HTTP transport, TLS authority and outbound CONNECT implementation.
+
+`agent/protocol.rs` registers `ModelProtocol` implementations and selects one from HTTP request metadata. Each creates its own mutable `ModelDecoder`, which receives decompressed request bytes and framed SSE/WebSocket payloads, then emits normalized events. JSON parsing and the `[DONE]` sentinel belong to the Responses implementation in `agent/responses.rs`; this parser is shared by any agent speaking that protocol. `agent/wire.rs` retains compression, size limits, completion checks and correlation, while the existing proxy retains framing and forwarding. Decoder state is never shared between streams. Agent adapters and model protocol adapters are independent: adding an agent that speaks Responses does not require another Responses parser.
+
+Adding a built-in adapter requires implementing these contracts and registering it, rather than adding Agent-specific branches to the collector, workspace or UI. This is compile-time integration, without dynamic library loading or a separate plugin framework. Tests exercise the common launcher with a non-Codex input format and exercise separate decoders with non-JSON payloads.
+
+Session metadata now includes `agent.id`, `agent.name`, `agent.avatar` and `agent.authentication_hint`, alongside the existing `agent_available` flag. Owner and monitor pages use the same metadata. UI code retains existing cards, evidence links and disclosure state, with a generic Agent fallback when metadata is absent.
+
+The production registry still contains one agent adapter (Codex) and one model protocol (Responses). This refactor does not add another agent or claim exact attribution of concurrent/background tools. The existing inferred timing association, event formats, sandbox paths and credential-isolation guarantees remain in place.
+
 ## Events and retained contents
 
 The event category is `agent`. Records include a task ID, Agent instance ID, HTTP request ID and capture timestamp when applicable.
+
+Complete `agent.message` events include the protocol-independent `message_kind`: `intermediate`, `final` or `unknown`. Each protocol decoder determines this value; the Responses decoder maps `commentary` and `final_answer`, while missing or unrecognized phases remain `unknown`. The original `phase` field is retained as evidence. The frontend uses the normalized kind for answer placement and trajectory deduplication. Unknown messages use the existing completed-task/last-message fallback; a still-running or interrupted task does not imply a final answer.
+
+For compatibility, the frontend converts old events without `message_kind` once when they enter the task projection, preserving their previous phase-based behavior. New events take precedence over raw phase, including an explicit `unknown`. Model cards display the observed model name or `Unknown model`; a missing model name never implies a specific provider or protocol.
 
 | Logical record | Raw updates | Evidence |
 | --- | --- | --- |
@@ -79,13 +101,13 @@ Code Mode can call multiple inner tools and choose which values to return to the
 
 ## Process association
 
-The core identity is `(PID, process_instance_id)`. AgentTomo tool IDs are generated independently of model and Codex execution IDs.
+The core identity is `(PID, process_instance_id)`. AgentTomo tool IDs are generated independently of model call IDs. Agent-specific execution IDs are not collected or used for process association.
 
 1. The launcher seeds `AGENTTOMO_AGENT_ID` and `AGENTTOMO_TASK_ID` in the Codex process environment.
-2. At successful exec, the tracer reads only these identifiers, `AGENTTOMO_TOOLCALL_ID` and `CODEX_TOOL_CALL_ID` from the environment.
+2. At successful exec, the tracer reads only these identifiers and `AGENTTOMO_TOOLCALL_ID` from the environment.
 3. An explicit AgentTomo tool ID is used when supplied. Otherwise a new worker binds to the active model-visible call at process birth, or at its first applicable exec. Fork-only workers are covered.
-4. The binding is stored in the tracer's shared runtime map and retained across later execs. Forked processes inherit it. A later discovered Codex execution ID is recorded as an external alias.
-5. Codex runtime executables retain task-level bindings without a tool assignment. This small executable-role rule resides in the Codex adapter.
+4. The binding is stored in the tracer's shared runtime map and retained across later execs. Forked processes inherit it.
+5. Codex runtime executables retain task-level bindings without a tool assignment. This executable-role rule remains in the Codex adapter: a persistent tool host must not keep its first tool binding and pass it to workers from later calls. Timing alone cannot reliably distinguish a runtime helper from a worker.
 6. Network and file records acquire their process's binding. Shared socket ownership remains subject to the existing network attribution rules.
 
 The active fallback is released when the corresponding model-visible tool return is observed. Existing process bindings and their descendant inheritance continue to identify that tool.

@@ -19,6 +19,8 @@ pub enum Action {
 }
 
 pub async fn run(browser: bool) -> io::Result<u8> {
+    let adapter = super::Adapter::selected()?
+        .ok_or_else(|| io::Error::other("workspace requires an agent adapter"))?;
     let listener = UnixListener::bind(SOCKET)?;
     std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o666))?;
     let mut terminal = if browser {
@@ -28,7 +30,7 @@ pub async fn run(browser: bool) -> io::Result<u8> {
         terminal.args(["--noprofile", "--norc", "-i"]);
         terminal
     };
-    super::codex::configure(&mut terminal)?;
+    adapter.configure(&mut terminal)?;
     let mut terminal = terminal.kill_on_drop(true).spawn()?;
     let connection = tokio::select! {
         accepted = listener.accept() => accepted?.0,
@@ -39,7 +41,7 @@ pub async fn run(browser: bool) -> io::Result<u8> {
     let mut task: Option<Child> = None;
     let mut output = None;
     let mut current = None;
-    let mut thread = None;
+    let mut conversation = None;
     let (diagnostics, mut notices) = tokio::sync::mpsc::channel::<String>(32);
     loop {
         tokio::select! {
@@ -53,15 +55,11 @@ pub async fn run(browser: bool) -> io::Result<u8> {
                             continue;
                         }
                         let start = async {
-                            let mut child = super::codex::command(&scope, thread.as_deref())?
-                                .process_group(0).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn()?;
-                            let mut stdin = child.stdin.take().unwrap();
-                            stdin.write_all(prompt.as_bytes()).await?;
-                            drop(stdin);
+                            let mut child = start(adapter, &scope, conversation.as_deref(), &prompt).await?;
                             let stdout = child.stdout.take().unwrap();
                             let stderr = child.stderr.take().unwrap();
                             let diagnostics = diagnostics.clone();
-                            output = Some(tokio::spawn(async move { tokio::try_join!(super::codex::read_runtime_output(stdout, diagnostics), read_output(stderr)) }));
+                            output = Some(tokio::spawn(async move { tokio::try_join!(adapter.read_output(Box::new(stdout), diagnostics), read_output(stderr)) }));
                             task = Some(child);
                             current = Some(scope.clone());
                             Ok::<_, io::Error>(())
@@ -85,13 +83,13 @@ pub async fn run(browser: bool) -> io::Result<u8> {
                 let captured = match output.take() {
                     Some(mut output) => match tokio::time::timeout(std::time::Duration::from_secs(2), &mut output).await {
                         Ok(Ok(Ok(value))) => value,
-                        _ => { output.abort(); (super::codex::RuntimeOutput::default(), String::new()) },
+                        _ => { output.abort(); (super::adapter::RuntimeOutput::default(), String::new()) },
                     },
-                    None => (super::codex::RuntimeOutput::default(), String::new()),
+                    None => (super::adapter::RuntimeOutput::default(), String::new()),
                 };
-                if let Some(id) = captured.0.thread { thread = Some(id); }
+                if let Some(id) = captured.0.conversation_id { conversation = Some(id); }
                 let error = captured.0.error.unwrap_or_else(|| {
-                    if captured.1.trim().is_empty() { format!("Codex exited unsuccessfully ({code:?})") }
+                    if captured.1.trim().is_empty() { format!("{} exited unsuccessfully ({code:?})", adapter.metadata().name) }
                     else { captured.1.chars().take(8192).collect::<String>() }
                 });
                 protocol::send(&mut write, &json!({"kind":"agent.task.finished","scope":current.take(),"exit_code":code,"error":if code == Some(0) { Value::Null } else { error.into() }})).await?;
@@ -100,6 +98,32 @@ pub async fn run(browser: bool) -> io::Result<u8> {
             }
         }
     }
+}
+
+pub(super) async fn start(
+    adapter: super::Adapter,
+    scope: &Scope,
+    conversation: Option<&str>,
+    prompt: &str,
+) -> io::Result<Child> {
+    let mut launch = adapter.launch(&super::adapter::LaunchRequest {
+        conversation,
+        prompt,
+    })?;
+    let mut child = launch
+        .command
+        .env("AGENTTOMO_AGENT_ID", &scope.agent_instance_id)
+        .env("AGENTTOMO_TASK_ID", &scope.task_id)
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(&launch.input).await?;
+    drop(stdin);
+    Ok(child)
 }
 
 fn kill_group(child: Option<&mut Child>) {

@@ -364,10 +364,10 @@ fn run(
                         let identity = processes.exec(pid, old);
                         let mut data = exec_context(pid);
                         let environment = crate::agent::environment(pid);
-                        agents.exec(
+                        agents.observe_exec(
                             identity.process_instance_id,
                             &environment,
-                            crate::agent::codex::is_runtime(&data["argv"]),
+                            &data["argv"],
                         );
                         agents.track(identity)?;
                         if environment

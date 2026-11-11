@@ -112,7 +112,7 @@ pub struct Create<'a> {
     pub http: crate::proxy::http::Options,
     pub browser: bool,
     pub rootfs: &'a crate::execution::rootfs::Options,
-    pub codex: Option<&'a crate::agent::codex::Installation>,
+    pub agent: Option<&'a dyn crate::agent::Installation>,
     pub agent_id: &'a str,
 }
 pub async fn create(options: Create<'_>) -> io::Result<()> {
@@ -125,7 +125,7 @@ pub async fn create(options: Create<'_>) -> io::Result<()> {
         http,
         browser,
         rootfs,
-        codex,
+        agent,
         agent_id,
     } = options;
     let mut rootfs = rootfs.clone();
@@ -192,15 +192,21 @@ pub async fn create(options: Create<'_>) -> io::Result<()> {
             .arg("--mount")
             .arg(mount(binary, "/agenttomo-box", true)?)
             .arg("--tmpfs")
-            // Codex installs its interactive daemon under its private home here.
+            // Agent-managed binaries and state live in this disposable filesystem.
             .arg(format!("/records:rw,exec,nosuid,nodev,size={tmpfs_size_mib}m,mode=0711"))
             ;
-    if let Some(codex) = codex {
+    if let Some(agent) = agent {
+        let (source, target) = agent.mount();
         command
             .arg("--mount")
-            .arg(mount(&codex.distribution, "/opt/agenttomo-codex", true)?)
+            .arg(mount(source, target, true)?)
             .arg("--env")
             .arg("AGENTTOMO_WORKSPACE=1")
+            .arg("--env")
+            .arg(format!(
+                "AGENTTOMO_AGENT_ADAPTER={}",
+                agent.adapter().metadata().id
+            ))
             .arg("--env")
             .arg("SSL_CERT_FILE=/records/control/upstream-certs.pem")
             .arg("--env")
@@ -217,9 +223,9 @@ pub async fn create(options: Create<'_>) -> io::Result<()> {
                 "--output-dir",
                 &format!("/records/{agent_id}/run"),
                 "-c",
-                if codex.is_some() && browser {
+                if agent.is_some() && browser {
                     "exec /agenttomo-box __workspace --browser"
-                } else if codex.is_some() {
+                } else if agent.is_some() {
                     "exec /agenttomo-box __workspace"
                 } else if browser {
                     "exec /usr/local/bin/agenttomo-browser-session"

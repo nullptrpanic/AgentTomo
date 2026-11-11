@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::{
     io,
     os::unix::fs::FileExt,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{fs::File, io::AsyncWriteExt};
@@ -41,6 +41,7 @@ pub struct Store {
     used: u64,
     failed: bool,
     exclude_task_trust: bool,
+    excluded_paths: Vec<PathBuf>,
     // Exact captured bytes are the key, so path reuse or in-place edits cannot
     // return stale content. Bound memory independently of the on-disk budget.
     snapshots: Cache<Vec<u8>, u64>,
@@ -51,6 +52,7 @@ impl Store {
         directory: &Path,
         limits: Limits,
         exclude_task_trust: bool,
+        excluded_paths: Vec<PathBuf>,
     ) -> io::Result<Self> {
         Ok(Self {
             file: if limits.enabled() {
@@ -62,6 +64,7 @@ impl Store {
             used: 0,
             failed: false,
             exclude_task_trust,
+            excluded_paths,
             snapshots: Cache::builder()
                 .max_capacity(16 * 1024 * 1024)
                 .weigher(|bytes: &Vec<u8>, _: &u64| bytes.len() as u32 + 128)
@@ -72,9 +75,9 @@ impl Store {
     pub async fn capture(&mut self, opened: Opened) -> Value {
         let Opened { mut data, content } = opened;
         if data["resolved_path"].as_str().is_some_and(|path| {
-            path.starts_with("/root/.agenttomo-codex/")
-                || path.starts_with("/root/.agenttomo-config/")
-                || path.starts_with("/records/codex/")
+            self.excluded_paths
+                .iter()
+                .any(|excluded| Path::new(path).starts_with(excluded))
         }) {
             data["preview"] = json!({"status":"unavailable","source":"open_snapshot","reason":"agent_private_state"});
             return data;
@@ -205,6 +208,43 @@ fn trust_material(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn configured_private_paths_exclude_contents_without_hiding_neighboring_files() {
+        let dir = Directory::new();
+        let mut store = Store::create(
+            &dir.0,
+            Limits::default(),
+            false,
+            vec!["/records/example".into()],
+        )
+        .await
+        .unwrap();
+        for (path, excluded) in [
+            ("/records/example/state.json", true),
+            ("/records/example", true),
+            ("/records/example-other/state.json", false),
+        ] {
+            let local = dir.0.join("content");
+            std::fs::write(&local, b"snapshot").unwrap();
+            let result = store
+                .capture(Opened {
+                    data: json!({"resolved_path":path,"preview":{"status":"unavailable"}}),
+                    content: Some(std::fs::File::open(local).unwrap()),
+                })
+                .await;
+            assert_eq!(result["resolved_path"], path);
+            if excluded {
+                assert_eq!(result["preview"]["reason"], "agent_private_state");
+            } else {
+                assert_eq!(result["preview"]["status"], "complete");
+            }
+        }
+        assert_eq!(
+            std::fs::read(dir.0.join(PAYLOAD_FILE)).unwrap(),
+            b"snapshot"
+        );
+    }
+
     struct Directory(std::path::PathBuf);
     impl Directory {
         fn new() -> Self {
@@ -238,6 +278,7 @@ mod tests {
                 total_bytes: 8,
             },
             false,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -274,6 +315,7 @@ mod tests {
                 total_bytes: 6,
             },
             false,
+            Vec::new(),
         )
         .await
         .unwrap();

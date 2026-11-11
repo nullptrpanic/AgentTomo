@@ -104,6 +104,15 @@ try {
   await page.goto(output.match(/http:\/\/\S+/)[0]);
   await until(async () => (await page.locator("#status").textContent()) === "Connected");
   assert.equal(session.agent_available,true,"external Codex discovery");
+  assert.equal(session.agent.id,"codex");
+  assert.equal(session.agent.name,"Codex");
+  assert.equal(session.agent.avatar,">_");
+  const sessionMetadata = await page.evaluate(async id => {
+    const url = new URL(`/api/sessions/${id}/events`, location.href);
+    url.searchParams.set("token", new URL(location.href).searchParams.get("token"));
+    return (await (await fetch(url)).json()).session;
+  }, session.id);
+  assert.deepEqual(sessionMetadata.agent,session.agent,"owner and independent monitors share adapter metadata");
   await page.locator("#terminal").click();
   await page.keyboard.type('test -z "$HTTP_PROXY$HTTPS_PROXY$ALL_PROXY$http_proxy$https_proxy$all_proxy" && test "$CODEX_HOME" = /records/codex && codex login status && printf "TERMINAL_AUTH_%s\\n" OK');
   await page.keyboard.press("Enter");
@@ -119,6 +128,9 @@ try {
   await until(() => observed.some(event => event.kind==="agent.task.finished"),90000);
   const ended=observed.find(event=>event.kind==="agent.task.finished");
   assert.equal(ended.data.exit_code,0,JSON.stringify(ended.data));
+  const messages = observed.filter(event=>event.kind==="agent.message");
+  assert.ok(messages.length > 0,"model traffic contains an assistant message");
+  assert.ok(messages.every(event=>["intermediate","final","unknown"].includes(event.data.message_kind)),"protocol adapters publish normalized message semantics through the journal");
   assert.deepEqual(await readdir(`${directory}/sessions`).catch(error => { if (error.code === "ENOENT") return []; throw error; }), [], "no runtime files may be staged on the host");
   assert.equal(docker("exec",session.container,"stat","-f","-c","%T","/records/codex").trim(),"tmpfs");
   assert.ok(docker("exec",session.container,"ls",`/records/${session.id}/run`).includes("agent-payloads.bin"),"evidence stays available in the live sandbox");

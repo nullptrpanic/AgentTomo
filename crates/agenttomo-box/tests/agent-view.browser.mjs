@@ -37,7 +37,7 @@ try {
       load:async payload => ({0:{model:"test-model",generate:false},1:{cmd:"curl https://example.test/",timeout_ms:1000},2:"Complete tool output",3:{id:"response",status:"completed",output:[{type:"message",content:[{type:"output_text",text:"Full model answer"}]}]}})[payload.offset],
       onSelect:() => {},onRaw:() => {},reveal:() => {},filter:{allows:() => true}});
     window.cancels = 0;
-    view.configure({agent_available:true});
+    view.configure({agent_available:true, agent:{id:"fixture",name:"Example Agent",avatar:"EA",authentication_hint:"Sign in to the fixture on the host."}});
     view.setControl({prompt:() => {},cancel:() => { window.cancels++; }});
     view.setReady(true);
     let sequence = 0;
@@ -51,6 +51,9 @@ try {
     add("agent.message.delta",{item_id:"after",delta:"The endpoint returned a response.",started_unix_ns:40});
   });
   await page.locator(".agent-tool-card").waitFor({state:"attached",timeout:5000});
+  assert.equal(await page.locator(".agent-reply-heading strong").textContent(),"Example Agent","assistant name comes from session metadata");
+  assert.equal(await page.locator(".agent-reply-heading .agent-avatar").textContent(),"EA");
+  assert.equal(await page.locator("textarea").getAttribute("aria-label"),"Task for Example Agent");
   assert.equal(await page.locator(".agent-reply").count(),1,"one assistant reply owns both the answer and execution");
   assert.equal(await page.locator('.agent-timeline > .agent-response').count(),1,"one model response owns its text and tool calls");
   assert.deepEqual(await page.locator('.agent-response .agent-entry').evaluateAll(nodes => nodes.map(node => node.dataset.entryId)),["before","tool","after"]);
@@ -159,6 +162,7 @@ try {
     add("agent.task.finished",{task_id:"failed",exit_code:1,error:"HTTP 401 Unauthorized"});
   });
   assert.equal(await page.locator("textarea").inputValue(),"Recover this prompt.");
+  await page.waitForFunction(()=>document.querySelector('[data-task-id="failed"] .agent-error > p')?.textContent==="Sign in to the fixture on the host.");
   const latestError = page.locator('.agent-chat-task[data-task-id="failed"] .agent-error-details');
   await latestError.waitFor({state:"visible"});
   await latestError.locator("summary").click();
@@ -300,7 +304,27 @@ try {
     await orphan.scrollIntoViewIfNeeded();
     assert.ok(await page.locator('.agent-history').evaluate(node=>node.scrollWidth<=node.clientWidth+1),`response/tool cards must wrap at ${width}px`);
   }
-  console.log(JSON.stringify({passed:true,ordering:true,stableNodes:true,textSelection:true,toolDetails:true,scrollFollowing:true,stopFeedback:true,draftPreserved:true,completedHierarchy:true,sanitizedMarkdown:true,answerCopyFeedback:true,narrowLayout:true}));
+  await page.setViewportSize({width:1280,height:900});
+  const normalizedRounds = await page.evaluate(() => {
+    add("agent.task.started",{task_id:"normalized",prompt:"Render normalized messages from another protocol."});
+    add("agent.model.request",{task_id:"normalized",request_id:301});
+    add("agent.message",{task_id:"normalized",request_id:301,item_id:"normalized-progress",message_kind:"intermediate",phase:"final_answer",preview:"Checking the result."});
+    add("agent.model.request",{task_id:"normalized",request_id:302});
+    add("agent.model.started",{task_id:"normalized",request_id:302,model:"provider-model"});
+    add("agent.message",{task_id:"normalized",request_id:302,item_id:"normalized-final",message_kind:"final",phase:"commentary",preview:"The result is ready."});
+    add("agent.task.finished",{task_id:"normalized",exit_code:0});
+    view.root.hidden=false; view.render(); view.renderChat();
+    return view.model.task("normalized").rounds.map(round=>round.id);
+  });
+  const normalized = page.locator('[data-task-id="normalized"]');
+  assert.equal(await normalized.locator('.agent-final-answers [data-entry-id="normalized-final"]').count(),1);
+  assert.equal(await normalized.locator('.agent-timeline [data-entry-id="normalized-progress"]').count(),1);
+  assert.equal(await normalized.locator('.agent-work').evaluate(node=>node.open),false,"normalized messages retain completed-task folding");
+  assert.equal(await page.locator(`[data-agent-node="${normalizedRounds[0]}"] > .agent-card .agent-node-meta`).textContent(),"Unknown model · ended");
+  assert.equal(await page.locator(`[data-agent-node="${normalizedRounds[1]}"] > .agent-card .agent-node-meta`).textContent(),"provider-model · ended");
+  assert.equal(await page.locator('[data-agent-node="message-normalized-final"]').count(),0,"the normalized final answer is not duplicated in the trajectory");
+  assert.deepEqual(errors,[]);
+  console.log(JSON.stringify({passed:true,ordering:true,stableNodes:true,textSelection:true,toolDetails:true,scrollFollowing:true,stopFeedback:true,draftPreserved:true,completedHierarchy:true,sanitizedMarkdown:true,answerCopyFeedback:true,narrowLayout:true,normalizedMessages:true,genericModelLabels:true}));
 } finally {
   await page?.close(); await browser?.close(); server.closeAllConnections(); server.close();
 }

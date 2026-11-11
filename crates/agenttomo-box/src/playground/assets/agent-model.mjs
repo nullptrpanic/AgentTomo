@@ -10,15 +10,25 @@ export function orderedRounds(task) {
 }
 
 export function isFinalMessage(task, message) {
-  if (message.event.data.phase) return message.event.data.phase === "final_answer";
+  if (message.kind === "final") return true;
+  if (message.kind === "intermediate") return false;
   const last = task.timeline.at(-1);
   return task.state === "completed" && last?.type === "message" && last.id === message.id;
 }
 
+function messageKind(data) {
+  if (data.message_kind !== undefined) {
+    return ["final", "intermediate"].includes(data.message_kind) ? data.message_kind : "unknown";
+  }
+  // Legacy journals predate message_kind. Convert their phase once at ingress,
+  // preserving the old rule for any explicit non-final phase.
+  return data.phase ? data.phase === "final_answer" ? "final" : "intermediate" : "unknown";
+}
+
 export class AgentModel {
-  constructor() { this.tasks = new Map(); this.tools = new Map(); this.bindings = new Map(); }
+  constructor() { this.name = "Agent"; this.tasks = new Map(); this.tools = new Map(); this.bindings = new Map(); }
   task(id) {
-    if (!this.tasks.has(id)) this.tasks.set(id, { id, prompt: "", state: "running", phase: "Starting Codex", queuedAt: Date.now(), activity: 0, timeline: [], rounds: [], messages: new Map(), tools: new Map(), errors: [], current: null });
+    if (!this.tasks.has(id)) this.tasks.set(id, { id, prompt: "", state: "running", phase: `Starting ${this.name}`, queuedAt: Date.now(), activity: 0, timeline: [], rounds: [], messages: new Map(), tools: new Map(), errors: [], current: null });
     return this.tasks.get(id);
   }
   add(event) {
@@ -33,7 +43,7 @@ export class AgentModel {
     if (d.error && !d.cancelled && ["agent.task.diagnostic", "agent.task.finished", "agent.task.rejected", "agent.capture.error"].includes(event.kind) && task.errors.at(-1)?.data.error !== d.error) {
       task.errors.push(event);
     }
-    if (event.kind === "agent.task.diagnostic") task.phase = /reconnect|retry/i.test(d.error || "") ? "Retrying connection" : "Codex reported a problem";
+    if (event.kind === "agent.task.diagnostic") task.phase = /reconnect|retry/i.test(d.error || "") ? "Retrying connection" : `${this.name} reported a problem`;
     if (event.kind === "agent.model.request") {
       const round = task.rounds.findLast(round => !round.request && round.requestId === d.request_id) || this.newRound(task,event);
       round.request = event; task.current = round;
@@ -69,11 +79,11 @@ export class AgentModel {
       task.phase = "Receiving reply";
       let message = task.messages.get(id);
       if (!message) {
-        message = { id, text: "", event, started: event };
+        message = { id, text: "", kind: messageKind(d), event, started: event };
         task.timeline.push({type:"message",id});
       }
       if (event.kind === "agent.message.delta") message.text += d.delta || "";
-      else { message.text = d.preview ?? message.text; message.event = event; message.complete = true; }
+      else { message.text = d.preview ?? message.text; message.kind = messageKind(d); message.event = event; message.complete = true; }
       task.messages.set(id, message);
       message.activity = Math.max(message.activity || 0, event.sequence || 0);
       this.round(task,event).messages.set(id, message);

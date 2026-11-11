@@ -107,7 +107,7 @@ pub struct PlaygroundArgs {
     /// Legacy compatibility option; Playground data now stays in container tmpfs
     #[arg(long, default_value = ".agenttomo/playground")]
     pub output_dir: PathBuf,
-    /// Maximum tmpfs size for diagnostics, Codex state and IPC, in MiB
+    /// Maximum tmpfs size for diagnostics, agent state and IPC, in MiB
     #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..))]
     pub session_tmpfs_size_mib: u32,
     #[command(flatten)]

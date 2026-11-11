@@ -39,7 +39,7 @@ Host TLS termination uses an ephemeral signing authority. Its public certificate
 
 ## Codex adapter ownership
 
-Keep installation discovery, configuration sanitization, placeholder generation, authentication extraction, and provider destination rules together under `agent::codex`. The core HTTP transport should receive transport and header operations with application-independent types. Provider names, Codex authentication field names, and ChatGPT endpoint policy belong to the adapter.
+Installation discovery, configuration sanitization, authentication extraction, synthetic identity metadata, and provider destination rules remain under `agent::codex`, behind the shared agent adapter interface. `proxy::credentials` owns random placeholders, scoped header grants, reloadable header sources, revocation and the host gateway. The adapter supplies exact allowed methods and paths; the gateway does not interpret Codex login or provider configuration. Provider names, Codex authentication field names, and ChatGPT endpoint policy belong to the adapter.
 
 The implementation reuses the existing HTTP CONNECT connector, TLS authority, opaque byte-stream forwarding, and Playground session lifecycle. Container capture and host forwarding share the HTTP framing, request sending, Upgrade handling, and shutdown implementation in `proxy::http::transport`. Request and response bodies pass through Hyper body frames. The host forwarding entry runs in the existing AgentTomo process and uses one listener for its owned sessions.
 

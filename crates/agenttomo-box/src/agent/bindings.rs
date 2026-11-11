@@ -18,7 +18,6 @@ pub struct Binding {
     pub scope: Scope,
     pub agenttomo_toolcall_id: Option<String>,
     pub association: &'static str,
-    pub external_execution_id: Option<String>,
 }
 #[derive(Default)]
 struct State {
@@ -30,11 +29,27 @@ struct State {
     cancelled: std::collections::HashSet<(String, String)>,
 }
 #[derive(Clone, Default)]
-pub struct Hub(Arc<Mutex<State>>);
+pub struct Hub {
+    state: Arc<Mutex<State>>,
+    runtimes: Arc<[String]>,
+}
 
 impl Hub {
+    pub fn with_runtimes(runtimes: Vec<String>) -> Self {
+        Self {
+            runtimes: runtimes.into(),
+            ..Self::default()
+        }
+    }
+    pub fn observe_exec(&self, instance: u64, env: &Value, argv: &Value) {
+        let runtime = argv[0]
+            .as_str()
+            .and_then(|path| std::path::Path::new(path).file_name())
+            .is_some_and(|name| self.runtimes.iter().any(|runtime| name == runtime.as_str()));
+        self.exec(instance, env, runtime);
+    }
     pub fn track(&self, identity: crate::process::Identity) -> std::io::Result<()> {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let Some(binding) = state.processes.get(&identity.process_instance_id) else {
             return Ok(());
         };
@@ -57,14 +72,14 @@ impl Hub {
         Ok(())
     }
     pub fn exited(&self, identity: crate::process::Identity) {
-        self.0
+        self.state
             .lock()
             .unwrap()
             .live
             .remove(&identity.process_instance_id);
     }
     pub fn cancel(&self, scope: &Scope) -> std::io::Result<()> {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         state
             .cancelled
             .insert((scope.agent_instance_id.clone(), scope.task_id.clone()));
@@ -85,7 +100,7 @@ impl Hub {
         }
     }
     pub fn exec(&self, instance: u64, env: &Value, runtime: bool) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let inherited = state
             .processes
             .get(&instance)
@@ -103,10 +118,9 @@ impl Hub {
                 None => return,
             },
         };
-        let external = env["CODEX_TOOL_CALL_ID"].as_str().map(str::to_owned);
         let explicit = env["AGENTTOMO_TOOLCALL_ID"].as_str().map(str::to_owned);
         // A known runtime helper can clear a tentative birth binding. Worker
-        // bindings otherwise remain frozen while later execs add their aliases.
+        // bindings otherwise remain frozen across later execs.
         if let Some(binding) = state.processes.get_mut(&instance)
             && binding.agenttomo_toolcall_id.is_some()
             && explicit.is_none()
@@ -114,9 +128,6 @@ impl Hub {
         {
             if binding.association == "inferred_process_birth" {
                 binding.association = "inferred_active_call";
-            }
-            if let Some(external) = external {
-                binding.external_execution_id = Some(external);
             }
             return;
         }
@@ -143,12 +154,11 @@ impl Hub {
                 } else {
                     "agent_runtime"
                 },
-                external_execution_id: external,
             },
         );
     }
     pub fn fork(&self, parent: u64, child: u64) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if let Some(mut binding) = state.processes.get(&parent).cloned() {
             if binding.agenttomo_toolcall_id.is_some() {
                 binding.association = if matches!(
@@ -169,7 +179,7 @@ impl Hub {
         }
     }
     pub fn binding(&self, instance: u64) -> Option<Binding> {
-        self.0.lock().unwrap().processes.get(&instance).cloned()
+        self.state.lock().unwrap().processes.get(&instance).cloned()
     }
     pub fn fields(&self, data: &mut Value) {
         if let Some(binding) = data["process_instance_id"]
@@ -180,7 +190,7 @@ impl Hub {
         }
     }
     pub fn call(&self, scope: &Scope, external: &str, activate: bool) -> (String, Scope) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let result = state
             .calls
             .entry((scope.agent_instance_id.clone(), external.to_owned()))
@@ -200,14 +210,14 @@ impl Hub {
         result
     }
     pub fn first_result(&self, scope: &Scope, external: &str) -> bool {
-        self.0
+        self.state
             .lock()
             .unwrap()
             .results
             .insert((scope.agent_instance_id.clone(), external.to_owned()))
     }
     pub fn returned(&self, scope: &Scope, tool: &str) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if state
             .active
             .get(&scope.agent_instance_id)
@@ -242,7 +252,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
-    fn runtime_helpers_stay_unassigned_and_workers_bind_without_environment_copying() {
+    fn runtime_helpers_keep_later_workers_on_their_current_calls() {
         let hub = Hub::default();
         let scope = Scope {
             agent_instance_id: "a".into(),
@@ -256,15 +266,26 @@ mod tests {
         );
         assert_eq!(hub.binding(1).unwrap().agenttomo_toolcall_id, None);
         hub.fork(1, 2);
+        hub.exec(2, &json!({}), true);
+        assert_eq!(hub.binding(2).unwrap().agenttomo_toolcall_id, None);
+        hub.fork(2, 3);
         assert_eq!(
-            hub.binding(2).unwrap().agenttomo_toolcall_id.as_deref(),
+            hub.binding(3).unwrap().agenttomo_toolcall_id.as_deref(),
             Some(tool.as_str()),
             "a fork-only worker must bind before any exec"
         );
-        hub.exec(2, &json!({}), false);
+        hub.exec(3, &json!({}), false);
+        let (next, _) = hub.call(&scope, "next-call", true);
+        hub.fork(2, 4);
+        hub.exec(4, &json!({}), false);
         assert_eq!(
-            hub.binding(2).unwrap().agenttomo_toolcall_id.as_deref(),
+            hub.binding(3).unwrap().agenttomo_toolcall_id.as_deref(),
             Some(tool.as_str())
+        );
+        assert_eq!(
+            hub.binding(4).unwrap().agenttomo_toolcall_id.as_deref(),
+            Some(next.as_str()),
+            "a persistent runtime helper must not pass its first call to later workers"
         );
     }
     #[tokio::test]
@@ -306,25 +327,6 @@ mod tests {
         }
     }
     #[test]
-    fn a_later_exec_adds_the_external_alias_without_rebinding_the_process() {
-        let hub = Hub::default();
-        let scope = Scope {
-            agent_instance_id: "a".into(),
-            task_id: "t".into(),
-        };
-        let (first, _) = hub.call(&scope, "call1", true);
-        let env = json!({"AGENTTOMO_AGENT_ID":"a","AGENTTOMO_TASK_ID":"t"});
-        hub.exec(1, &env, false);
-        hub.call(&scope, "call2", true);
-        hub.exec(1, &json!({"AGENTTOMO_AGENT_ID":"a","AGENTTOMO_TASK_ID":"t","CODEX_TOOL_CALL_ID":"exec-real"}), false);
-        let binding = hub.binding(1).unwrap();
-        assert_eq!(
-            binding.agenttomo_toolcall_id.as_deref(),
-            Some(first.as_str())
-        );
-        assert_eq!(binding.external_execution_id.as_deref(), Some("exec-real"));
-    }
-    #[test]
     fn binding_is_frozen_across_exec_fork_and_later_calls() {
         let hub = Hub::default();
         let scope = Scope {
@@ -332,8 +334,7 @@ mod tests {
             task_id: "t".into(),
         };
         let (first, _) = hub.call(&scope, "model1", true);
-        let env =
-            json!({"AGENTTOMO_AGENT_ID":"a","AGENTTOMO_TASK_ID":"t","CODEX_TOOL_CALL_ID":"exec1"});
+        let env = json!({"AGENTTOMO_AGENT_ID":"a","AGENTTOMO_TASK_ID":"t"});
         hub.exec(1, &env, false);
         hub.call(&scope, "model2", true);
         hub.exec(1, &env, false);
@@ -343,11 +344,15 @@ mod tests {
             Some(first.as_str())
         );
         assert_eq!(hub.binding(2).unwrap().association, "inherited_inferred");
-        hub.exec(3, &json!({"AGENTTOMO_AGENT_ID":"a","AGENTTOMO_TASK_ID":"other","CODEX_TOOL_CALL_ID":"exec2"}), false);
+        hub.exec(
+            3,
+            &json!({"AGENTTOMO_AGENT_ID":"a","AGENTTOMO_TASK_ID":"other"}),
+            false,
+        );
         assert_eq!(hub.binding(3).unwrap().agenttomo_toolcall_id, None);
     }
     #[test]
-    fn aliases_are_scoped_and_replayed_results_are_deduplicated() {
+    fn model_call_ids_are_scoped_and_replayed_results_are_deduplicated() {
         let hub = Hub::default();
         let scope = Scope {
             agent_instance_id: "a".into(),

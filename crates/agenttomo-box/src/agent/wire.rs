@@ -1,9 +1,9 @@
 //! Bounded semantic observation independent of HTTP preview retention.
 use super::{
     Hub, MAX_CONTENT, Scope,
-    responses::{self, Event},
+    protocol::{Event, ModelDecoder, Protocol},
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use std::io::{self, Read};
 
 pub struct Observer {
@@ -11,17 +11,17 @@ pub struct Observer {
     hub: Hub,
     request: Vec<u8>,
     oversized: bool,
-    response: responses::Response,
+    response: Box<dyn ModelDecoder>,
     response_complete: bool,
 }
 impl Observer {
-    pub fn new(scope: Scope, hub: Hub) -> Self {
+    pub fn new(scope: Scope, hub: Hub, protocol: Protocol) -> Self {
         Self {
             scope,
             hub,
             request: Vec::new(),
             oversized: false,
-            response: responses::Response::default(),
+            response: protocol.decoder(),
             response_complete: false,
         }
     }
@@ -42,21 +42,18 @@ impl Observer {
             Err(io::Error::other("model request body was interrupted"))
         } else {
             decode(&std::mem::take(&mut self.request), encoding)
-                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(io::Error::other))
+                .and_then(|bytes| self.response.request(&bytes))
         };
         let events = match result {
-            Ok(value) => responses::request(&value),
+            Ok(events) => events,
             Err(error) => vec![self.error(error.to_string())],
         };
         self.decorate(events)
     }
     pub fn event(&mut self, data: &str) -> Vec<Event> {
-        if data.trim() == "[DONE]" {
-            return Vec::new();
-        }
-        let events = match serde_json::from_str::<Value>(data) {
-            Ok(value) => self.response.event(value),
-            Err(error) => vec![self.error(format!("invalid model SSE JSON: {error}"))],
+        let events = match self.response.event(data) {
+            Ok(events) => events,
+            Err(error) => vec![self.error(error.to_string())],
         };
         if events
             .iter()
@@ -80,12 +77,9 @@ impl Observer {
         }
     }
     pub fn websocket_request(&mut self, bytes: &[u8]) -> Vec<Event> {
-        let events = match serde_json::from_slice::<Value>(bytes) {
-            Ok(value) if value["type"] == "response.create" => {
-                responses::request(value.get("response").unwrap_or(&value))
-            }
-            Ok(_) => Vec::new(),
-            Err(error) => vec![self.error(format!("invalid model WebSocket JSON: {error}"))],
+        let events = match self.response.websocket_request(bytes) {
+            Ok(events) => events,
+            Err(error) => vec![self.error(error.to_string())],
         };
         self.decorate(events)
     }
@@ -169,6 +163,9 @@ fn decode(bytes: &[u8], encoding: &str) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn responses() -> Protocol {
+        Protocol::detect(&axum::http::Method::POST, &"/v1/responses".parse().unwrap()).unwrap()
+    }
     #[test]
     fn returning_a_tool_releases_the_active_fallback_for_later_unrelated_children() {
         let scope = Scope {
@@ -181,7 +178,7 @@ mod tests {
             &json!({"AGENTTOMO_AGENT_ID":"a","AGENTTOMO_TASK_ID":"t"}),
             true,
         );
-        let mut observer = Observer::new(scope, hub.clone());
+        let mut observer = Observer::new(scope, hub.clone(), responses());
         observer.event(r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","id":"item1","call_id":"call1","name":"exec","input":""}}"#);
         observer.feed_request(
             br#"{"input":[{"type":"custom_tool_call_output","call_id":"call1","output":"done"}]}"#,
@@ -197,7 +194,7 @@ mod tests {
             task_id: "t".into(),
         };
         let hub = Hub::default();
-        let mut observer = Observer::new(scope, hub);
+        let mut observer = Observer::new(scope, hub, responses());
         let output = "result\n".repeat(20000);
         let raw = serde_json::to_vec(&json!({"input":[{"type":"custom_tool_call_output","call_id":"call1","output":output}]})).unwrap();
         let compressed = zstd::stream::encode_all(&raw[..], 1).unwrap();
@@ -219,6 +216,7 @@ mod tests {
                 task_id: "t".into(),
             },
             Hub::default(),
+            responses(),
         );
         observer.feed_request(b"bad");
         assert_eq!(

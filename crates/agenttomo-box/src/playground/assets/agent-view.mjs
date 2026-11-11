@@ -44,7 +44,18 @@ export class AgentView {
     this.dirty = true; this.selected = null;
     this.renderChat();
   }
-  configure(message) { this.available = Boolean(message.agent_available); this.updateControls(); }
+  configure(message) {
+    this.available = Boolean(message.agent_available);
+    const metadata = message.agent || {};
+    const name = typeof metadata.name === "string" && metadata.name.trim() ? metadata.name : "Agent";
+    this.agentName = name;
+    this.model.name = name;
+    this.chatHistory.configure({name, avatar:typeof metadata.avatar === "string" ? metadata.avatar : ">_",
+      authentication_hint:typeof metadata.authentication_hint === "string" ? metadata.authentication_hint : ""});
+    this.prompt.setAttribute("aria-label", `Task for ${name}`);
+    this.prompt.placeholder = `Ask ${name} to run a task in this sandbox…`;
+    this.updateControls();
+  }
   setReady(value, reason) {
     if (!value && this.ready) { this.model.end(); this.dirty = true; this.renderChat(); if (this.snapshot && !this.root.hidden) this.render(); }
     if (value) this.stopReason = null;
@@ -59,7 +70,7 @@ export class AgentView {
     this.send.disabled = !this.ready || this.prompt.disabled || busy;
     this.stop.disabled = !this.ready || !busy || !this.control || running.stopping;
     this.stop.textContent = running?.stopping ? "Stopping…" : "Stop";
-    this.status.textContent = !this.ready && this.stopReason ? this.stopReason : !this.available ? "External Codex was not found on the server." : !this.ready ? "Waiting for the sandbox" : busy ? "You can stop this task at any time" : "Enter to send · Shift+Enter for a new line";
+    this.status.textContent = !this.ready && this.stopReason ? this.stopReason : !this.available ? `External ${this.agentName || "agent"} was not found on the server.` : !this.ready ? "Waiting for the sandbox" : busy ? "You can stop this task at any time" : "Enter to send · Shift+Enter for a new line";
     if (busy && !this.progressTimer) this.progressTimer = setInterval(() => this.updateProgress(), 1000);
     if (!busy && this.progressTimer) { clearInterval(this.progressTimer); this.progressTimer = null; }
     this.updateProgress();
@@ -245,7 +256,7 @@ export class AgentView {
         const state = round.complete ? round.complete.data.status || "complete" : task.state === "running" ? "streaming" : "ended";
         const title = `Model call ${index + 1}`;
         this.activitySequences.set(round.id, activity);
-        return [event, this.branch(round.id, "model", title, `${round.request?.data.model || round.started?.data.model || "Responses"} · ${state}`, chronological(children), () => this.showModel(round, title))];
+        return [event, this.branch(round.id, "model", title, `${round.request?.data.model || round.started?.data.model || "Unknown model"} · ${state}`, chronological(children), () => this.showModel(round, title))];
       });
       rounds.push(...roots(task, null));
       for (const error of task.errors) rounds.push([error, this.branch(`error-${error.sequence}`, "error", "Capture or execution error", error.data.error, [], () => this.onRaw(error))]);

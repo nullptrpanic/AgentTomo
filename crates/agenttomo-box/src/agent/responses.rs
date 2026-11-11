@@ -1,11 +1,51 @@
 //! OpenAI Responses wire protocol, including function and custom tool calls.
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::{collections::HashSet, io};
 
-pub struct Event {
-    pub kind: &'static str,
-    pub data: Value,
-    pub content: Option<Value>,
+use super::protocol::{Event, MessageKind, ModelDecoder, ModelProtocol};
+use axum::http::{Method, Uri};
+
+pub struct Responses;
+
+impl ModelProtocol for Responses {
+    fn matches(&self, method: &Method, uri: &Uri) -> bool {
+        matches!(*method, Method::POST | Method::GET)
+            && uri.path().trim_end_matches('/').ends_with("/responses")
+    }
+    fn decoder(&self) -> Box<dyn ModelDecoder> {
+        Box::new(Response::default())
+    }
+    // Some Responses endpoints omit Content-Type while still streaming SSE.
+    fn expects_sse(&self) -> bool {
+        true
+    }
+}
+
+impl ModelDecoder for Response {
+    fn request(&mut self, bytes: &[u8]) -> io::Result<Vec<Event>> {
+        Ok(request(&serde_json::from_slice(bytes)?))
+    }
+    fn event(&mut self, data: &str) -> io::Result<Vec<Event>> {
+        if data.trim() == "[DONE]" {
+            return Ok(Vec::new());
+        }
+        let value = serde_json::from_str(data)
+            .map_err(|error| io::Error::other(format!("invalid model SSE JSON: {error}")))?;
+        Ok(Response::event(self, value))
+    }
+    fn websocket_request(&mut self, bytes: &[u8]) -> io::Result<Vec<Event>> {
+        let value = serde_json::from_slice(bytes)
+            .map_err(|error| io::Error::other(format!("invalid model WebSocket JSON: {error}")))?;
+        Ok(websocket_request(&value))
+    }
+}
+
+pub fn websocket_request(value: &Value) -> Vec<Event> {
+    if value["type"] == "response.create" {
+        request(value.get("response").unwrap_or(value))
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn request(value: &Value) -> Vec<Event> {
@@ -115,6 +155,11 @@ impl Response {
                 events.push(tool(item, "agent.tool.result", Some(output.clone())));
             }
         } else if item["type"] == "message" {
+            let message_kind = match item["phase"].as_str() {
+                Some("commentary") => MessageKind::Intermediate,
+                Some("final_answer") => MessageKind::Final,
+                _ => MessageKind::Unknown,
+            };
             let text = item["content"]
                 .as_array()
                 .into_iter()
@@ -124,7 +169,7 @@ impl Response {
                 .collect::<String>();
             events.push(Event {
                 kind: "agent.message",
-                data: json!({"item_id":id,"role":item["role"],"phase":item["phase"]}),
+                data: json!({"item_id":id,"role":item["role"],"message_kind":message_kind,"phase":item["phase"]}),
                 content: Some(Value::String(text)),
             });
         }
@@ -148,6 +193,33 @@ fn tool(item: &Value, kind: &'static str, content: Option<Value>) -> Event {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn messages_normalize_semantics_without_losing_original_phase() {
+        for (phase, expected) in [
+            (json!("commentary"), "intermediate"),
+            (json!("final_answer"), "final"),
+            (Value::Null, "unknown"),
+            (json!(""), "unknown"),
+            (json!("future_phase"), "unknown"),
+        ] {
+            let payload = json!({"type":"response.output_item.done","item":{
+                "id":"message-1","type":"message","role":"assistant","phase":phase,
+                "content":[{"type":"output_text","text":"Complete reply"}]
+            }});
+            let mut decoder = Responses.decoder();
+            let events = decoder.event(&payload.to_string()).unwrap();
+            let message = events
+                .iter()
+                .find(|event| event.kind == "agent.message")
+                .unwrap();
+            assert_eq!(message.data["message_kind"], expected);
+            assert_eq!(message.data["phase"], phase);
+            assert_eq!(message.data["role"], "assistant");
+            assert_eq!(message.content, Some(json!("Complete reply")));
+        }
+    }
+
     #[test]
     fn terminal_events_keep_the_complete_model_response() {
         for (kind, status) in [

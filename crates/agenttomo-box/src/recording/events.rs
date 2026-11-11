@@ -146,11 +146,11 @@ mod tests {
             total_bytes: 0,
         };
         let (mut recording, input) =
-            Recording::create(OsStr::new("test"), &directory, limits, false)
+            Recording::create(OsStr::new("test"), &directory, limits, false, Vec::new())
                 .await
                 .unwrap();
         drop(input);
-        let previews = file_preview::Store::create(&directory, limits, false)
+        let previews = file_preview::Store::create(&directory, limits, false, Vec::new())
             .await
             .unwrap();
         let mut original =

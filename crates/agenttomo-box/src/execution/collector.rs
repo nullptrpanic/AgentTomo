@@ -28,10 +28,17 @@ pub async fn run(
     http: crate::proxy::http::Options,
     rootfs: super::rootfs::Options,
     proxy: Option<crate::proxy::outbound::Proxy>,
+    rules: crate::agent::ObservationRules,
 ) -> io::Result<()> {
     let parent_lost = signal(SignalKind::user_defined1())?;
-    let (mut recording, input_log) =
-        Recording::create(command, directory, preview_limits, http.enabled).await?;
+    let (mut recording, input_log) = Recording::create(
+        command,
+        directory,
+        preview_limits,
+        http.enabled,
+        rules.private_paths,
+    )
+    .await?;
     let result = collect(
         command,
         with_terminal,
@@ -42,6 +49,7 @@ pub async fn run(
         http,
         rootfs,
         proxy,
+        rules.runtime_executables,
     )
     .await;
     if let Err(error) = &result {
@@ -61,11 +69,12 @@ async fn collect(
     http: crate::proxy::http::Options,
     rootfs: super::rootfs::Options,
     proxy: Option<crate::proxy::outbound::Proxy>,
+    runtime_executables: Vec<String>,
 ) -> io::Result<()> {
     nix::sys::prctl::set_child_subreaper(true)?;
     let root = rootfs.enabled.then(super::rootfs::Root::new).transpose()?;
     let (observations, mut proxy_events) = mpsc::channel(256);
-    let agents = crate::agent::Hub::default();
+    let agents = crate::agent::Hub::with_runtimes(runtime_executables);
     let (agent_actions, actions) = mpsc::channel(8);
     let mut agent_task = std::env::var_os("AGENTTOMO_WORKSPACE")
         .filter(|_| with_terminal)

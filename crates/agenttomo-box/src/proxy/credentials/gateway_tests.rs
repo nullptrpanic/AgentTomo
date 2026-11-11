@@ -1,11 +1,10 @@
-use super::super::prepare;
+use super::super::{Grant, Scope, Source, marker, secret_header};
 use super::*;
 use futures_util::{SinkExt, StreamExt};
 use rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, pem::PemObject},
 };
-use std::collections::BTreeMap;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -26,27 +25,25 @@ impl Harness {
         } else {
             "http"
         };
-        let config = format!(
-            "[model_providers.test]\nbase_url='{scheme}://{destination}/v1'\nexperimental_bearer_token='host-only-test-secret'\n"
-        );
-        let prepared = prepare(
-            Path::new("/unused"),
-            BTreeMap::from([("config.toml".into(), config)]),
-            BTreeMap::new(),
-        )
-        .unwrap();
-        let config: toml::Value = toml::from_str(&prepared.files["config.toml"]).unwrap();
-        let header = format!(
-            "Bearer {}",
-            config["model_providers"]["test"]["experimental_bearer_token"]
-                .as_str()
-                .unwrap()
-        );
+        let header = format!("Bearer {}", marker());
+        let policy = Policy::new(vec![
+            Grant::new(
+                Scope::new(
+                    &format!("{scheme}://{destination}/v1"),
+                    &[("POST", "responses"), ("GET", "responses")],
+                )
+                .unwrap(),
+                "authorization".parse().unwrap(),
+                header.parse().unwrap(),
+                Source::Static(secret_header("host-only-test-secret", true).unwrap()),
+            )
+            .unwrap(),
+        ]);
         let mut gateway = Gateway::new().unwrap();
         if let Some(authority) = upstream_ca {
             gateway.authority.client = client_trust(authority);
         }
-        gateway.register("test-owner".into(), prepared.policy);
+        gateway.register("test-owner".into(), policy);
         let gateway = Arc::new(gateway);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy: Proxy = format!("http://{}", listener.local_addr().unwrap())
@@ -104,7 +101,6 @@ async fn headers(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> String {
     }
     String::from_utf8(bytes).unwrap()
 }
-use std::path::Path;
 
 #[tokio::test]
 async fn gateway_injects_http_and_https_headers_and_streams_before_completion() {
