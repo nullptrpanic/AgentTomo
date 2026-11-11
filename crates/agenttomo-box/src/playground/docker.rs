@@ -192,7 +192,8 @@ pub async fn create(options: Create<'_>) -> io::Result<()> {
             .arg("--mount")
             .arg(mount(binary, "/agenttomo-box", true)?)
             .arg("--tmpfs")
-            .arg(format!("/records:rw,nosuid,nodev,size={tmpfs_size_mib}m,mode=0711"))
+            // Codex installs its interactive daemon under its private home here.
+            .arg(format!("/records:rw,exec,nosuid,nodev,size={tmpfs_size_mib}m,mode=0711"))
             ;
     if let Some(codex) = codex {
         command

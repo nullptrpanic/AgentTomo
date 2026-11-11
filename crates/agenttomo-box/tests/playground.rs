@@ -442,6 +442,23 @@ async fn session_data_never_uses_writable_host_mounts_or_host_recordings() {
         "{}",
         String::from_utf8_lossy(&checked.stderr)
     );
+    // Interactive Codex stages its managed daemon binary in this private home.
+    let executed = Command::new("docker")
+        .args([
+            "exec",
+            &container,
+            "sh",
+            "-c",
+            "cp /bin/true /records/codex/execution-probe && /records/codex/execution-probe",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        executed.status.success(),
+        "managed programs must execute from the disposable Codex home: {}",
+        String::from_utf8_lossy(&executed.stderr)
+    );
     socket.close(None).await.unwrap();
     removed(&container).await;
     server.stop().await;
