@@ -141,6 +141,10 @@ export class AgentChat {
         text(record.hint, errorHint(value, this.agent)); text(record.errorBody, value);
       }
       record.pending.hidden = task.state !== "running" || Boolean(error);
+      const expandable = !record.pending.hidden || Boolean(error) || placements.get(record.timeline).length > 0;
+      record.summary.setAttribute("aria-disabled", String(!expandable));
+      record.summary.tabIndex = expandable ? 0 : -1;
+      if (!expandable) record.work.open = false;
       const label = {running:"Task in progress",completed:"Task completed",cancelled:"Task stopped",failed:"Task failed",rejected:"Task rejected",interrupted:"Task interrupted"}[task.state] || task.state;
       text(record.workTitle, task.state === "running" && task.stopping ? "Stopping task" : task.state === "running" && error ? "Retrying connection" : label);
       record.indicator.classList.toggle("agent-spinner", task.state === "running");
@@ -188,6 +192,9 @@ export class AgentChat {
     heading.append(avatar, agentName, roundTitle);
     const work = el("details", "agent-work"); work.open = true;
     const summary = el("summary", "agent-work-summary");
+    summary.addEventListener("click", event => {
+      if (summary.getAttribute("aria-disabled") === "true") event.preventDefault();
+    });
     const indicator = el("span", "agent-state-dot"); indicator.setAttribute("aria-hidden", "true");
     const workTitle = el("strong", "agent-work-title", "Task in progress");
     const workCount = el("span", "agent-work-count", "");
@@ -205,7 +212,7 @@ export class AgentChat {
     work.append(summary, pending, error, timeline);
     reply.append(heading, answers, work);
     root.append(user.root, reply); this.root.append(root);
-    return {root,user,prompt,reply,agentName,avatar,roundTitle,indicator,work,workTitle,workCount,timeline,answers,error,hint,errorBody,pending,progress,outcome,entries:new Map(),responses:new Map()};
+    return {root,user,prompt,reply,agentName,avatar,roundTitle,indicator,work,summary,workTitle,workCount,timeline,answers,error,hint,errorBody,pending,progress,outcome,entries:new Map(),responses:new Map()};
   }
   bubble(role, content, inspect) {
     const root = el("article", `agent-chat-message agent-${role}`);

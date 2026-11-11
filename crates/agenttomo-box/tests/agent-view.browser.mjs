@@ -60,7 +60,7 @@ try {
   assert.equal(await page.locator('.agent-final-answers .agent-entry').count(),0,"running commentary stays with tools from the same response");
   assert.equal(await page.locator('.agent-user .agent-message-heading time').count(),0);
   assert.equal(await page.locator('.agent-user .agent-message-actions time').count(),1,"timestamps live in the bottom action toolbar");
-  assert.equal(await page.locator('.agent-user .agent-message-heading').evaluate(node=>getComputedStyle(node).justifyContent),"flex-end");
+  assert.equal(await page.locator('.agent-user .agent-message-heading').evaluate(node=>getComputedStyle(node).justifyContent),"flex-start");
   assert.equal(await page.locator('.agent-user .agent-message-heading > .agent-avatar svg').count(),1,"You has a matching avatar before its label");
   assert.equal(await page.locator('.agent-user .agent-message-heading').evaluate(node=>node.lastElementChild.textContent),"You");
   assert.equal(await page.locator('.agent-work').evaluate(node=>node.open),true,"execution starts expanded while running");
@@ -290,8 +290,14 @@ try {
   assert.equal(await page.locator('[data-agent-node="message-final"]').count(),0,"the trajectory omits duplicate final-answer nodes");
   const finalRound=await page.evaluate(()=>view.model.tasks.get("complete").rounds.find(round=>round.requestId===22).id);
   const finalBranch=page.locator(`[data-agent-node="${finalRound}"]`);
-  await finalBranch.locator(':scope > .agent-card > .agent-fold').click();
-  assert.equal(await finalBranch.locator(':scope > .agent-card > .agent-fold').getAttribute('aria-expanded'),"true","empty responses still have a working fold control");
+  assert.equal(await finalBranch.locator(':scope > .agent-card > .agent-fold').isVisible(),false,"empty responses do not advertise expansion");
+  assert.equal(await finalBranch.locator(':scope > .agent-card > .agent-node-content').getAttribute('aria-expanded'),null);
+  assert.ok(await finalBranch.evaluate(node=>{
+    const fold=node.querySelector(':scope > .agent-card > .agent-fold');
+    const label=node.querySelector('.agent-label');
+    const sibling=node.previousElementSibling.querySelector('.agent-label');
+    return fold.getBoundingClientRect().width>0 && Math.abs(label.getBoundingClientRect().left-sibling.getBoundingClientRect().left)<1;
+  }),"empty and expandable siblings keep their text aligned");
   assert.equal(await finalBranch.locator(':scope > .agent-children > li').count(),0);
   await finalBranch.locator(':scope > .agent-card > .agent-node-inspect').click();
   await page.waitForFunction(()=>document.querySelectorAll('#detail .agent-content')[1]?.textContent.includes('Full model answer'));
@@ -323,6 +329,41 @@ try {
   assert.equal(await page.locator(`[data-agent-node="${normalizedRounds[0]}"] > .agent-card .agent-node-meta`).textContent(),"Unknown model · ended");
   assert.equal(await page.locator(`[data-agent-node="${normalizedRounds[1]}"] > .agent-card .agent-node-meta`).textContent(),"provider-model · ended");
   assert.equal(await page.locator('[data-agent-node="message-normalized-final"]').count(),0,"the normalized final answer is not duplicated in the trajectory");
+  const liveRound=await page.evaluate(()=>{
+    add("agent.task.started",{task_id:"simple",prompt:"test"});
+    add("agent.model.request",{task_id:"simple",request_id:400,model:"test-model"});
+    view.render();
+    return view.model.task("simple").rounds[0].id;
+  });
+  const liveFold=page.locator(`[data-agent-node="${liveRound}"] > .agent-card > .agent-fold`);
+  assert.equal(await liveFold.isVisible(),false);
+  await page.evaluate(()=>{
+    add("agent.message.delta",{task_id:"simple",request_id:400,item_id:"simple-answer",delta:"Test received."});
+    view.render();
+  });
+  assert.equal(await liveFold.isVisible(),true,"a new child makes the disclosure available without reloading");
+  await liveFold.click();
+  assert.equal(await liveFold.getAttribute('aria-expanded'),"false");
+  await page.evaluate(()=>{
+    add("agent.message",{task_id:"simple",request_id:400,item_id:"simple-answer",message_kind:"final",preview:"Test received."});
+    add("agent.task.finished",{task_id:"simple",exit_code:0});
+    view.render();
+    view.root.hidden=true; document.querySelector('#detail').hidden=true;
+    Object.assign(view.chat.style,{width:"100%",maxWidth:"none"});
+  });
+  const simple=page.locator('[data-task-id="simple"]');
+  await simple.locator('.agent-final-answers [data-entry-id="simple-answer"]').waitFor();
+  assert.equal(await liveFold.isDisabled(),true,"the disclosure disappears when its last visible child is removed");
+  assert.equal(await page.locator(`[data-agent-node="${liveRound}"] > .agent-children > li`).count(),0);
+  const emptySummary=simple.locator('.agent-work > summary');
+  assert.equal(await emptySummary.evaluate(node=>getComputedStyle(node,'::after').visibility),"hidden","a completed answer without execution steps has no empty disclosure");
+  await emptySummary.click();
+  assert.equal(await simple.locator('.agent-work').evaluate(node=>node.open),false);
+  await page.setViewportSize({width:1600,height:900});
+  await simple.scrollIntoViewIfNeeded();
+  assert.ok(await simple.evaluate(node=>node.closest('.agent-history').clientWidth-node.clientWidth<=48),"wide chat uses the panel width with compact side margins");
+  assert.ok(await emptySummary.evaluate(node=>node.getBoundingClientRect().right-node.querySelector('.agent-chat-outcome').getBoundingClientRect().right<64),"the status duration stays right-aligned without an arrow");
+  if(process.env.AGENTTOMO_TEST_ARTIFACTS) await page.screenshot({path:`${process.env.AGENTTOMO_TEST_ARTIFACTS}/chat-wide.png`});
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({passed:true,ordering:true,stableNodes:true,textSelection:true,toolDetails:true,scrollFollowing:true,stopFeedback:true,draftPreserved:true,completedHierarchy:true,sanitizedMarkdown:true,answerCopyFeedback:true,narrowLayout:true,normalizedMessages:true,genericModelLabels:true}));
 } finally {

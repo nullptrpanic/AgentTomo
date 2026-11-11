@@ -145,6 +145,7 @@ export class AgentView {
       record = {item,card,toggle,content,label,name,metadata,inspect,list};
       this.branches.set(id, record);
       const fold = () => {
+        if (!record.hasChildren) return;
         const expanded = record.list.hidden;
         this.expanded.set(id, expanded);
         this.updateBranch(record, expanded);
@@ -159,7 +160,7 @@ export class AgentView {
     card.dataset.category = category;
     setText(label, category); setText(name, title); name.title = title;
     setText(metadata, meta || "");
-    content.title = "Expand or collapse";
+    content.title = record.hasChildren ? "Expand or collapse" : "";
     inspect.disabled = !select;
     inspect.title = select ? "Inspect evidence" : "Evidence not captured yet";
     inspect.setAttribute("aria-label", inspect.title);
@@ -173,16 +174,20 @@ export class AgentView {
     return item;
   }
   updateBranch(record, expanded) {
-    const {list,toggle,content,children} = record;
-    if (expanded) {
+    const {list,toggle,content,children,hasChildren} = record;
+    expanded = hasChildren && expanded;
+    if (expanded || !hasChildren) {
       reconcile(list, typeof children === "function" ? children() : children);
       for (const branch of list.querySelectorAll(".agent-branch")) this.paintActivity(branch.querySelector(":scope > .agent-card"), branch.dataset.agentNode);
     }
     list.hidden = !expanded;
+    toggle.disabled = content.disabled = !hasChildren;
     setText(toggle, expanded ? "⌄" : "›");
-    toggle.setAttribute("aria-expanded", String(expanded));
+    for (const button of [toggle, content]) {
+      if (hasChildren) button.setAttribute("aria-expanded", String(expanded));
+      else button.removeAttribute("aria-expanded");
+    }
     toggle.setAttribute("aria-label", expanded ? "Collapse" : "Expand");
-    content.setAttribute("aria-expanded", String(expanded));
   }
   paintActivity(card, id) {
     const activity = this.activity.get(id);
