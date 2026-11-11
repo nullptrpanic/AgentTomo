@@ -15,7 +15,7 @@ const repo = fileURLToPath(new URL("../../..", import.meta.url));
 const directory = await mkdtemp(`${tmpdir()}/agenttomo-agent-chat-`);
 const docker = (...args) => execFileSync("docker", args, { encoding:"utf8", timeout:15000 });
 const gateway = JSON.parse(docker("network", "inspect", "bridge"))[0].IPAM.Config[0].Gateway;
-let step = 0, holdResponses = false, recovering = false, rejectResponses = false;
+let step = 0, holdResponses = false, rejectResponses = false;
 const requests = [], responses = [], observed = [], modelAuthorization = [];
 const hostCredential = "agenttomo-test-key-never-used-remotely";
 const fixture = createServer(async (req, res) => {
@@ -27,7 +27,7 @@ const fixture = createServer(async (req, res) => {
   if (req.headers["content-encoding"] === "zstd") bytes = zstdDecompressSync(bytes);
   requests.push(JSON.parse(bytes));
   step++;
-  if (holdResponses || step >= 8 && !rejectResponses && !recovering) { res.writeHead(200); res.flushHeaders(); return; }
+  if (holdResponses || step >= 8 && !rejectResponses) { res.writeHead(200); res.flushHeaders(); return; }
   if (rejectResponses) {
     res.writeHead(401, {"content-type":"application/json"});
     res.end(JSON.stringify({error:{message:"Authentication rejected by the test endpoint",type:"authentication_error"}}));
@@ -40,7 +40,7 @@ const fixture = createServer(async (req, res) => {
   };
   if (step >= 7) call.input = `const result = await tools.exec_command({cmd: "printf 'AGENTTOMO_CANCEL_TARGET\\n'; sleep 30", login: false, yield_time_ms: 1000}); text(result.output);`;
   const answer = { type:"message", id:`msg_chat_${step}`, role:"assistant", status:"completed", content:[{ type:"output_text", text:"Task complete. TOOL_RESULT and resource evidence were observed.", annotations:[] }] };
-  const item = recovering || step % 3 === 0 ? answer : call;
+  const item = step % 3 === 0 ? answer : call;
   const base = { id:`resp_chat_${step}`, object:"response", created_at:Math.floor(Date.now()/1000), status:"in_progress", model:"gpt-6-astra", output:[], error:null };
   const added = { ...item, status:"in_progress", ...(item.type === "custom_tool_call" ? {input:""} : {}) };
   const events = [{ type:"response.created", response:base },{ type:"response.output_item.added", output_index:0, item:added }];
@@ -221,29 +221,20 @@ try {
   await page.locator(".agent-send").click();
   await until(()=>requests.length > beforeDisconnection);
   const oldSession = session;
-  await page.locator('[aria-label="Task for Codex"]').fill("Keep this draft through sandbox recovery.");
+  await page.locator('[aria-label="Task for Codex"]').fill("Keep this draft on the current page.");
   await page.evaluate(()=>window.testOwnerSocket.close());
   await until(async()=>(await page.locator('.agent-chat-status').textContent()).includes('Sandbox disconnected'));
   assert.equal(await page.locator('[aria-label="Task for Codex"]').isEnabled(),true);
   assert.equal(await page.locator('.agent-send').isDisabled(),true);
-  assert.equal(await page.locator('.agent-restart').isEnabled(),true);
+  assert.deepEqual(await page.locator('.agent-compose footer button').allTextContents(),["Stop","Send ↗"]);
   await until(()=>!docker("ps","-a","--filter",`name=${oldSession.container}`,"--format","{{.Names}}").trim());
   assert.deepEqual(await readdir(`${directory}/sessions`).catch(error => { if (error.code === "ENOENT") return []; throw error; }), []);
-  holdResponses = false; recovering = true;
-  await page.locator('.agent-restart').click();
-  await until(()=>session.id!==oldSession.id);
-  await until(async()=>(await page.locator('#status').textContent())==='Connected');
-  assert.equal(await page.locator('#agent-chat').isVisible(),true);
-  assert.equal(await page.locator('[aria-label="Task for Codex"]').inputValue(),"Keep this draft through sandbox recovery.");
-  const beforeRecovery = observed.filter(event=>event.kind==='agent.task.finished').length;
-  await page.locator('.agent-send').click();
-  await until(()=>observed.filter(event=>event.kind==='agent.task.finished').length>beforeRecovery,90000);
-  assert.equal(observed.filter(event=>event.kind==='agent.task.finished').at(-1).data.exit_code,0,"new sandbox accepts and completes the retained draft");
+  assert.equal(await page.locator('[aria-label="Task for Codex"]').inputValue(),"Keep this draft on the current page.");
   assert.deepEqual(pageErrors,[]);
   assert.ok(modelAuthorization.every(value => value === `Bearer ${hostCredential}`));
   assert.ok(!JSON.stringify(observed).includes(hostCredential));
   if(process.env.AGENTTOMO_TEST_ARTIFACTS) { await mkdir(process.env.AGENTTOMO_TEST_ARTIFACTS,{recursive:true}); await page.screenshot({path:`${process.env.AGENTTOMO_TEST_ARTIFACTS}/agent-chat.png`}); await writeFile(`${process.env.AGENTTOMO_TEST_ARTIFACTS}/agent-events.json`,JSON.stringify(observed)); }
-  console.log(JSON.stringify({passed:true,modelRequests:requests.length,proxyTunnels:tunnels.length,toolId:tool.data.agenttomo_toolcall_id,processPid:command.data.pid,events:observed.length,cancelled:true,disconnectionRecovery:true}));
+  console.log(JSON.stringify({passed:true,modelRequests:requests.length,proxyTunnels:tunnels.length,toolId:tool.data.agenttomo_toolcall_id,processPid:command.data.pid,events:observed.length,cancelled:true,disconnectionCleanup:true}));
 } catch (error) {
   if(process.env.AGENTTOMO_TEST_ARTIFACTS) {
     await mkdir(process.env.AGENTTOMO_TEST_ARTIFACTS,{recursive:true});

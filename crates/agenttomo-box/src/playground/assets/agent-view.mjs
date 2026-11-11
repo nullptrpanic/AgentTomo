@@ -32,7 +32,6 @@ export class AgentView {
     this.history = chat.querySelector(".agent-history");
     this.form = chat.querySelector("form"); this.prompt = chat.querySelector("textarea");
     this.send = chat.querySelector(".agent-send"); this.stop = chat.querySelector(".agent-stop");
-    this.restart = chat.querySelector(".agent-restart");
     this.status = chat.querySelector(".agent-chat-status");
     this.chatHistory = new AgentChat({root:this.history,section:this.section.bind(this),
       onTool:id => { this.focus(id); this.showTool(this.model.tools.get(id)); },
@@ -42,7 +41,6 @@ export class AgentView {
     this.form.addEventListener("submit", event => { event.preventDefault(); this.submit(); });
     this.prompt.addEventListener("keydown", event => { if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); this.submit(); } });
     this.stop.addEventListener("click", () => this.cancel());
-    this.restart.addEventListener("click", () => this.control?.restart?.());
     this.dirty = true; this.selected = null;
     this.renderChat();
   }
@@ -50,7 +48,7 @@ export class AgentView {
   setReady(value, reason) {
     if (!value && this.ready) { this.model.end(); this.dirty = true; this.renderChat(); if (this.snapshot && !this.root.hidden) this.render(); }
     if (value) this.stopReason = null;
-    else if (reason || this.ready) this.stopReason = reason || "Sandbox disconnected. Start a new sandbox to continue.";
+    else if (reason || this.ready) this.stopReason = reason || "Sandbox disconnected.";
     this.ready = value; this.updateControls();
   }
   setControl(control) { this.control = control; this.updateControls(); }
@@ -60,7 +58,6 @@ export class AgentView {
     this.prompt.disabled = !this.available || !this.control;
     this.send.disabled = !this.ready || this.prompt.disabled || busy;
     this.stop.disabled = !this.ready || !busy || !this.control || running.stopping;
-    this.restart.hidden = this.ready || !this.stopReason || !this.control?.restart;
     this.stop.textContent = running?.stopping ? "Stopping…" : "Stop";
     this.status.textContent = !this.ready && this.stopReason ? this.stopReason : !this.available ? "External Codex was not found on the server." : !this.ready ? "Waiting for the sandbox" : busy ? "You can stop this task at any time" : "Enter to send · Shift+Enter for a new line";
     if (busy && !this.progressTimer) this.progressTimer = setInterval(() => this.updateProgress(), 1000);

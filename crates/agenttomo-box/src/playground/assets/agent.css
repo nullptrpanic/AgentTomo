@@ -112,7 +112,7 @@
 .agent-compose textarea:focus { outline:2px solid #6cae99; outline-offset:-1px; }
 .agent-compose footer { display:flex; align-items:center; gap:8px; margin-top:10px; }
 .agent-chat-status { flex:1; font-size:11px; color:#91a7ba; line-height:1.5; }
-.agent-send,.agent-stop,.agent-restart { border:1px solid #496353; color:#a3ebca; background:#203c32; border-radius:6px; padding:8px 12px; cursor:pointer; }
+.agent-send,.agent-stop { border:1px solid #496353; color:#a3ebca; background:#203c32; border-radius:6px; padding:8px 12px; cursor:pointer; }
 .agent-stop { border-color:#536474; color:#c9d5df; background:#20303b; }
 .agent-compose button:disabled { opacity:.4; }
 #agent-trajectory { flex:1; min-width:0; min-height:120px; padding:12px 16px; overflow:auto; overflow-anchor:none; scrollbar-gutter:stable; scrollbar-color:#45596c transparent; }

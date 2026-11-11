@@ -115,7 +115,6 @@ try {
   assert.equal(new URL(second.url()).searchParams.get("monitor"), session.id);
   assert.equal(await monitor.evaluate(() => window.opener), null, "new tabs must be independent");
   assert.equal(await monitor.locator("#workspace-panel").isVisible(), false);
-  assert.equal(await monitor.locator("#new-session").isVisible(), false);
   assert.equal(await monitor.locator("#toggle-monitor").isVisible(), false);
   assert.equal((await owner.locator("#workspace-panel").boundingBox()).width, initialWidth);
   assert.equal(sessions.length, 1, "opening monitors must not create sessions");

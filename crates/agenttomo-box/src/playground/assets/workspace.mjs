@@ -4,15 +4,6 @@ import { resizePanels } from "./panel-resize.mjs";
 // Only this entry point may create and own a Docker session.
 export function startWorkspace({ token, onMessage, notice, onView }) {
   const $ = (id) => document.getElementById(id);
-  const prompt = document.querySelector(".agent-compose textarea");
-  let restoredDraft = false;
-  try {
-    const draft = sessionStorage.getItem("agenttomo.chat-draft");
-    if (draft !== null) {
-      prompt.value = draft; restoredDraft = true;
-      sessionStorage.removeItem("agenttomo.chat-draft");
-    }
-  } catch { /* The workspace still works if browser storage is unavailable. */ }
   resizePanels(document.querySelector("main"), $("panel-resizer"));
   const terminal = new Terminal({
     cursorBlink: true,
@@ -117,8 +108,7 @@ export function startWorkspace({ token, onMessage, notice, onView }) {
         sessionId = message.id;
         browserEnabled = Boolean(message.browser);
         $("browser-tab").hidden = !browserEnabled;
-        if (restoredDraft) workspaceView("chat");
-        else if (browserEnabled) workspaceView("browser");
+        if (browserEnabled) workspaceView("browser");
         $("image").textContent = message.image;
         $("session-id").textContent = `session ${message.id.slice(0, 8)}`;
         break;
@@ -153,18 +143,8 @@ export function startWorkspace({ token, onMessage, notice, onView }) {
     browser.stop();
     onMessage({ type: "disconnected" });
   };
-  function restart() {
-    try { sessionStorage.setItem("agenttomo.chat-draft", prompt.value); }
-    catch {
-      notice("Cannot preserve the draft in browser storage. Copy it before reloading this page.");
-      return;
-    }
-    location.reload();
-  }
-  $("new-session").addEventListener("click", restart);
   window.addEventListener("pagehide", () => { browser.stop(); socket.close(); });
   return {
-    restart,
     prompt(task_id, prompt) {
       if (!acceptingInput || socket.readyState !== WebSocket.OPEN) throw new Error("Sandbox is not connected");
       socket.send(JSON.stringify({ type:"agent_prompt", task_id, prompt }));

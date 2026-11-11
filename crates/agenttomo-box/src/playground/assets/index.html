@@ -24,7 +24,6 @@
       <span id="status" class="status" data-state="starting" role="status">Starting</span>
       <button id="toggle-monitor" class="monitor-control" type="button" aria-label="Hide monitor" title="Hide monitor" aria-expanded="true" aria-controls="monitor-panel"></button>
       <a id="open-monitor" class="monitor-control" aria-label="Open monitor in new tab" title="Open monitor in new tab" aria-disabled="true" tabindex="-1" target="_blank" rel="noopener noreferrer"></a>
-      <button id="new-session" type="button">New session <span aria-hidden="true">↗</span></button>
     </div>
   </header>
   <main>
@@ -38,7 +37,7 @@
         </div>
         <form class="agent-compose">
           <textarea aria-label="Task for Codex" placeholder="Ask Codex to run a task in this sandbox…" maxlength="8192" disabled></textarea>
-          <footer><span class="agent-chat-status" role="status">Waiting for the sandbox</span><button type="button" class="agent-restart" hidden>New sandbox</button><button type="button" class="agent-stop" disabled>Stop</button><button type="submit" class="agent-send" disabled>Send ↗</button></footer>
+          <footer><span class="agent-chat-status" role="status">Waiting for the sandbox</span><button type="button" class="agent-stop" disabled>Stop</button><button type="submit" class="agent-send" disabled>Send ↗</button></footer>
         </form>
       </section>
       <div id="terminal" aria-label="Interactive container terminal"></div>

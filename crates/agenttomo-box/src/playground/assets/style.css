@@ -18,13 +18,10 @@ button { font: inherit; cursor: pointer; }
 .status[data-state="live"]::before { background: #79ddb1; box-shadow: 0 0 0 4px #79ddb116; }
 .status[data-state="error"] { color: #ffb3a5; }
 .status[data-state="error"]::before { background: #ff987f; }
-#new-session { background: #222c38; color: #e1e9f1; border: 1px solid #3d4a59; border-radius: 6px; padding: 9px 13px; font-size: 12px; }
-#new-session:hover { background: #303d4c; }
-#new-session span { margin-left: 10px; }
 main { display: grid; grid-template-columns: minmax(320px, var(--workspace-width, 1.23fr)) 8px minmax(360px, 1fr); margin: 25px 26px 0; flex: 1; min-height: 0; border: 1px solid #34404e; border-radius: 10px; overflow: hidden; }
 .monitor-collapsed main, .monitor-only main { grid-template-columns: minmax(0, 1fr); }
 .monitor-collapsed #monitor-panel, .monitor-collapsed #panel-resizer,
-.monitor-only #workspace-panel, .monitor-only #panel-resizer, .monitor-only #toggle-monitor, .monitor-only #new-session { display: none; }
+.monitor-only #workspace-panel, .monitor-only #panel-resizer, .monitor-only #toggle-monitor { display: none; }
 #panel-resizer { cursor: col-resize; touch-action: none; background: #18232d; border-inline: 1px solid #34404e; }
 #panel-resizer:hover, #panel-resizer:focus-visible, .resizing-panels #panel-resizer { background: #476c61; outline: none; }
 .resizing-panels, .resizing-panels * { cursor: col-resize !important; user-select: none !important; }

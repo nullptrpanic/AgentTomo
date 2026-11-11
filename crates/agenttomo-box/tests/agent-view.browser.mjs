@@ -38,7 +38,7 @@ try {
       onSelect:() => {},onRaw:() => {},reveal:() => {},filter:{allows:() => true}});
     window.cancels = 0;
     view.configure({agent_available:true});
-    view.setControl({prompt:() => {},cancel:() => { window.cancels++; },restart:() => { window.restarted = true; }});
+    view.setControl({prompt:() => {},cancel:() => { window.cancels++; }});
     view.setReady(true);
     let sequence = 0;
     window.add = (kind,data={}) => view.add({kind,sequence:++sequence,observed_unix_ns:Date.now()*1e6,
@@ -226,13 +226,11 @@ try {
   await page.waitForFunction(()=>document.querySelector('[data-task-id="complete"] .agent-final-answers .agent-copy').title==="Copied");
   await page.mouse.move(0,0);
   assert.equal(await copy.innerHTML(),icon,"leaving the button resets feedback");
-  await page.evaluate(()=>view.setReady(false,"Sandbox disconnected. Start a new sandbox to continue."));
+  await page.evaluate(()=>view.setReady(false,"Sandbox disconnected."));
   assert.match(await page.locator('.agent-chat-status').textContent(),/Sandbox disconnected/);
   assert.equal(await page.locator('textarea').isEnabled(),true,"draft remains editable after disconnection");
   assert.equal(await page.locator('.agent-send').isDisabled(),true,"cannot send to a removed sandbox");
-  assert.equal(await page.locator('.agent-restart').isVisible(),true,"disconnection has an actionable recovery control");
-  await page.locator('.agent-restart').click();
-  assert.equal(await page.evaluate(()=>window.restarted),true);
+  assert.deepEqual(await page.locator('.agent-compose footer button').allTextContents(),["Stop","Send ↗"]);
   assert.deepEqual(errors,[]);
   if(process.env.AGENTTOMO_TEST_ARTIFACTS) {
     await mkdir(process.env.AGENTTOMO_TEST_ARTIFACTS,{recursive:true});
