@@ -20,6 +20,15 @@ struct Message {
     frames: u64,
     compressed: bool,
     decoded: bool,
+    semantic: Option<Prefix>,
+}
+impl Message {
+    fn feed(&mut self, bytes: &[u8]) {
+        self.body.feed(bytes);
+        if let Some(semantic) = &mut self.semantic {
+            semantic.feed(bytes);
+        }
+    }
 }
 struct Frame {
     header: FrameHeader,
@@ -39,6 +48,8 @@ struct Observer {
     client: bool,
     failed: bool,
     started: u128,
+    model: Option<crate::agent::Observer>,
+    context: Option<MessageContext>,
 }
 impl Observer {
     fn new(recorder: Recorder, extensions: &str, client: bool) -> Self {
@@ -76,6 +87,8 @@ impl Observer {
             client,
             failed: false,
             started: 0,
+            model: None,
+            context: None,
         }
     }
     fn feed(&mut self, mut bytes: &[u8]) {
@@ -128,14 +141,14 @@ impl Observer {
             if message.compressed && message.decoded {
                 if let Err(error) =
                     inflate::feed(&mut self.inflater, &plain[..count], &mut |bytes| {
-                        message.body.feed(bytes)
+                        message.feed(bytes)
                     })
                 {
                     self.fail(&error);
                     return;
                 }
             } else {
-                message.body.feed(&plain[..count]);
+                message.feed(&plain[..count]);
             }
             bytes = &bytes[count..];
             if frame.received == frame.length {
@@ -178,6 +191,8 @@ impl Observer {
                 && !header.rsv2
                 && !header.rsv3
                 && (!header.rsv1 || self.compression),
+            semantic: (self.model.is_some() && kind == "text")
+                .then(|| Prefix::new(crate::agent::MAX_CONTENT)),
         };
         let control = if control {
             Some(message)
@@ -218,7 +233,7 @@ impl Observer {
             if message.compressed && message.decoded {
                 if let Err(error) =
                     inflate::feed(&mut self.inflater, &[0, 0, 255, 255], &mut |bytes| {
-                        message.body.feed(bytes)
+                        message.feed(bytes)
                     })
                 {
                     self.emit(message, false);
@@ -232,7 +247,24 @@ impl Observer {
             self.emit(message, true);
         }
     }
-    fn emit(&self, message: Message, complete: bool) {
+    fn emit(&mut self, message: Message, complete: bool) {
+        if let (Some(model), Some(context), Some(semantic)) =
+            (&mut self.model, &self.context, &message.semantic)
+        {
+            if complete && message.decoded && semantic.seen == semantic.bytes.len() as u64 {
+                let mut events = if self.client {
+                    model.websocket_request(&semantic.bytes)
+                } else {
+                    model.event(std::str::from_utf8(&semantic.bytes).unwrap_or(""))
+                };
+                for event in &mut events {
+                    event.data["message_started_unix_ns"] = json!(message.started);
+                }
+                context.semantic(events);
+            } else {
+                context.semantic(vec![crate::agent::Event { kind:"agent.capture.error",data:json!({"task_id":context.agent.as_ref().map(|scope| &scope.task_id),"error":"incomplete or oversized model WebSocket message"}),content:None }]);
+            }
+        }
         let mut data = message.body.metadata();
         data["kind"] = message.kind.into();
         data["started_unix_ns"] = json!(message.started);
@@ -276,18 +308,18 @@ pub(in crate::proxy::http) fn observe(
     extensions: &str,
     client: bool,
 ) -> BoxIo {
-    Box::new(Observed {
-        io,
-        observer: Observer::new(
-            Recorder::new(
-                message,
-                "websocket",
-                if client { "upstream" } else { "downstream" },
-            ),
-            extensions,
-            client,
+    let mut observer = Observer::new(
+        Recorder::new(
+            message,
+            "websocket",
+            if client { "upstream" } else { "downstream" },
         ),
-    })
+        extensions,
+        client,
+    );
+    observer.model = message.model_observer();
+    observer.context = Some(message.clone());
+    Box::new(Observed { io, observer })
 }
 struct Observed {
     io: BoxIo,

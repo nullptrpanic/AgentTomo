@@ -2,11 +2,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::{
-    os::unix::fs::{MetadataExt, PermissionsExt},
-    path::PathBuf,
-    time::Duration,
-};
+use std::{os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
@@ -413,6 +409,102 @@ async fn removed(container: &str) {
 
 #[tokio::test]
 #[ignore = "requires Docker access and a local agenttomo-playground:24.04 image"]
+async fn session_data_never_uses_writable_host_mounts_or_host_recordings() {
+    let mut server = start_server().await;
+    let (mut socket, _) = connect_async(&server.ws_url).await.unwrap();
+    let (container, id) = ready(&mut socket).await;
+    let _guard = ContainerGuard(container.clone());
+    let inspected = Command::new("docker")
+        .args(["inspect", &container])
+        .output()
+        .await
+        .unwrap();
+    let inspected: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert!(
+        inspected[0]["Mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|mount| mount["Type"] != "bind" || mount["RW"] == false),
+        "session containers must not write through host bind mounts"
+    );
+    assert_eq!(inspected[0]["HostConfig"]["LogConfig"]["Type"], "none");
+    assert!(
+        !server.directory.join(&id).exists(),
+        "no host session staging"
+    );
+    let checked = Command::new("docker").args([
+        "exec", &container, "sh", "-c",
+        "test \"$(stat -f -c %T /records)\" = tmpfs && test -s /records/*/run/events.jsonl && test -d /records/control",
+    ]).output().await.unwrap();
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    socket.close(None).await.unwrap();
+    removed(&container).await;
+    server.stop().await;
+    assert!(!server.directory.join(id).exists());
+    let _ = std::fs::remove_dir_all(server.directory.clone());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker access and a local agenttomo-playground:24.04 image"]
+async fn full_session_tmpfs_reports_failure_without_host_disk_fallback() {
+    let mut server = start_server_with_options(
+        None,
+        &[
+            "--image",
+            "agenttomo-playground:24.04",
+            "--session-tmpfs-size-mib",
+            "32",
+        ],
+    )
+    .await;
+    let (mut socket, _) = connect_async(&server.ws_url).await.unwrap();
+    let (container, id) = ready(&mut socket).await;
+    let _guard = ContainerGuard(container.clone());
+    let full = Command::new("docker")
+        .args([
+            "exec",
+            &container,
+            "sh",
+            "-c",
+            "dd if=/dev/zero of=/records/fill bs=65536 count=1024 2>/dev/null",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        !full.status.success(),
+        "fixture must exhaust the bounded tmpfs"
+    );
+    // Two chunks also force Tokio's buffered file to report a failed prior write.
+    for _ in 0..2 {
+        socket
+            .send(Message::Binary(
+                b"/bin/echo trigger-write\n".to_vec().into(),
+            ))
+            .await
+            .unwrap();
+    }
+    let error = cleanup_error(&mut socket).await;
+    assert!(
+        error.contains("No space left") || error.contains("os error 28"),
+        "{error}"
+    );
+    removed(&container).await;
+    assert!(
+        !server.directory.exists(),
+        "full tmpfs must not spill onto host storage"
+    );
+    assert!(!server.directory.join(id).exists());
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker access and a local agenttomo-playground:24.04 image"]
 async fn docker_terminal_streams_real_traces_and_cleans_up() {
     let mut server = start_server().await;
     let ws_url = &server.ws_url;
@@ -433,7 +525,7 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
     let (mut socket, _) = connect_async(ws_url).await.unwrap();
     let (container, id) = ready(&mut socket).await;
     let session: Value = serde_json::from_slice(
-        &std::fs::read(server.directory.join(&id).join("session.json")).unwrap(),
+        &container_file(&container, &format!("/records/{id}/session.json")).await,
     )
     .unwrap();
     assert_eq!(session["browser"], false);
@@ -489,36 +581,41 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
         String::from_utf8_lossy(&terminal)
     );
     assert!(!container.is_empty());
+    assert!(
+        !server.directory.join(&id).exists(),
+        "recordings must stay in the sandbox"
+    );
+    let inspected = Command::new("docker")
+        .args([
+            "exec",
+            &container,
+            "stat",
+            "-c",
+            "%a",
+            &format!("/records/{id}/run/events.jsonl"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(inspected.stdout, b"600\n", "recordings remain private");
     socket.close(None).await.unwrap();
     removed(&container).await;
     server.stop().await;
-    let run = server.directory.join(&id).join("run");
-    for path in [
-        run.clone(),
-        run.join("events.jsonl"),
-        run.join("stdout.log"),
-        run.join("collection-status.json"),
-    ] {
-        let metadata = std::fs::metadata(&path).unwrap();
-        assert_eq!(
-            metadata.uid(),
-            nix::unistd::getuid().as_raw(),
-            "{}",
-            path.display()
-        );
-        assert_eq!(
-            metadata.permissions().mode() & 0o077,
-            0,
-            "recordings remain private"
-        );
-    }
+    assert!(!server.directory.join(&id).exists());
     let _ = std::fs::remove_dir_all(&server.directory);
 }
 
 #[tokio::test]
 #[ignore = "requires Docker access and a local agenttomo-playground:24.04 image"]
 async fn completion_flushes_descendant_traces_after_shell_exit() {
-    let mut server = start_server().await;
+    // Inspect the completed journal before the new destruction policy removes it.
+    let wrapper = r#"#!/bin/sh
+if [ "$1" = rm ]; then
+    while [ ! -f "$AGENTTOMO_TEST_GATE_DIR/release" ]; do sleep 0.01; done
+fi
+exec "$AGENTTOMO_TEST_REAL_DOCKER" "$@"
+"#;
+    let mut server = start_server_with_docker_wrapper(Some(wrapper)).await;
     let (mut socket, _) = connect_async(&server.ws_url).await.unwrap();
     let (container, id) = ready(&mut socket).await;
     socket
@@ -531,10 +628,13 @@ async fn completion_flushes_descendant_traces_after_shell_exit() {
         .unwrap();
     let mut root_exited = false;
     let mut after_root_exec = false;
+    let mut after_root_pid = None;
+    let mut after_root_exited = false;
     let mut last_sequence = 0;
     timeout(Duration::from_secs(15), async {
         loop {
-            if let Message::Text(text) = socket.next().await.unwrap().unwrap() {
+            let message = socket.next().await.unwrap().unwrap();
+            if let Message::Text(text) = message {
                 let value: Value = serde_json::from_str(&text).unwrap();
                 assert_ne!(value["type"], "error", "{value}");
                 match value["type"].as_str() {
@@ -550,7 +650,11 @@ async fn completion_flushes_descendant_traces_after_shell_exit() {
                         {
                             assert!(root_exited, "late descendant event preceded shell exit");
                             after_root_exec = true;
+                            after_root_pid = event["data"]["pid"].as_i64();
                         }
+                        after_root_exited |= event["kind"] == "process.exit"
+                            && after_root_pid.is_some()
+                            && event["data"]["pid"].as_i64() == after_root_pid;
                     }
                     Some("complete") => {
                         assert_eq!(value["status"]["state"], "complete");
@@ -564,21 +668,31 @@ async fn completion_flushes_descendant_traces_after_shell_exit() {
     .await
     .expect("collector did not finish");
     assert!(root_exited && after_root_exec);
-    let run = server.directory.join(id).join("run");
-    let events = std::fs::read_to_string(run.join("events.jsonl")).unwrap();
+    assert!(
+        after_root_exited,
+        "descendant exit was lost before completion"
+    );
+    let events = String::from_utf8(
+        container_file(&container, &format!("/records/{id}/run/events.jsonl")).await,
+    )
+    .unwrap();
     let last: Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
     assert_eq!(
         last_sequence,
         last["sequence"].as_u64().unwrap(),
-        "last event was lost before completion"
+        "final event was lost"
     );
     assert!(
-        std::fs::read_to_string(run.join("stdout.log"))
-            .unwrap()
-            .contains("AFTER_ROOT\r\n")
+        String::from_utf8(
+            container_file(&container, &format!("/records/{id}/run/stdout.log")).await
+        )
+        .unwrap()
+        .contains("AFTER_ROOT\r\n")
     );
+    std::fs::write(server.directory.join("release"), b"").unwrap();
     removed(&container).await;
     server.stop().await;
+    assert!(!server.directory.join(id).exists());
     let _ = std::fs::remove_dir_all(&server.directory);
 }
 
@@ -590,12 +704,10 @@ async fn server_shutdown_removes_an_active_container() {
     let (container, id) = ready(&mut socket).await;
     server.stop().await;
     removed(&container).await;
-    let result: Value = serde_json::from_slice(
-        &std::fs::read(server.directory.join(id).join("session-result.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(result["reason"], "server_shutdown");
-    assert_eq!(result["container_removed"], true);
+    assert!(
+        !server.directory.join(id).exists(),
+        "sandbox shutdown must also destroy its recordings and staged credentials"
+    );
     let _ = std::fs::remove_dir_all(&server.directory);
 }
 
@@ -633,13 +745,7 @@ exec "$AGENTTOMO_TEST_REAL_DOCKER" "$@"
             .unwrap()
             .success()
     );
-    let result: Value = serde_json::from_slice(
-        &std::fs::read(server.directory.join(id).join("session-result.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(result["container_removed"], true, "{result}");
-    assert!(result["error"].is_null(), "{result}");
-    assert_eq!(result["reason"], "server_shutdown");
+    assert!(!server.directory.join(id).exists());
     removed(&container).await;
     let _ = std::fs::remove_dir_all(&server.directory);
 }
@@ -662,12 +768,7 @@ exec "$AGENTTOMO_TEST_REAL_DOCKER" "$@"
     let _container = ContainerGuard(container.clone());
     server.stop().await;
     removed(&container).await;
-    let result: Value = serde_json::from_slice(
-        &std::fs::read(server.directory.join(id).join("session-result.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(result["container_removed"], true, "{result}");
-    assert!(result["error"].is_null(), "{result}");
+    assert!(!server.directory.join(id).exists());
     let _ = std::fs::remove_dir_all(&server.directory);
 }
 
@@ -691,14 +792,11 @@ async fn cleanup_reports_real_failures_instead_of_claiming_the_container_is_gone
         let (container, id) = ready(&mut socket).await;
         let _container = ContainerGuard(container.clone());
         server.stop().await;
-        let result: Value = serde_json::from_slice(
-            &std::fs::read(server.directory.join(id).join("session-result.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(result["container_removed"], false, "{result}");
+        let error = cleanup_error(&mut socket).await;
+        assert!(error.contains(expected), "{error}");
         assert!(
-            result["error"].as_str().unwrap().contains(expected),
-            "{result}"
+            !server.directory.join(&id).exists(),
+            "even a cleanup failure must never create host recordings"
         );
         assert!(
             Command::new("docker")
@@ -710,6 +808,65 @@ async fn cleanup_reports_real_failures_instead_of_claiming_the_container_is_gone
                 .success(),
             "the fixture must really still exist"
         );
-        let _ = std::fs::remove_dir_all(&server.directory);
+        drop(_container);
+        std::fs::remove_dir_all(&server.directory).unwrap();
     }
+}
+
+async fn cleanup_error(socket: &mut Connection) -> String {
+    timeout(Duration::from_secs(5), async {
+        while let Some(Ok(message)) = socket.next().await {
+            if let Message::Text(text) = message {
+                let message: Value = serde_json::from_str(&text).unwrap();
+                if message["type"] == "error" {
+                    return message["message"].as_str().unwrap().to_owned();
+                }
+            }
+        }
+        panic!("cleanup failure was not reported");
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires Docker access and a local agenttomo-playground:24.04 image"]
+async fn startup_failure_destroys_partial_recordings_and_configuration() {
+    let wrapper = r#"#!/bin/sh
+if [ "$1" = start ]; then echo 'fixture startup failure' >&2; exit 39; fi
+exec "$AGENTTOMO_TEST_REAL_DOCKER" "$@"
+"#;
+    let mut server = start_server_with_docker_wrapper(Some(wrapper)).await;
+    let (mut socket, _) = connect_async(&server.ws_url).await.unwrap();
+    let id = loop {
+        if let Message::Text(text) = socket.next().await.unwrap().unwrap() {
+            let message: Value = serde_json::from_str(&text).unwrap();
+            if message["type"] == "session" {
+                break message["id"].as_str().unwrap().to_owned();
+            }
+        }
+    };
+    assert!(
+        cleanup_error(&mut socket)
+            .await
+            .contains("fixture startup failure")
+    );
+    server.stop().await;
+    removed(&format!("agenttomo-{id}")).await;
+    assert!(!server.directory.join(id).exists());
+    let _ = std::fs::remove_dir_all(&server.directory);
+}
+
+async fn container_file(container: &str, path: &str) -> Vec<u8> {
+    let result = Command::new("docker")
+        .args(["exec", container, "cat", path])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    result.stdout
 }

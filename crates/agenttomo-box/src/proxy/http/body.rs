@@ -15,10 +15,14 @@ pub struct Observed {
     done: bool,
     message: MessageContext,
     trailers: serde_json::Value,
+    model: Option<crate::agent::Observer>,
 }
 
 impl Observed {
     pub fn new(inner: Incoming, message: MessageContext, encoding: Option<String>) -> Self {
+        let model = (!message.response && !inner.is_end_stream())
+            .then(|| message.model_observer())
+            .flatten();
         let capture = encoding
             .is_none()
             .then(|| message.session.inspection.store.capture());
@@ -30,6 +34,7 @@ impl Observed {
             done: false,
             message,
             trailers: serde_json::json!([]),
+            model,
         };
         if body.inner.is_end_stream() {
             body.finish(true);
@@ -41,10 +46,14 @@ impl Observed {
             return;
         }
         self.done = true;
+        if let Some(model) = &mut self.model {
+            self.message
+                .semantic(model.finish_request(&self.message.encoding, complete));
+        }
         let capture = self.capture.take();
         let streaming = self.sse.is_some();
         if let Some(sse) = &mut self.sse {
-            sse.finish();
+            sse.finish(complete);
         }
         let message = self.message.clone();
         let trailers = self.trailers.take();
@@ -68,6 +77,11 @@ impl Body for Observed {
         let result = Pin::new(&mut self.inner).poll_frame(cx);
         match &result {
             Poll::Ready(Some(Ok(frame))) => {
+                if let Some(bytes) = frame.data_ref()
+                    && let Some(model) = &mut self.model
+                {
+                    model.feed_request(bytes);
+                }
                 if let Some(bytes) = frame.data_ref()
                     && let Some(capture) = &mut self.capture
                 {

@@ -6,7 +6,13 @@ use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 
-pub fn exec(command: &OsStr, trust_overlay: Option<&std::path::Path>, root_session: bool) -> u8 {
+pub fn exec(
+    command: &OsStr,
+    trust_overlay: Option<&std::path::Path>,
+    root_session: bool,
+    root_overlay: Option<&std::path::Path>,
+    rootfs: &super::rootfs::Options,
+) -> u8 {
     // fd 3 is a dedicated, unbuffered gate, separate from the target's streams.
     let mut control = unsafe { UnixStream::from_raw_fd(3) };
     let ca = if trust_overlay.is_some() {
@@ -21,8 +27,25 @@ pub fn exec(command: &OsStr, trust_overlay: Option<&std::path::Path>, root_sessi
         Vec::new()
     };
     if let Err(error) = crate::network::namespace::prepare(&control, root_session, || {
+        if rootfs.enabled {
+            let directory = root_overlay
+                .ok_or_else(|| std::io::Error::other("root overlay storage is missing"))?;
+            let private_paths = if trust_overlay.is_some() {
+                super::trust::PRIVATE_PATHS
+                    .iter()
+                    .map(std::path::Path::new)
+                    .collect()
+            } else {
+                vec![]
+            };
+            super::rootfs::install(directory, rootfs, &private_paths)?;
+        }
         if let Some(directory) = trust_overlay {
-            super::trust::install(directory, &ca)?;
+            if rootfs.enabled {
+                super::trust::inject(std::path::Path::new("/etc/ssl/certs"), &ca)?;
+            } else {
+                super::trust::install(directory, &ca)?;
+            }
         }
         Ok(())
     }) {

@@ -103,17 +103,42 @@ fn mount(source: &Path, destination: &str, readonly: bool) -> io::Result<String>
     ))
 }
 
-pub async fn create(
-    name: &str,
-    image: &str,
-    binary: &Path,
-    directory: &Path,
-    preview_limits: crate::recording::file_preview::Limits,
-    http: crate::proxy::http::Options,
-    browser: bool,
-) -> io::Result<()> {
-    let output = execute(
-        Command::new("docker")
+pub struct Create<'a> {
+    pub name: &'a str,
+    pub image: &'a str,
+    pub binary: &'a Path,
+    pub tmpfs_size_mib: u32,
+    pub preview_limits: crate::recording::file_preview::Limits,
+    pub http: crate::proxy::http::Options,
+    pub browser: bool,
+    pub rootfs: &'a crate::execution::rootfs::Options,
+    pub codex: Option<&'a crate::agent::codex::Installation>,
+    pub agent_id: &'a str,
+}
+pub async fn create(options: Create<'_>) -> io::Result<()> {
+    let Create {
+        name,
+        image,
+        binary,
+        tmpfs_size_mib,
+        preview_limits,
+        http,
+        browser,
+        rootfs,
+        codex,
+        agent_id,
+    } = options;
+    let mut rootfs = rootfs.clone();
+    if rootfs.enabled {
+        rootfs.exemptions.push("/records".into());
+        if browser {
+            rootfs
+                .exemptions
+                .extend(["/tmp/.X11-unix".into(), "/tmp/agenttomo-desktop".into()]);
+        }
+    }
+    let mut command = Command::new("docker");
+    command
             .args([
                 "create",
                 "--pull=never",
@@ -122,6 +147,7 @@ pub async fn create(
                 "--label",
                 "io.agenttomo.playground=true",
                 "--interactive",
+                "--log-driver=none",
                 "--init",
                 "--cap-drop=ALL",
                 // Root bootstrap needs credential mapping; DAC_OVERRIDE lets
@@ -155,12 +181,30 @@ pub async fn create(
             } else {
                 vec![]
             })
+            .args(if browser && rootfs.enabled {
+                vec![
+                    "--tmpfs", "/tmp/.X11-unix:rw,nosuid,nodev,noexec,size=1m,mode=1777",
+                    "--tmpfs", "/tmp/agenttomo-desktop:rw,nosuid,nodev,noexec,size=16m,mode=0711,uid=65534,gid=65534",
+                ]
+            } else { vec![] })
             .arg("--user")
             .arg("0:0")
             .arg("--mount")
             .arg(mount(binary, "/agenttomo-box", true)?)
+            .arg("--tmpfs")
+            .arg(format!("/records:rw,nosuid,nodev,size={tmpfs_size_mib}m,mode=0711"))
+            ;
+    if let Some(codex) = codex {
+        command
             .arg("--mount")
-            .arg(mount(directory, "/records", false)?)
+            .arg(mount(&codex.distribution, "/opt/agenttomo-codex", true)?)
+            .arg("--env")
+            .arg("AGENTTOMO_WORKSPACE=1")
+            .arg("--env")
+            .arg(format!("AGENTTOMO_AGENT_ID={agent_id}"));
+    }
+    let output = execute(
+        command
             .args([
                 "--entrypoint",
                 "/agenttomo-box",
@@ -168,23 +212,26 @@ pub async fn create(
                 "__collector",
                 "--terminal",
                 "--output-dir",
-                "/records/run",
+                &format!("/records/{agent_id}/run"),
                 "-c",
-                if browser {
+                if codex.is_some() && browser {
+                    "exec /agenttomo-box __workspace --browser"
+                } else if codex.is_some() {
+                    "exec /agenttomo-box __workspace"
+                } else if browser {
                     "exec /usr/local/bin/agenttomo-browser-session"
                 } else {
                     "exec /bin/bash --noprofile --norc -i"
                 },
             ])
-            .arg("--record-uid")
-            .arg(nix::unistd::getuid().as_raw().to_string())
-            .arg("--record-gid")
-            .arg(nix::unistd::getgid().as_raw().to_string())
+            .arg("--playground-session")
+            .arg(agent_id)
             .arg("--file-preview-max-bytes")
             .arg(preview_limits.max_bytes.to_string())
             .arg("--file-preview-total-bytes")
             .arg(preview_limits.total_bytes.to_string())
-            .args(http.arguments()),
+            .args(http.arguments())
+            .args(rootfs.arguments()),
     )
     .await?;
     if !output.status.success() {

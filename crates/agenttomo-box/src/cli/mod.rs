@@ -17,6 +17,16 @@ pub enum Command {
     Run(RunArgs),
     /// Open a Docker terminal and live traces in a web browser
     Playground(PlaygroundArgs),
+    #[command(name = "__workspace", hide = true)]
+    Workspace {
+        #[arg(long)]
+        browser: bool,
+    },
+    #[command(name = "__records", hide = true)]
+    Records {
+        #[arg(long)]
+        session: String,
+    },
     #[command(name = "__collector", hide = true)]
     Collector {
         #[arg(short = 'c', allow_hyphen_values = true)]
@@ -29,10 +39,16 @@ pub enum Command {
         record_uid: Option<u32>,
         #[arg(long, requires = "record_uid")]
         record_gid: Option<u32>,
+        #[arg(long)]
+        playground_session: Option<String>,
+        #[arg(long)]
+        proxy: Option<crate::proxy::outbound::Proxy>,
         #[command(flatten)]
         file_preview: FilePreviewArgs,
         #[command(flatten)]
         http: HttpArgs,
+        #[command(flatten)]
+        rootfs: RootfsArgs,
     },
     #[command(name = "__tracee", hide = true)]
     Tracee {
@@ -42,6 +58,10 @@ pub enum Command {
         trust_overlay: Option<PathBuf>,
         #[arg(long)]
         root_session: bool,
+        #[arg(long)]
+        root_overlay_directory: Option<PathBuf>,
+        #[command(flatten)]
+        rootfs: RootfsArgs,
     },
 }
 
@@ -50,6 +70,12 @@ pub enum Command {
     after_help = "Logs default to .agenttomo/runs/<timestamp>-<pid>/. Uses pipes, not a PTY. The foreground returns the root command's exit code; surviving descendants remain traced."
 )]
 pub struct RunArgs {
+    /// HTTP CONNECT upstream for box's TCP forwarding (default: http://127.0.0.1:8118)
+    #[arg(long, value_name = "URL", overrides_with = "no_proxy")]
+    pub proxy: Option<crate::proxy::outbound::Proxy>,
+    /// Disable box's upstream proxy and connect directly
+    #[arg(long, overrides_with = "proxy")]
+    pub no_proxy: bool,
     /// Shell command to execute with /bin/sh -c
     #[arg(short = 'c', value_name = "COMMAND", allow_hyphen_values = true)]
     pub command: OsString,
@@ -60,23 +86,63 @@ pub struct RunArgs {
     pub file_preview: FilePreviewArgs,
     #[command(flatten)]
     pub http: HttpArgs,
+    #[command(flatten)]
+    pub rootfs: RootfsArgs,
 }
 
 #[derive(Args)]
 pub struct PlaygroundArgs {
+    /// HTTP CONNECT upstream (fallback: http://127.0.0.1:8118; host loopback is bridged)
+    #[arg(long, value_name = "URL", overrides_with = "no_proxy")]
+    pub proxy: Option<crate::proxy::outbound::Proxy>,
+    /// Disable box's upstream proxy, including inherited and local settings
+    #[arg(long, overrides_with = "proxy")]
+    pub no_proxy: bool,
     /// HTTP address; use 0.0.0.0:8080 to accept connections from other hosts
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
     /// Local Docker image; compatible images open Chrome automatically
     #[arg(long, default_value = "agenttomo-playground-chrome:24.04")]
     pub image: String,
-    /// Directory for retained session recordings
+    /// Legacy compatibility option; Playground data now stays in container tmpfs
     #[arg(long, default_value = ".agenttomo/playground")]
     pub output_dir: PathBuf,
+    /// Maximum tmpfs size for diagnostics, Codex state and IPC, in MiB
+    #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..))]
+    pub session_tmpfs_size_mib: u32,
     #[command(flatten)]
     pub file_preview: FilePreviewArgs,
     #[command(flatten)]
     pub http: HttpArgs,
+    #[command(flatten)]
+    pub rootfs: RootfsArgs,
+}
+
+#[derive(Args)]
+pub struct RootfsArgs {
+    /// Overlay eligible whole top-level directories and /etc/ssl; other paths stay shared
+    #[arg(id = "overlay_root", long = "overlay-root")]
+    pub enabled: bool,
+    /// Shared tmpfs limit for the selected directories' overlay data, in MiB
+    #[arg(long = "overlay-root-size-mib", default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..))]
+    pub size_mib: u32,
+    /// Exempt an existing absolute path (its containing overlay is skipped); repeatable
+    #[arg(
+        long = "overlay-exempt",
+        requires = "overlay_root",
+        value_name = "PATH"
+    )]
+    pub exemptions: Vec<PathBuf>,
+}
+
+impl RootfsArgs {
+    pub fn options(&self) -> crate::execution::rootfs::Options {
+        crate::execution::rootfs::Options {
+            enabled: self.enabled,
+            size_mib: self.size_mib,
+            exemptions: self.exemptions.clone(),
+        }
+    }
 }
 
 #[derive(Args)]

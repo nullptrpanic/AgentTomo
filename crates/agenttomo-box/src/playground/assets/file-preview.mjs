@@ -1,10 +1,11 @@
-import { copyText } from "./copy-text.mjs";
+import { copyWithFeedback } from "./copy-text.mjs";
 import { closeIcon, copyIcon } from "./icons.mjs";
 
 const size = bytes => bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KiB`;
 const reasons = {
   disabled: "File content capture was disabled for this run.",
   task_trust_material: "Task trust material is kept within this session and excluded from saved previews.",
+  agent_private_state: "Agent configuration, credentials and private session files are excluded from saved previews. Model evidence is captured from network traffic.",
   open_failed: "The file open failed; no content was captured.",
   write_only: "The file was opened for writing only; no content was read.",
   path_only: "O_PATH opens do not read file content.",
@@ -80,7 +81,7 @@ export class FilePreview {
         if (text === undefined) return;
         button.disabled = true;
         try {
-          await copyText(text);
+          await copyWithFeedback(button, text);
           if (version === this.version) this.status.textContent = this.event.data.preview?.status === "truncated" ? "Captured prefix copied; the full file was not captured." : "Displayed content copied.";
         } catch (error) {
           if (version === this.version) this.status.textContent = error.message;

@@ -26,6 +26,8 @@ pub async fn run(
     with_terminal: bool,
     preview_limits: crate::recording::file_preview::Limits,
     http: crate::proxy::http::Options,
+    rootfs: super::rootfs::Options,
+    proxy: Option<crate::proxy::outbound::Proxy>,
 ) -> io::Result<()> {
     let parent_lost = signal(SignalKind::user_defined1())?;
     let (mut recording, input_log) =
@@ -38,6 +40,8 @@ pub async fn run(
         parent_lost,
         preview_limits.enabled(),
         http,
+        rootfs,
+        proxy,
     )
     .await;
     if let Err(error) = &result {
@@ -55,10 +59,25 @@ async fn collect(
     mut parent_lost: Signal,
     capture_files: bool,
     http: crate::proxy::http::Options,
+    rootfs: super::rootfs::Options,
+    proxy: Option<crate::proxy::outbound::Proxy>,
 ) -> io::Result<()> {
     nix::sys::prctl::set_child_subreaper(true)?;
+    let root = rootfs.enabled.then(super::rootfs::Root::new).transpose()?;
     let (observations, mut proxy_events) = mpsc::channel(256);
-    let inspection = crate::proxy::http::Inspection::create(recording.directory(), http).await?;
+    let agents = crate::agent::Hub::default();
+    let (agent_actions, actions) = mpsc::channel(8);
+    let mut agent_task = std::env::var_os("AGENTTOMO_WORKSPACE")
+        .filter(|_| with_terminal)
+        .map(|_| {
+            tokio::spawn(crate::agent::workspace::drive(
+                actions,
+                observations.clone(),
+                agents.clone(),
+            ))
+        });
+    let inspection =
+        crate::proxy::http::Inspection::create(recording.directory(), http, agents.clone()).await?;
     let trust = inspection
         .as_ref()
         .map(|inspection| super::trust::Overlay::new(&inspection.authority.pem))
@@ -68,6 +87,7 @@ async fn collect(
     let (network, endpoints) = oneshot::channel::<crate::network::Endpoints>();
     let scope_finished = CancellationToken::new();
     let scope = scope_finished.clone();
+    let clear_proxy_environment = proxy.is_some();
     let mut proxy_task = tokio::spawn(async move {
         let endpoints = endpoints.await.map_err(io::Error::other)?;
         tokio::try_join!(
@@ -77,6 +97,7 @@ async fn collect(
                 observations.clone(),
                 scope.clone(),
                 inspection,
+                proxy,
             ),
             crate::proxy::udp::run(endpoints.udp, associations, observations, scope),
         )?;
@@ -84,13 +105,18 @@ async fn collect(
     });
     let (events_tx, mut events) = mpsc::channel(256);
     let thread = tracing::spawn(
-        command.to_owned(),
-        with_terminal,
+        tracing::Launch {
+            command: command.to_owned(),
+            with_terminal,
+            capture_files,
+            clear_proxy_environment,
+            trust_overlay: trust.as_ref().map(super::trust::Overlay::handoff),
+            root_overlay: root.map(|root| (root, rootfs)),
+        },
         events_tx,
         registry,
         network,
-        capture_files,
-        trust.as_ref().map(super::trust::Overlay::handoff),
+        agents.clone(),
     )?;
     let (pid, streams) = match events.recv().await {
         Some(Event::Started { pid, streams }) => (pid, streams),
@@ -107,7 +133,14 @@ async fn collect(
     let input = Receiver::from_owned_fd(unsafe { OwnedFd::from_raw_fd(0) })?;
     let (stop_input, stopped) = oneshot::channel();
     let mut stop_input = Some(stop_input);
-    let mut input = tokio::spawn(record_input(input, stdin, terminal, input_log, stopped));
+    let mut input = tokio::spawn(record_input(
+        input,
+        stdin,
+        terminal,
+        input_log,
+        stopped,
+        agent_actions,
+    ));
     let mut frontend = Some(tokio::io::stdout());
     protocol::send(frontend.as_mut().unwrap(), &Message::Started { pid }).await?;
     let mut out_buffer = [0; 8192];
@@ -124,11 +157,16 @@ async fn collect(
             break;
         }
         tokio::select! {
+            result = async { match &mut agent_task { Some(task) => task.await, None => std::future::pending().await } } => {
+                result.map_err(io::Error::other)??;
+                agent_task = None;
+            },
             result = recording.writer_failure() => result?,
             event = events.recv(), if !tracing_done => match event {
-                Some(Event::Process { kind, data }) => recording.event("ptrace", kind, data).await?,
-                Some(Event::FileOpen(opened)) => recording.file_open(opened).await?,
+                Some(Event::Process { kind, mut data }) => { agents.fields(&mut data); recording.event("ptrace", kind, data).await?; },
+                Some(Event::FileOpen(mut opened)) => { agents.fields(&mut opened.data); recording.file_open(opened).await?; },
                 Some(Event::RootExit(code)) => {
+                    if let Some(task) = agent_task.take() { task.abort(); }
                     // Drain a snapshot, not EOF or an unbounded busy pipe.
                     if let Some(stop) = stop_input.take() { let _ = stop.send(()); }
                     if !input_done { (&mut input).await.map_err(io::Error::other)??; input_done = true; }
@@ -150,7 +188,7 @@ async fn collect(
                 _ => return Err(io::Error::other("tracer closed without completing collection")),
             },
             event = proxy_events.recv(), if !proxy_done => match event {
-                Some(event) => recording.event(event.source, event.kind, event.data).await?,
+                Some(mut event) => { agents.fields(&mut event.data); recording.event(event.source, event.kind, event.data).await?; },
                 None => proxy_done = true,
             },
             result = &mut proxy_task, if !proxy_exited => {
@@ -199,6 +237,7 @@ async fn record_input(
     terminal: Option<Pty>,
     mut log: File,
     stop: oneshot::Receiver<()>,
+    agents: mpsc::Sender<crate::agent::workspace::Action>,
 ) -> io::Result<()> {
     let mut input = BufReader::new(input);
     let mut stdin = Some(stdin);
@@ -206,6 +245,31 @@ async fn record_input(
         let copy = async {
             loop {
                 match protocol::receive(&mut input).await? {
+                    Input::AgentPrompt { task_id, prompt } => {
+                        if task_id.len() != 32
+                            || !task_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            || prompt.trim().is_empty()
+                            || prompt.len() > 8192
+                        {
+                            return Err(io::Error::other("invalid agent prompt"));
+                        }
+                        let agent_instance_id =
+                            std::env::var("AGENTTOMO_AGENT_ID").map_err(io::Error::other)?;
+                        agents
+                            .send(crate::agent::workspace::Action::Start {
+                                scope: crate::agent::Scope {
+                                    agent_instance_id,
+                                    task_id,
+                                },
+                                prompt,
+                            })
+                            .await
+                            .map_err(io::Error::other)?;
+                    }
+                    Input::AgentCancel => agents
+                        .send(crate::agent::workspace::Action::Cancel)
+                        .await
+                        .map_err(io::Error::other)?,
                     Input::Resize { rows, cols } => {
                         if let Some(terminal) = &terminal {
                             terminal.resize(rows, cols)?;

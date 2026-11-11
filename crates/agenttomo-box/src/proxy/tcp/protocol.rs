@@ -68,6 +68,37 @@ impl Inspector {
     }
 }
 
+/// Reuse passive parsing for upstream routing. Unknown/server-first protocols
+/// retain IP routing after a bounded wait; consumed bytes are always replayed.
+pub(super) async fn preface(
+    mut client: crate::proxy::BoxIo,
+    finished: &tokio_util::sync::CancellationToken,
+) -> std::io::Result<(Option<Name>, crate::proxy::BoxIo)> {
+    use tokio::io::AsyncReadExt;
+    let mut inspector = Inspector::default();
+    let mut prefix = Vec::new();
+    let mut buffer = [0; 8192];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    let name = loop {
+        let available = buffer.len().min(LIMIT - prefix.len());
+        let count = tokio::select! {
+            biased;
+            count = client.read(&mut buffer[..available]) => count?,
+            _ = finished.cancelled() => break None,
+            _ = tokio::time::sleep_until(deadline) => break None,
+        };
+        if count == 0 {
+            break None;
+        }
+        prefix.extend_from_slice(&buffer[..count]);
+        let name = inspector.observe(&buffer[..count]);
+        if matches!(inspector.state, State::Done) {
+            break name;
+        }
+    };
+    Ok((name, crate::proxy::replay::replay(prefix, client)))
+}
+
 fn tls_name(acceptor: &mut Acceptor, bytes: &mut &[u8]) -> Result<Option<Name>, ()> {
     while !bytes.is_empty() {
         if acceptor.read_tls(bytes).map_err(|_| ())? == 0 {
@@ -137,6 +168,53 @@ mod tests {
 
     const HELLO: &[u8] = include_bytes!("../../../tests/fixtures/client-hello-sni.bin");
     const NO_SNI: &[u8] = include_bytes!("../../../tests/fixtures/client-hello-no-sni.bin");
+
+    #[tokio::test]
+    async fn routing_replays_fragmented_and_unrecognized_prefaces_exactly() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (bytes, expected) in [
+            (HELLO.to_vec(), Some("tls.example.test")),
+            (
+                b"GET / HTTP/1.1\r\nHost: origin.test\r\n\r\npayload".to_vec(),
+                Some("origin.test"),
+            ),
+            (NO_SNI.to_vec(), None),
+            ((0..=255).collect::<Vec<_>>(), None),
+            (
+                [
+                    b"GET / HTTP/1.1\r\nX-Large: ".as_slice(),
+                    &vec![b'x'; LIMIT + 1],
+                ]
+                .concat(),
+                None,
+            ),
+        ] {
+            let (mut app, stream) = tokio::io::duplex(64);
+            let original = bytes.clone();
+            let writer = tokio::spawn(async move {
+                for chunk in bytes.chunks(7) {
+                    app.write_all(chunk).await.unwrap();
+                }
+                app.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                app.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply, b"reply");
+            });
+            let (name, mut replay) = preface(
+                Box::new(stream),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(name.and_then(|name| name.domain).as_deref(), expected);
+            let mut received = Vec::new();
+            replay.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, original);
+            replay.write_all(b"reply").await.unwrap();
+            replay.shutdown().await.unwrap();
+            writer.await.unwrap();
+        }
+    }
 
     fn fragmented(bytes: &[u8], size: usize) -> Name {
         let mut inspector = Inspector::default();

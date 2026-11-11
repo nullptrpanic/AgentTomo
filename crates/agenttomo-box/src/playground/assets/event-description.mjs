@@ -1,4 +1,5 @@
 // Shared descriptions for native process events and saved v1 records.
+import { httpRequestTarget } from "./traffic-model.mjs";
 export const formatCommand = (argv) => argv.map(arg => /\s/.test(arg) ? JSON.stringify(arg) : arg).join(" ");
 
 export function describeBehavior(kind, data, domain) {
@@ -20,7 +21,7 @@ export function describeBehavior(kind, data, domain) {
   if (kind === "network.upstream") return `tcp ${destination} · upstream ${data.status}${data.error ? `: ${data.error}` : ""}`;
   if (kind === "network.transfer") return `tcp ${destination ?? "connection"} · ${data.status} · ↑ ${data.bytes_up ?? "?"} B · ↓ ${data.bytes_down ?? "?"} B${data.error ? ` · ${data.error}` : ""}`;
   if (kind === "network.protocol") return `${data.protocol} ${data.domain ?? "[domain unavailable]"} · ${data.domain_source} · ${data.destination ?? "address unavailable"}`;
-  if (kind === "network.http.request") return `${data.method} ${data.url} · request #${data.request_id}`;
+  if (kind === "network.http.request") return `${data.method} ${httpRequestTarget(data)} · request #${data.request_id}`;
   if (kind === "network.stream.open") return `${data.protocol} · request #${data.request_id} · live messages in Traffic`;
   if (kind === "network.stream.closed") return `${data.protocol} · request #${data.request_id} · ${data.complete ? "closed" : "interrupted"}${data.error ? ` · ${data.error}` : ""}`;
   if (kind === "network.http.response") return `${data.version} ${data.status_code} · request #${data.request_id}`;

@@ -2,7 +2,9 @@
 
 pub(crate) mod child;
 pub(crate) mod collector;
+mod mounts;
 pub(crate) mod protocol;
+pub(crate) mod rootfs;
 mod streams;
 pub(crate) mod trust;
 
@@ -26,6 +28,8 @@ pub async fn run(
     output_dir: Option<&Path>,
     preview_limits: recording::file_preview::Limits,
     http: crate::proxy::http::Options,
+    rootfs: rootfs::Options,
+    proxy: Option<crate::proxy::outbound::Proxy>,
 ) -> io::Result<u8> {
     let directory = output_dir
         .map(Path::to_path_buf)
@@ -45,9 +49,13 @@ pub async fn run(
         .arg("--file-preview-total-bytes")
         .arg(preview_limits.total_bytes.to_string())
         .args(http.arguments())
+        .args(rootfs.arguments())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if let Some(proxy) = proxy {
+        worker.arg("--proxy").arg(proxy.to_string());
+    }
     let foreground = getpid();
     // Only syscalls run between fork and exec. The collector disarms this
     // notification before acknowledging a normal root exit.

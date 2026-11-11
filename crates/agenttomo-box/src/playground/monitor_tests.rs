@@ -27,14 +27,20 @@ impl Fixture {
                 image_id: String::new(),
                 binary: PathBuf::new(),
                 output_dir: self.0.clone(),
+                session_tmpfs_size_mib: 512,
                 token: "monitor-token".into(),
                 file_preview: Default::default(),
                 http: Default::default(),
+                rootfs: Default::default(),
+                codex: None,
+                proxy: None,
             }),
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
             desktops: Default::default(),
             running: Default::default(),
+            proxy_peers: Default::default(),
+            bridges: None,
         }
     }
 

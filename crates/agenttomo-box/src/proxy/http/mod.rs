@@ -32,7 +32,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    net::TcpStream,
     sync::{Mutex, mpsc},
     time::{timeout, timeout_at},
 };
@@ -70,9 +69,16 @@ pub struct Inspection {
     store: Arc<Store>,
     streams: Arc<crate::recording::streams::Store>,
     ids: AtomicU64,
+    agents: crate::agent::Hub,
+    semantic: crate::agent::store::Store,
+    semantic_serial: Mutex<()>,
 }
 impl Inspection {
-    pub async fn create(directory: &Path, options: Options) -> stdio::Result<Option<Arc<Self>>> {
+    pub async fn create(
+        directory: &Path,
+        options: Options,
+        agents: crate::agent::Hub,
+    ) -> stdio::Result<Option<Arc<Self>>> {
         if !options.enabled {
             return Ok(None);
         }
@@ -82,6 +88,9 @@ impl Inspection {
             store: Store::create(directory, options.limits).await?,
             streams: crate::recording::streams::Store::create(directory, options.streams).await?,
             ids: AtomicU64::new(1),
+            agents,
+            semantic: crate::agent::store::Store::create(directory).await?,
+            semantic_serial: Mutex::new(()),
         })))
     }
 }
@@ -141,13 +150,67 @@ struct MessageContext {
     start: Instant,
     unix_ns: u128,
     response: bool,
+    connect: bool,
+    agent: Option<crate::agent::Scope>,
+    encoding: String,
 }
 impl MessageContext {
+    fn model_observer(&self) -> Option<crate::agent::Observer> {
+        self.agent
+            .clone()
+            .map(|scope| crate::agent::Observer::new(scope, self.session.inspection.agents.clone()))
+    }
+    fn semantic(&self, events: Vec<crate::agent::Event>) {
+        if events.is_empty() {
+            return;
+        }
+        let message = self.clone();
+        self.session.writes.spawn(async move {
+            let _ordered = message.session.inspection.semantic_serial.lock().await;
+            for mut event in events {
+                if let Some(content) = event.content {
+                    event.data["preview"] = content
+                        .as_str()
+                        .map(|text| text.chars().take(4096).collect::<String>())
+                        .unwrap_or_else(|| "Structured content".to_owned())
+                        .into();
+                    event.data["payload"] =
+                        match message.session.inspection.semantic.save(&content).await {
+                            Ok(reference) => reference,
+                            Err(error) => json!({"status":"unavailable","error":error.to_string()}),
+                        };
+                }
+                event.data["request_id"] = message.request_id.into();
+                event.data["started_unix_ns"] =
+                    if let Some(started) = event.data.get("message_started_unix_ns") {
+                        started.clone()
+                    } else if event.kind == "agent.model.request" {
+                        json!(message.unix_ns)
+                    } else {
+                        event.data["captured_unix_ns"].clone()
+                    };
+                event.data["start_source"] = if event.data.get("message_started_unix_ns").is_some()
+                {
+                    "proxy_frame_header"
+                } else {
+                    "model_protocol"
+                }
+                .into();
+                let _ = message
+                    .session
+                    .events
+                    .send(message.session.context.event(event.kind, event.data))
+                    .await;
+            }
+        });
+    }
     async fn emit(&self, kind: &'static str, mut data: Value) -> stdio::Result<()> {
         data["request_id"] = self.request_id.into();
         data["started_unix_ns"] = json!(self.unix_ns);
         data["start_source"] = "proxy_request_headers".into();
-        data["scheme"] = self.session.scheme.into();
+        if !self.connect {
+            data["scheme"] = self.session.scheme.into();
+        }
         self.session
             .events
             .send(self.session.context.event(kind, data))
@@ -166,19 +229,20 @@ impl MessageContext {
 }
 
 pub async fn forward(
-    client: TcpStream,
-    upstream: TcpStream,
+    client: BoxIo,
+    upstream: BoxIo,
     inspection: Arc<Inspection>,
     context: &Context,
     events: &mpsc::Sender<Observation>,
     finished: CancellationToken,
 ) -> stdio::Result<transfer::Outcome> {
-    let mut first = [0];
-    let mut server_first = [0];
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut client = BufReader::new(client);
+    let mut upstream = BufReader::new(upstream);
     let tls = tokio::select! {
         biased;
-        count = client.peek(&mut first) => count? > 0 && first[0] == 0x16,
-        count = upstream.peek(&mut server_first) => { count?; false },
+        bytes = client.fill_buf() => bytes?.first() == Some(&0x16),
+        bytes = upstream.fill_buf() => { bytes?; false },
         _ = finished.cancelled() => false,
     };
     let counts = Arc::new(Counters::default());
@@ -187,48 +251,17 @@ pub async fn forward(
         counts: counts.clone(),
     });
     let (client, upstream, scheme): (BoxIo, BoxIo, _) = if tls {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        let handshake = async {
-            let start =
-                tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), client)
-                    .await?;
-            let (name, name_source) = start
-                .client_hello()
-                .server_name()
-                .map(|name| (name.to_owned(), "tls_sni"))
-                .unwrap_or_else(|| (context.key.destination.ip().to_string(), "destination_ip"));
-            let server_name = rustls::pki_types::ServerName::try_from(name.clone())
-                .map_err(stdio::Error::other)?;
-            let remote = tokio_rustls::TlsConnector::from(inspection.authority.client.clone())
-                .connect(server_name, upstream)
-                .await?;
-            let local = start
-                .into_stream(inspection.authority.server(&name)?)
-                .await?;
-            let alpn = local
-                .get_ref()
-                .1
-                .alpn_protocol()
-                .map(String::from_utf8_lossy);
-            let upstream_alpn = remote
-                .get_ref()
-                .1
-                .alpn_protocol()
-                .map(String::from_utf8_lossy);
-            events.send(context.event("network.protocol", json!({"protocol":"tls","domain":name,"domain_source":name_source,"scope":"connection_preface","tls_intercepted":true,"alpn":alpn,"upstream_alpn":upstream_alpn}))).await.map_err(stdio::Error::other)?;
-            Ok::<_, stdio::Error>((Box::new(local) as BoxIo, Box::new(remote) as BoxIo))
-        };
-        let result = tokio::select! {
-            result = timeout_at(deadline, handshake) => result.map_err(stdio::Error::other).and_then(|result| result),
-            _ = finished.cancelled() => Err(stdio::Error::other("task ended during TLS handshake")),
-        };
-        match result {
-            Ok((client, upstream)) => (client, upstream, "https"),
-            Err(error) => {
-                events.send(context.event("network.tls.error", json!({"error":error.to_string(),"stage":"handshake","tls_intercepted":false}))).await.map_err(stdio::Error::other)?;
-                return Err(error);
-            }
-        }
+        let (client, upstream) = decrypt(
+            client,
+            Box::new(upstream),
+            &inspection,
+            context,
+            events,
+            &finished,
+            None,
+        )
+        .await?;
+        (client, upstream, "https")
     } else {
         (client, Box::new(upstream), "http")
     };
@@ -255,39 +288,150 @@ pub async fn forward(
     })
 }
 
-type HttpBody = UnsyncBoxBody<Bytes, hyper::Error>;
-async fn bridge(client: BoxIo, upstream: BoxIo, session: Session) -> stdio::Result<()> {
-    let (sender, connection) = hyper::client::conn::http1::Builder::new()
-        .preserve_header_case(true)
-        .handshake::<_, body::Observed>(TokioIo::new(upstream))
-        .await
-        .map_err(stdio::Error::other)?;
-    let driver = tokio::spawn(connection.with_upgrades());
-    let sender = Arc::new(Mutex::new(sender));
-    let handler = session.clone();
-    let service = service_fn(move |request| handle(request, sender.clone(), handler.clone()));
-    let connection = hyper::server::conn::http1::Builder::new()
-        .preserve_header_case(true)
-        .half_close(true)
-        .serve_connection(TokioIo::new(client), service)
-        .with_upgrades();
-    let mut connection = Box::pin(connection);
-    let result = tokio::select! {
-        biased;
-        result = &mut connection => result.map_err(stdio::Error::other),
-        _ = session.finished.cancelled() => {
-            connection.as_mut().graceful_shutdown();
-            timeout(Duration::from_secs(5), &mut connection).await.map_err(stdio::Error::other).and_then(|result| result.map_err(stdio::Error::other))
-        },
+// Both direct TLS and HTTP CONNECT tunnels use the same task CA and verifier.
+async fn decrypt(
+    client: BoxIo,
+    upstream: BoxIo,
+    inspection: &Arc<Inspection>,
+    context: &Context,
+    events: &mpsc::Sender<Observation>,
+    finished: &CancellationToken,
+    connect_host: Option<&str>,
+) -> stdio::Result<(BoxIo, BoxIo)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let handshake = async {
+        let start =
+            tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), client)
+                .await?;
+        let (name, name_source) = start
+            .client_hello()
+            .server_name()
+            .map(|name| (name.to_owned(), "tls_sni"))
+            .or_else(|| {
+                connect_host.map(|host| {
+                    (
+                        host.trim_matches(['[', ']']).to_owned(),
+                        "connect_authority",
+                    )
+                })
+            })
+            .unwrap_or_else(|| (context.key.destination.ip().to_string(), "destination_ip"));
+        let server_name =
+            rustls::pki_types::ServerName::try_from(name.clone()).map_err(stdio::Error::other)?;
+        let remote = tokio_rustls::TlsConnector::from(inspection.authority.client.clone())
+            .connect(server_name, upstream)
+            .await?;
+        let local = start
+            .into_stream(inspection.authority.server(&name)?)
+            .await?;
+        let alpn = local
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(String::from_utf8_lossy);
+        let upstream_alpn = remote
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(String::from_utf8_lossy);
+        events.send(context.event("network.protocol", json!({"protocol":"tls","domain":name,"domain_source":name_source,"scope":"connection_preface","tls_intercepted":true,"alpn":alpn,"upstream_alpn":upstream_alpn}))).await.map_err(stdio::Error::other)?;
+        Ok::<_, stdio::Error>((Box::new(local) as BoxIo, Box::new(remote) as BoxIo))
     };
-    driver.abort();
-    let _ = driver.await;
-    // All body drops and upgrade jobs finish before the proxy relinquishes its
-    // observation sender, so the recorder can flush complete metadata/payloads.
-    drop(connection);
-    session.writes.close();
-    session.writes.wait().await;
-    result
+    let result = tokio::select! {
+        result = timeout_at(deadline, handshake) => result.map_err(stdio::Error::other).and_then(|result| result),
+        _ = finished.cancelled() => Err(stdio::Error::other("task ended during TLS handshake")),
+    };
+    match result {
+        Ok(pair) => Ok(pair),
+        Err(error) => {
+            events
+                .send(context.event(
+                    "network.tls.error",
+                    json!({"error":error.to_string(),"stage":"handshake","tls_intercepted":false}),
+                ))
+                .await
+                .map_err(stdio::Error::other)?;
+            Err(error)
+        }
+    }
+}
+
+type HttpBody = UnsyncBoxBody<Bytes, hyper::Error>;
+fn bridge(
+    client: BoxIo,
+    upstream: BoxIo,
+    session: Session,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = stdio::Result<()>> + Send>> {
+    Box::pin(async move {
+        let (sender, connection) = hyper::client::conn::http1::Builder::new()
+            .preserve_header_case(true)
+            .handshake::<_, body::Observed>(TokioIo::new(upstream))
+            .await
+            .map_err(stdio::Error::other)?;
+        let driver = tokio::spawn(connection.with_upgrades());
+        let sender = Arc::new(Mutex::new(sender));
+        let handler = session.clone();
+        let service = service_fn(move |request| handle(request, sender.clone(), handler.clone()));
+        let connection = hyper::server::conn::http1::Builder::new()
+            .preserve_header_case(true)
+            .half_close(true)
+            .serve_connection(TokioIo::new(client), service)
+            .with_upgrades();
+        let mut connection = Box::pin(connection);
+        let result = tokio::select! {
+            biased;
+            result = &mut connection => result.map_err(stdio::Error::other),
+            _ = session.finished.cancelled() => {
+                connection.as_mut().graceful_shutdown();
+                timeout(Duration::from_secs(5), &mut connection).await.map_err(stdio::Error::other).and_then(|result| result.map_err(stdio::Error::other))
+            },
+        };
+        driver.abort();
+        let _ = driver.await;
+        // All body drops and upgrade jobs finish before the proxy relinquishes its
+        // observation sender, so the recorder can flush complete metadata/payloads.
+        drop(connection);
+        session.writes.close();
+        session.writes.wait().await;
+        result
+    })
+}
+
+async fn tunnel(
+    client: BoxIo,
+    upstream: BoxIo,
+    mut session: Session,
+    connect_host: Option<String>,
+) -> stdio::Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut client = BufReader::new(client);
+    let mut upstream = BufReader::new(upstream);
+    let tls = tokio::select! {
+        bytes = client.fill_buf() => bytes?.first() == Some(&0x16),
+        bytes = upstream.fill_buf() => { bytes?; false },
+        _ = session.finished.cancelled() => return Ok(()),
+    };
+    session.scheme = if tls { "https" } else { "http" };
+    let (client, upstream): (BoxIo, BoxIo) = if tls {
+        decrypt(
+            Box::new(client),
+            Box::new(upstream),
+            &session.inspection,
+            &session.context,
+            &session.events,
+            &session.finished,
+            connect_host.as_deref(),
+        )
+        .await?
+    } else {
+        (Box::new(client), Box::new(upstream))
+    };
+    let (http, client, upstream) = io::detect(client, upstream, &session.finished).await?;
+    if http {
+        bridge(client, upstream, session).await
+    } else {
+        io::opaque(client, upstream, &session.finished).await
+    }
 }
 
 async fn handle(
@@ -295,12 +439,43 @@ async fn handle(
     sender: Arc<Mutex<hyper::client::conn::http1::SendRequest<body::Observed>>>,
     session: Session,
 ) -> Result<Response<HttpBody>, stdio::Error> {
+    let agent = (matches!(*request.method(), Method::POST | Method::GET)
+        && request
+            .uri()
+            .path()
+            .trim_end_matches('/')
+            .ends_with("/responses"))
+    .then(|| {
+        session
+            .context
+            .metadata
+            .as_ref()
+            .filter(|metadata| metadata.actors.len() == 1)
+            .and_then(|metadata| {
+                session
+                    .inspection
+                    .agents
+                    .binding(metadata.actors[0].process_instance_id)
+            })
+            .map(|binding| binding.scope)
+    })
+    .flatten();
+    let encoding = request
+        .headers()
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let connect = request.method() == Method::CONNECT;
     let message = MessageContext {
         request_id: session.inspection.ids.fetch_add(1, Ordering::Relaxed),
         session,
         start: Instant::now(),
         unix_ns: now(),
         response: false,
+        connect,
+        agent,
+        encoding,
     };
     let authority = request
         .uri()
@@ -314,10 +489,8 @@ async fn handle(
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| message.session.context.key.destination.to_string());
-    let url = if request.uri().scheme().is_some() {
+    let url = if connect || request.uri().scheme().is_some() {
         request.uri().to_string()
-    } else if request.method() == Method::CONNECT {
-        format!("{}://{}", message.session.scheme, request.uri())
     } else {
         format!(
             "{}://{}{}",
@@ -327,7 +500,7 @@ async fn handle(
         )
     };
     message.emit("network.http.request", json!({"method":request.method().as_str(),"url":url,"domain":authority,"version":format!("{:?}",request.version()),"headers":headers(request.headers()),"header_encoding":"latin1"})).await?;
-    let connect = request.method() == Method::CONNECT;
+    let connect_host = request.uri().host().map(str::to_owned);
     let upgrade_requested = connect || request.headers().contains_key("upgrade");
     let websocket_accept = (request.method() == Method::GET
         && header_token(request.headers(), "upgrade", "websocket")
@@ -414,8 +587,18 @@ async fn handle(
                         false,
                     );
                 }
-                complete = io::opaque(client, upstream, &finished).await.is_ok()
-                    && !finished.is_cancelled();
+                complete = if connect {
+                    let session = Session {
+                        scheme: "https",
+                        writes: TaskTracker::new(),
+                        ..upgraded_message.session.clone()
+                    };
+                    tunnel(client, upstream, session, connect_host)
+                        .await
+                        .is_ok()
+                } else {
+                    io::opaque(client, upstream, &finished).await.is_ok()
+                } && !finished.is_cancelled();
             }
             if websocket {
                 streams::closed(upgraded_message, "websocket", complete).await;
@@ -424,20 +607,27 @@ async fn handle(
     }
     let response_message = MessageContext {
         response: true,
+        encoding: response
+            .headers()
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned(),
         ..message
     };
-    let sse = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .eq_ignore_ascii_case("text/event-stream")
-        });
+    let sse = response_message.agent.is_some() && !upgrade_requested
+        || response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            });
     let encoding = sse.then(|| {
         response
             .headers()

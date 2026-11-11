@@ -12,6 +12,7 @@
   <link rel="stylesheet" href="/assets/traffic.css">
   <link rel="stylesheet" href="/assets/behavior-graph.css">
   <link rel="stylesheet" href="/assets/browser.css">
+  <link rel="stylesheet" href="/assets/agent.css">
   <script defer src="/assets/vendor/xterm.js"></script>
   <script defer src="/assets/vendor/addon-fit.js"></script>
   <script type="module" src="/assets/app.js"></script>
@@ -29,7 +30,17 @@
   <main>
     <section id="workspace-panel" class="terminal-panel" aria-labelledby="terminal-title">
       <div class="panel-heading"><div><span class="eyebrow">WORKSPACE</span><h1 id="terminal-title">Container terminal</h1></div><span id="image" class="image-label">Docker</span></div>
-      <div class="terminal-toolbar"><nav class="workspace-tabs" aria-label="Workspace view"><button type="button" data-workspace="terminal" aria-pressed="true">Terminal</button><button id="browser-tab" type="button" data-workspace="browser" aria-pressed="false" hidden>Browser</button></nav><span id="session-id">Creating a temporary container…</span></div>
+      <div class="terminal-toolbar"><nav class="workspace-tabs" aria-label="Workspace view"><button type="button" data-workspace="terminal" aria-pressed="true">Terminal</button><button id="browser-tab" type="button" data-workspace="browser" aria-pressed="false" hidden>Browser</button><button id="chat-tab" type="button" data-workspace="chat" aria-pressed="false">Chat</button></nav><span id="session-id">Creating a temporary container…</span></div>
+      <section id="agent-chat" aria-label="Agent conversation" hidden>
+        <div class="agent-history-region">
+          <div class="agent-history" aria-live="polite"></div>
+          <button type="button" class="agent-latest" aria-label="Follow latest messages" hidden>↓ Latest</button>
+        </div>
+        <form class="agent-compose">
+          <textarea aria-label="Task for Codex" placeholder="Ask Codex to run a task in this sandbox…" maxlength="8192" disabled></textarea>
+          <footer><span class="agent-chat-status" role="status">Waiting for the sandbox</span><button type="button" class="agent-restart" hidden>New sandbox</button><button type="button" class="agent-stop" disabled>Stop</button><button type="submit" class="agent-send" disabled>Send ↗</button></footer>
+        </form>
+      </section>
       <div id="terminal" aria-label="Interactive container terminal"></div>
       <section id="browser" aria-label="Container Chrome window" hidden>
         <div class="browser-toolbar"><span id="browser-status" role="status">Waiting for desktop</span><button id="browser-reconnect" type="button" disabled>Reconnect display</button></div>
@@ -41,7 +52,7 @@
     <div id="panel-resizer" role="separator" tabindex="0" aria-label="Resize workspace and activity panels" aria-orientation="vertical" aria-controls="workspace-panel" title="Drag to resize · Arrow keys to adjust · Double-click to reset"></div>
     <section id="monitor-panel" class="trace-panel" aria-labelledby="trace-title">
       <div class="panel-heading"><div><span class="eyebrow">OBSERVABILITY</span><h2 id="trace-title">Activity <span id="event-count" class="count">0</span></h2></div><span id="trace-session" class="trace-label"><span class="small-dot"></span> Live behaviors</span></div>
-      <nav class="observation-tabs" aria-label="Observation view"><button type="button" data-observation="process" aria-pressed="true">Process tree</button><button type="button" data-observation="graph" aria-pressed="false">Graph</button><button type="button" data-observation="traffic" aria-pressed="false">Traffic</button></nav>
+      <nav class="observation-tabs" aria-label="Observation view"><button type="button" data-observation="process" aria-pressed="true">Process tree</button><button type="button" data-observation="graph" aria-pressed="false">Graph</button><button type="button" data-observation="traffic" aria-pressed="false">Traffic</button><button type="button" data-observation="agent" aria-pressed="false">Task trajectory</button></nav>
       <p class="trace-description"><span id="view-description">Expand a process to inspect its behavior and descendants.</span><br><span id="capture-description">Process lifecycle · file opens · mmap · TCP / UDP · HTTP Host / TLS SNI.</span></p>
       <div class="trace-tools">
         <details id="event-filter" class="event-filter">
@@ -49,7 +60,7 @@
           <div class="filter-menu">
             <div class="filter-actions"><button type="button" data-filter-action="all">Select all</button><button type="button" data-filter-action="none">Clear all</button></div>
             <div class="filter-groups"></div>
-            <p>Filters affect displayed events. Full logs are retained.</p>
+            <p>Filters affect displayed events. Logs are available while the sandbox runs.</p>
           </div>
         </details>
       </div>
@@ -63,12 +74,14 @@
         <div id="behavior-graph"><ul class="graph-roots" aria-label="Processes and their event cards"></ul></div>
       </section>
       <section id="traffic" aria-label="Traffic inspector" hidden></section>
+      <section id="agent-trajectory" aria-label="Agent task trajectory" tabindex="0" hidden></section>
+      <aside id="agent-detail" aria-label="Agent evidence detail" hidden></aside>
       <aside id="file-preview" aria-label="File preview" hidden></aside>
       <details id="event-detail"><summary>Selected event <span id="selected-sequence"></span></summary><pre id="event-json">Select a trace row to inspect its fields.</pre></details>
-      <footer class="trace-footer"><span id="trace-summary">Waiting for process events</span><span>Logs retained on host</span></footer>
+      <footer class="trace-footer"><span id="trace-summary">Waiting for process events</span><span>Records deleted when sandbox ends</span></footer>
     </section>
   </main>
   <div id="notice" role="alert" hidden></div>
-  <footer class="page-footer"><span id="page-description">One session. Multiple views of its activity.</span><span id="page-lifecycle">Closing this workspace removes its container.</span></footer>
+  <footer class="page-footer"><span id="page-description">One session. Multiple views of its activity.</span><span id="page-lifecycle">Closing this workspace removes its container and recordings.</span></footer>
 </body>
 </html>

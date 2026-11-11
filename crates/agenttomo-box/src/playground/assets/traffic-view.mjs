@@ -1,6 +1,6 @@
-import { TrafficModel } from "./traffic-model.mjs";
+import { TrafficModel, httpRequestTarget } from "./traffic-model.mjs";
 import { contentEncoding, httpPreview } from "./http-preview.mjs";
-import { copyText } from "./copy-text.mjs";
+import { copyWithFeedback } from "./copy-text.mjs";
 import { copyIcon } from "./icons.mjs";
 import { StreamView } from "./stream-view.mjs";
 
@@ -121,7 +121,7 @@ export class TrafficView {
       if (view.latest !== row.latest) {
         const data = row.request?.data || row.latest.data;
         view.method.textContent = row.stream?.data.protocol === "websocket" ? "WS" : row.stream ? "SSE" : data.method || "…";
-        view.url.textContent = data.url || "Waiting for request headers…";
+        view.url.textContent = httpRequestTarget(data) || "Waiting for request headers…";
         view.code.textContent = row.error ? "Failed" : row.stream ? row.streamClosed ? "Closed" : "Live" : row.response?.data.status_code ?? "Pending";
         const completed = row.stream ? row.streamClosed?.data : row.responseBody?.data;
         const duration = completed?.duration_ns ? ` · ${(completed.duration_ns / 1e6).toFixed(1)} ms` : "";
@@ -152,7 +152,7 @@ export class TrafficView {
     this.detail.innerHTML = `<div class="traffic-detail-heading"><strong></strong></div><p class="traffic-copy-status" role="status" hidden></p><nav aria-label="Exchange direction"><button type="button" data-side="request">Request</button><button type="button" data-side="response">Response</button></nav><p class="traffic-message-status"></p><details class="traffic-headers traffic-section"><summary><span class="traffic-section-title">Headers</span></summary><pre></pre></details><details class="traffic-body-section traffic-section"><summary class="traffic-body-tools"><span class="traffic-section-title traffic-body-title">Body</span><span class="traffic-body-modes" role="group" aria-label="Body representation"><button type="button" data-body-mode="decoded">Decoded</button><button type="button" data-body-mode="raw">Raw / Hex</button></span><button type="button" class="traffic-body-copy traffic-icon" aria-label="Copy content" title="Copy content" disabled>${copyIcon}</button></summary><p class="traffic-body-status" role="status"></p><pre class="traffic-body"></pre></details>`;
     this.detail.querySelector(".traffic-headers").open = headersOpen;
     this.detail.querySelector(".traffic-body-section").open = bodyOpen;
-    const url = row.request?.data.url || "Request pending";
+    const url = httpRequestTarget(row.request?.data) || "Request pending";
     this.detail.querySelector(".traffic-detail-heading strong").textContent = url;
     const status = this.detail.querySelector(".traffic-body-status");
     const copyStatus = this.detail.querySelector(".traffic-copy-status");
@@ -194,7 +194,7 @@ export class TrafficView {
       copy.setAttribute("aria-label", copy.title);
       copy.onclick = async () => {
         let message = content.partial ? "Displayed prefix copied; content is incomplete." : "Displayed body copied.";
-        try { await copyText(content.text); } catch (error) { message = error.message; }
+        try { await copyWithFeedback(copy, content.text); } catch (error) { message = error.message; }
         if (version === this.version) { copyStatus.textContent = message; copyStatus.hidden = false; }
       };
     } catch (error) {

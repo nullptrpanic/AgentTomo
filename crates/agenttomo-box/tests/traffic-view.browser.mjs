@@ -24,7 +24,7 @@ server.listen(0, "127.0.0.1");
 await once(server, "listening");
 let browser;
 try {
-  browser = await chromium.launch({ executablePath: process.env.AGENTTOMO_TEST_BROWSER || undefined, headless: true, args: ["--no-sandbox"] });
+  browser = process.env.AGENTTOMO_CDP ? await chromium.connectOverCDP(process.env.AGENTTOMO_CDP) : await chromium.launch({ executablePath: process.env.AGENTTOMO_TEST_BROWSER || undefined, headless: true, args: ["--no-sandbox"] });
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   const result = await page.evaluate(async () => {
@@ -79,6 +79,9 @@ try {
     await new Promise(resolve => setTimeout(resolve, 0));
     check(copied.includes("72 65 73 70") && !root.querySelector(".traffic-body-section").open, "copy remains usable without expanding the body");
     check(root.querySelector(".traffic-copy-status").checkVisibility() && root.querySelector(".traffic-copy-status").textContent.includes("copied"), "collapsed body copy feedback remains visible");
+    check(root.querySelector(".traffic-body-copy").title === "Copied", "body copy shows its success icon");
+    root.querySelector(".traffic-body-copy").dispatchEvent(new MouseEvent("mouseleave"));
+    check(root.querySelector(".traffic-body-copy").title === "Copy hex", "body copy feedback restores the original representation label");
     view.add(event("response.body", 7, { body: { status: "complete", offset: 0, captured_bytes: 13, observed_bytes: 13, complete: true } }));
     flush();
     await new Promise(resolve => setTimeout(resolve, 0));
@@ -138,6 +141,7 @@ try {
     check(streamCopy.querySelector("svg") && streamCopy.textContent === "" && streamCopy.getAttribute("aria-label") === "Copy content", "stream copy uses a labeled icon");
     await streamCopy.onclick();
     check(copied === "last" && root.querySelector(".stream-payload-status").textContent.includes("copied"), "closed stream message copy");
+    check(streamCopy.title === "Copied", "stream copy uses the shared success feedback");
     view.streamView.stop();
     return { burst_events: 30, burst_renders: 1, retained_rows: list.children.length };
   });

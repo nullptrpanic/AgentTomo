@@ -1,5 +1,5 @@
 import { eventTime, orderByStart } from "./event-time.mjs";
-import { httpEventField } from "./traffic-model.mjs";
+import { httpEventField, httpRequestTarget } from "./traffic-model.mjs";
 
 const validId = value => Number.isSafeInteger(value) && value >= 0;
 const amount = value => Number.isFinite(value) && value >= 0 ? `${value} B` : "—";
@@ -34,7 +34,8 @@ function httpSummary(card) {
   const closed = row.streamClosed?.event.data;
   card.requestId = card.records[0].event.data.request_id;
   card.label = `HTTP · #${card.requestId}`;
-  card.title = request?.url ? `${request.method || "HTTP"} ${request.url}` : `HTTP request #${card.requestId}`;
+  const target = httpRequestTarget(request);
+  card.title = target ? `${request.method || "HTTP"} ${target}` : `HTTP request #${card.requestId}`;
   card.description = join([
     row.error ? `Failed: ${row.error.event.data.error}` : response?.status_code,
     stream || closed ? `${(stream?.protocol || closed?.protocol)?.toUpperCase() || "Stream"} · ${closed ? closed.complete === false ? "Interrupted" : "Closed" : "Live"}`
@@ -55,7 +56,10 @@ function tcpSummary(card) {
   const protocol = latest("network.protocol");
   const request = latest("network.http.request");
   let domain = protocol?.event.data.domain;
-  if (!domain && request) { try { domain = new URL(request.event.data.url).hostname; } catch { /* Only use an actual URL. */ } }
+  if (!domain && request) { try {
+    const data = request.event.data, target = httpRequestTarget(data);
+    domain = new URL(data.method === "CONNECT" ? `http://${target}` : target).hostname;
+  } catch { /* Only use a readable request authority. */ } }
   const destination = card.records.find(entry => entry.event.data.destination)?.event.data.destination;
   const data = transfer?.event.data || failure?.event.data || upstream?.event.data;
   card.connectionId = card.records[0].event.data.connection_id;

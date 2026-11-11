@@ -1,6 +1,6 @@
 import { StreamModel } from "./stream-model.mjs";
 import { previewContent } from "./file-preview.mjs";
-import { copyText } from "./copy-text.mjs";
+import { copyWithFeedback, resetCopyFeedback } from "./copy-text.mjs";
 import { copyIcon } from "./icons.mjs";
 
 export class StreamView {
@@ -68,6 +68,7 @@ export class StreamView {
     this.payloadRequest = new AbortController();
     const message = this.model.messages.find(message => message.id === this.model.selected);
     const status = this.root.querySelector(".stream-payload-status"), body = this.root.querySelector(".stream-payload"), copy = this.root.querySelector(".stream-copy");
+    resetCopyFeedback(copy);
     this.loaded = message?.id ?? null; copy.disabled = true; copy.onclick = null; body.textContent = "";
     if (!message) { status.textContent = expired ? "Selected message expired from the sliding window." : "Waiting for messages…"; return; }
     this.onSelect({ kind: "network.stream.message", category: "network", source: "tcp_proxy", data: message });
@@ -82,7 +83,7 @@ export class StreamView {
       copy.disabled = false;
       copy.title = content.format === "hex" ? "Copy hex" : "Copy content";
       copy.setAttribute("aria-label", copy.title);
-      copy.onclick = async () => { try { await copyText(content.text); if (this.active && version === this.version) status.textContent = "Displayed message copied."; } catch (error) { if (this.active && version === this.version) status.textContent = error.message; } };
+      copy.onclick = async () => { try { await copyWithFeedback(copy, content.text); if (this.active && version === this.version) status.textContent = "Displayed message copied."; } catch (error) { if (this.active && version === this.version) status.textContent = error.message; } };
     } catch (error) {
       if (this.active && version === this.version) status.textContent = error.status === 410 ? "Message expired from the sliding window." : `Message unavailable: ${error.message}`;
     }

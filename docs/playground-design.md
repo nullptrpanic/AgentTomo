@@ -37,10 +37,12 @@ flowchart LR
 
 - `cli/`：Clap 子命令与参数；`main.rs` 仅分派入口和管理 runtime。
 - `execution/`：前台、采集 worker、启动屏障和私有 IPC。
+- `execution/rootfs/`：可选一级目录及 SSL OverlayFS 的选择、元数据和任务临时存储；与文件采集解耦。
 - `tracing/`：原生进程事件、ptrace 停点与恢复、exec 元数据。
 - `syscall/`：选择性 seccomp 过滤、目标内存和寄存器机制。
 - `collectors/file/`、`collectors/memory/`、`collectors/network/`：分别解释文件、内存映射与网络 syscall，互不引用。
 - `proxy/tcp/`、`proxy/udp/`：同一 worker 内相互独立的 Tokio 转发，不依赖 ptrace 或文件采集。
+- `proxy/outbound`：TCP 出口建连；可选 HTTP CONNECT 隧道，只处理传输，不判断应用协议。
 - `terminal/`：PTY 分配、异步读写与窗口尺寸；不包含 Docker 或 Web 逻辑。
 - `recording/`：原始输出和 JSONL 证据、根退出与采集完成状态。
 - `playground/`：HTTP/WS、Docker 容器会话、日志追加读取、静态页面。
@@ -49,15 +51,31 @@ flowchart LR
 
 ## 会话与终端
 
-默认每个工作区主页面建立一个独立临时容器，主页面断开或服务正常停止时删除该容器，日志保留。Docker 先 create，再 attach/start，以便连接失败时也能准确清理自己的容器。仅删除当前会话创建的容器，不执行全局 prune。
+默认每个工作区主页面建立一个独立临时容器。记录与配置直接写入容器的 `/records` tmpfs，主页面断开、采集完成或服务正常停止时删除容器，随之销毁 tmpfs 和容器可写层。Docker 先 create，再 attach/start，以便连接失败时也能准确清理自己的容器。只删除当前会话创建的容器，不执行全局 prune；单次 Chat 任务结束不结束沙箱。
 
 Docker CLI 子进程使用独立进程组，宿主终端的 Ctrl-C 由 Playground 处理，连续按键不会打断创建、attach 或清理命令；网页终端中的 Ctrl-C 仍通过 PTY 作用于目标前台任务。控制命令保留 30 秒超时。`docker rm` 失败或超时时，再查询该名称的容器：只有查询成功且确认不存在才把清理记为成功；容器仍存在或无法查询时，记录原命令的退出码/信号或 I/O 错误，以及复核结果，不把 Docker 权限/连接错误视为容器已删除。
 
-默认使用本地 `agenttomo-playground-chrome:24.04` 并自动启动 Chrome，镜像包含 Ubuntu 24.04 工具集和桌面组件。构建方法见[镜像说明](../docker/playground-chrome/README.md)。可由 `--image` 指定其他兼容镜像，不自动拉取或构建。只挂载只读的 box 二进制和该会话日志目录；不挂载项目、宿主根目录或 Docker socket 到目标容器。
+默认使用本地 `agenttomo-playground-chrome:24.04` 并自动启动 Chrome，镜像包含 Ubuntu 24.04 工具集和桌面组件。构建方法见[镜像说明](../docker/playground-chrome/README.md)。可由 `--image` 指定其他兼容镜像，不自动拉取或构建。宿主机只提供只读的 box 二进制及可选 Codex 程序目录；不提供可写 bind mount，不挂载项目、宿主根目录或 Docker socket。容器使用 `--log-driver=none`，防止终端协议内容被 Docker 日志驱动另存到宿主机。
+
+可通过 `--overlay-root` 开启[一级目录及 SSL OverlayFS](root-overlay-design.md)，所有私有层
+共用默认 512 MiB 的容量上限，可配置豁免路径；不增加 Docker capabilities。只覆盖能整目录
+挂载的一级目录，以及 `/etc/ssl`；包含子挂载的目录整体跳过。当前 `/usr`、`/etc/ssl` 之外的
+`/etc`、带浏览器时的 `/tmp` 保持容器原视图，写入不隔离。浏览器通信使用两个小型 tmpfs；
+主命令退出后，存活后代继续使用任务挂载。
 
 容器采集器及终端使用 root（UID/GID 0），终端的 HOME 和初始工作目录为 `/root`。容器从 `cap-drop=ALL` 开始，仅为身份映射和文件检查增加 SETUID、SETGID、SETFCAP、DAC_OVERRIDE，保留 no-new-privileges，不使用 privileged。启动器在独立 user/net namespace 中完成配置，父采集器写入与外层相同的有效 UID/GID 范围，使终端可以切换到普通浏览器用户。目标执行前收回网络、挂载等管理能力，只保留身份切换能力；root 账号仍受这些能力限制，并非无限制的系统管理权限。为允许嵌套 user/net namespace，开发容器设置 seccomp=unconfined、apparmor=unconfined；这放宽了容器策略。网络工具与内核 TPROXY 能力不足时启动失败，不回退旧路径。
 
-采集器在创建 Tokio/文件写入线程前，把 FSUID/FSGID 设置为宿主日志用户，保持记录目录 0700、文件 0600 且由宿主用户所有；不通过放宽日志权限共享内容。专用 tracer 线程恢复 root 的文件访问身份后启动目标和检查进程，避免把宿主日志身份带入终端。普通 `run` 沿用调用者身份。
+Playground 采集器以容器 root 写入记录，目录 0700、文件 0600。原有 `run` 的执行身份和持久化行为不变。
+
+`/records` 默认上限 512 MiB，由 `--session-tmpfs-size-mib` 配置，按使用量分配；记录、Codex 原生会话和控制 socket 共用这一容量。`/records/<session-id>/run/` 保存现有 JSONL、正文和 SQLite；`/records/codex/` 是私有 CODEX_HOME；`/records/control/` 保存容器内部通信 socket。`--overlay-root` 始终豁免 `/records`，避免覆盖通信路径。该挂载保留执行能力，以兼容 Codex 在私有 home 中安装的工具；仍设置 nosuid/nodev。
+
+登录配置经内存快照、Docker attach 标准输入传入，不在宿主机写中转文件、不放在命令参数中，也不复制外层历史会话。宿主 Web 每个沙箱建立一条常驻 `docker exec` 管道，以 Hyper/Axum 的 HTTP/1 协议调用容器内现有读取接口，无新增监听端口、无每次轮询创建进程。所有监控页仍有独立游标，文件/HTTP/模型内容预览和 SSE/WebSocket 查询保持同一 API。连接故障会报告错误，不降级到宿主文件存储。
+
+采集完成时先原子写完成标记，保留容器直到工作区读完最后一批事件再移除，避免 tmpfs 提前卸载而丢失后代尾部事件。单次 Chat 完成、取消仍保留沙箱及续聊状态。容量耗尽会按现有记录写入错误报告并结束沙箱，不回退磁盘；可增大上限。tmpfs 上限不是整个容器内存限制；系统启用 swap 时页面仍可能换出。宿主进程崩溃和 Docker 删除失败仍可能留下活容器，正常清理失败必须明确报告。此方案隔离本地运行数据，不消除共享账号额度、真实联网操作或 CPU/内存消耗。
+
+旧的 Playground `--output-dir` 参数继续接受但不再写入。宿主端只保留活跃连接和必要的内存状态。
+
+`--proxy http://host:port` 为内置代理选择 TCP 出口，缺省为 `http://127.0.0.1:8118`，可用 `--no-proxy` 关闭；收到连接便向上游发送 `CONNECT 原目标IP:端口`，成功后转发任意 TCP 数据。目标程序不接收代理环境变量；HTTP/TLS 采集位于隧道内，原地址和五元组保持不变，box 的内部握手不作为应用事件。上游代理握手失败不直连回退；UDP 保持原路径。Playground 的宿主 loopback 代理由 bridge 上的受限转接访问，配置走内存 bootstrap，不写入 Docker 环境和 Codex 副本。无参数时兼容原宿主代理变量和本地 JSON 配置，优先级及支持范围见 README。普通 `run` 使用同名参数，无 Docker 转接。
 
 终端使用独立 PTY，支持输入、ANSI 显示、Ctrl-C、窗口 resize 和 Bash 作业控制。PTY 的 stdout/stderr 天然合并，保存到 stdout.log，不能再声称两个流可以分开。普通 `run` 继续使用原来的独立管道。
 
@@ -79,7 +97,7 @@ Chrome wrapper 从既有 OverlayFS 读取任务公开 CA，导入临时容器 NS
 
 `file.open` 增加独立文件预览面板，原始事件 JSON 详情继续保留。预览从事件关联的已保存内容加载，提供文本/JSON/Hex，使用图标按钮复制当前内容和关闭预览；失败、未采集、空文件与截断有独立状态。`GET /api/sessions/{session}/file-preview` 使用同一个访问令牌，仅接受固定快照文件的 offset/length，限制读取大小并拒绝路径符号链接；不允许任意宿主文件路径。旧记录无内容时不发起路径读取。完整边界见[内容检查设计](content-inspection-design.md)。
 
-终端输出使用二进制 WS 帧，状态和 trace 使用 JSON；输入和 resize 转换为现有 worker IPC。右侧按下述进程树规则组织真实事件，原始日志继续落盘。
+终端输出使用二进制 WS 帧，状态和 trace 使用 JSON；输入和 resize 转换为现有 worker IPC。右侧按下述进程树规则组织真实事件，原始日志继续写入沙箱 tmpfs。
 
 终端与 trace 面板使用统一深色主题。trace 视图位于底部时跟随新命令和事件滚动；用户向上查看历史时保持阅读位置，回到底部后恢复跟随。滚动仅作用于 trace 面板，不移动整个页面或展开已折叠分支。
 
@@ -91,9 +109,9 @@ Chrome wrapper 从既有 OverlayFS 读取任务公开 CA，导入临时容器 NS
 
 独立页通过带相同访问令牌的 `GET /api/sessions/{session}/events?offset=<字节游标>` 分批读取 `events.jsonl`。每批目标上限为 256 条或 1 MiB；单条完整记录可超过批次字节上限，但不超过现有 16 MiB 记录限制。活跃时每 250 ms 查询一次，回放未读历史时立即继续，单页不并发轮询。瞬时连接错误从原游标重试，关闭页面取消请求。每页保有自己的游标，不影响其他读者或采集器；前端内存仍采用现有最近事件窗口。
 
-服务只增加 session 存活状态与根 PID 的小型登记表，在采集及容器清理结束、`session-result.json` 写完后移除。查询先取存活状态再读文件，避免结束瞬间漏掉最后一批记录。未写完的一行等待后续查询，结束后仍残缺则明确提示。游标须位于记录边界；读取复用文件预览的目录访问约束，拒绝路径符号链接及非普通日志文件。元数据记录 HTTP 采集开关，结束记录保存根 PID，刷新和结束后回放沿用同一事件关联。
+服务维护 session 存活状态与根 PID 的小型登记表，在采集和清理结束后移除。活跃会话仍通过独立游标读取，未写完的一行等待后续查询。游标须位于记录边界；读取复用文件预览的目录访问约束，拒绝路径符号链接及非普通日志文件。完成标记仅短暂保存在容器 tmpfs 中用于排空最终事件，移除容器时元数据与载荷一起消失；清理错误保留在服务错误输出和仍可连接的页面提示中。
 
-这一步保留主页面拥有容器的生命周期：关闭监控页不停止任务，关闭工作区主页面仍清理容器。独立监控页在结束后保留已接收内容，也可刷新回放。使用已有追加日志作为来源，代价是每个监控页独立读取与轮询；无需额外常驻广播队列或第二套会话管理。
+这一步保留主页面拥有容器的生命周期：关闭监控页不停止任务，关闭工作区主页面清理容器及记录。记录删除后，独立监控页停止轮询并解释记录已不可用，刷新不再回放。销毁不会等待每个监控页读完末尾；主页面正常完成前仍会排空自己的最后一批事件。已经收到的数据可能仍留在页面内存中。新的 Playground 读取接口仅服务活跃沙箱，不再读取宿主归档；已有手动保留的文件不会被新服务自动删除。SIGKILL、主机故障和清理失败不能保证删除成功；不添加会误删其他服务会话的全局回收逻辑。
 
 ### 进程树与节点行为
 
@@ -202,6 +220,8 @@ flowchart LR
 ```
 
 ## 验证
+
+Chat 与 Task trajectory 的数据流、外部 Codex 接入、完整工具内容和关联边界见[任务设计](agent-task-design.md)。Chat 通过独立控制通道启动受追踪后代，复用现有沙箱与事件日志。多个独立监控页可以同时回看任务轨迹。
 
 保留现有运行生命周期测试，补充子命令、PTY isatty/resize/Ctrl-C、访问控制和会话清理测试。用真实 Docker 和浏览器验证命令执行、右侧 trace、窗口缩放、断线清理、服务退出清理。退出回归覆盖向服务进程组连续发送 SIGINT、daemon 已删除但 CLI 返回失败、容器实际残留和状态复核失败；只在测试的 Docker CLI 边界注入故障，实际创建/删除容器。测试不能以静态示例事件代替实际采集。
 

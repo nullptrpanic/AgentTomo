@@ -28,6 +28,25 @@ printf 'hello\n' | cargo run --quiet -p agenttomo-box -- run \
 
 ## playground：Docker 终端与实时 trace
 
+Playground 现在提供 Chat 页签。服务器自动查找外部 Codex，在同一受追踪容器里启动，并为本次会话复制外部配置与认证文件。检测到 Codex 后自动启用 HTTP/HTTPS 检查。Chat 支持连续对话，右侧 Task trajectory 按任务、模型轮次、工具、进程和资源展示。
+
+Terminal 与 Chat 共用本次会话的 Codex 登录副本，终端可以直接执行 `codex` 或 `codex login status`。Chat 显示当前阶段、运行计时和实时错误，原始报错可以展开查看。box 的四层出口默认使用 `http://127.0.0.1:8118`，无需在 Codex、curl 或其他目标程序中设置代理变量；`--proxy URL` 可覆盖，`--no-proxy` 可切换为 box 直连：
+
+```bash
+target/debug/agenttomo-box run -c 'curl https://www.baidu.com'
+target/debug/agenttomo-box playground --listen 0.0.0.0:18889
+```
+
+收到 TCP 连接后，box 复用已有 HTTP Host／TLS SNI 解析器读取有界首段：识别到域名时发送 `CONNECT 域名:原目标端口`，由上游代理解析域名，避免沿用本地 DNS 返回的错误 IP。没有可用域名、未知协议或服务端先发数据时仍使用 `CONNECT 原目标IP:端口`，首段等待最多 500 ms、缓冲最多 64 KiB；已读字节通过共享回放模块原样转发。显式 HTTP 代理的 CONNECT／绝对 URI 请求保留原代理端点。此路由选择不要求启用内容解密，也不改 DNS 配置；DNS 直接失败、TLS 隐藏 SNI 等情况无法仅靠它恢复域名。HTTP/TLS 内容采集仍由原采集模块独立处理；内部握手不会成为额外的应用请求。应用看到的目标地址、事件中的原始五元组和进程关联不变。启用该选项时，目标启动环境移除大小写 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY，避免二次代理；不做 NO_PROXY 分流。代理拒绝、断开或超时会报告失败，不回退直连。当前上游支持无认证的 `http://host[:port]` CONNECT 服务；UDP（含普通 DNS、QUIC）仍按现有 UDP 路径转发。
+
+`run` 的代理地址相对 box 所在网络环境；Playground 会为宿主 loopback（如 127.0.0.1:8118）建立仅允许所属容器访问的 Docker bridge 转接，不使用 host network。该设置经已有初始化通道交给容器内 box，不写入 Codex 的环境或配置副本。
+
+Playground 兼容工作目录下的 `.agenttomo/playground.json`，例如 `{"proxy":"http://127.0.0.1:8118"}`。优先级为显式命令参数、宿主代理变量、本地配置、默认 `http://127.0.0.1:8118`；它们现在都配置 box 出口，不注入应用。多个不同的代理变量会要求使用 `--proxy` 明确选择；显式空代理变量仍可关闭本地配置和默认值回退，`--no-proxy` 直接关闭全部回退。`run` 不读取这些兼容来源，未传参时直接使用默认值。Task trajectory 的父节点会在收到新的子级活动时闪烁提示，折叠状态同样生效。树节点按稳定 ID 原位更新，实时事件不会替换正在点击的按钮；点击卡片或箭头折叠，右侧图标查看证据。聊天卡片在回答下方显示可折叠执行区，重试与错误在执行区展示。
+
+工具详情的 Request parameters 与 Returned content 展示模型协议中可见的完整参数和返回，分别支持折叠、复制。进程关联按进程实例冻结，时间回退与继承推断会明确标注。终端、浏览器、Traffic、文件预览和原始事件详情继续使用现有入口。协议范围、保留上限和关联边界见[任务设计](../../docs/agent-task-design.md)。
+
+Chat 按首次观察到的顺序穿插回复和工具卡片。卡片默认折叠，展开后按需加载完整参数与返回，并可定位到轨迹详情。流式更新保留选中文字、焦点和展开状态；向上阅读会暂停跟随，点击 Latest 返回最新消息。停止操作立即显示 Stopping，失败时会在输入框没有新草稿的情况下恢复原始任务。
+
 需要能访问本机 Docker daemon，默认使用本地 `agenttomo-playground-chrome:24.04` 镜像并自动启动 Chrome。它基于 Ubuntu 24.04 工具镜像，包含 ifconfig/netstat、ip/ss、curl/wget、dig、nc、jq、strace、Python 和图形桌面组件。首次使用前在仓库根目录构建，需已有 Ubuntu 基础镜像及软件源访问。
 
 ```bash
@@ -44,7 +63,7 @@ cargo run --quiet -p agenttomo-box -- playground
 cargo run --quiet -p agenttomo-box -- playground --listen 0.0.0.0:8080
 
 # 指定本地兼容镜像和日志根目录。
-target/debug/agenttomo-box playground --image my-compatible-image:latest --output-dir .agenttomo/playground
+target/debug/agenttomo-box playground --image my-compatible-image:latest --session-tmpfs-size-mib 512
 ```
 
 默认监听 `127.0.0.1:8080`，输出带随机令牌的访问 URL。页面和 WebSocket 都需要令牌；浏览器 WebSocket 还会校验 Origin。持有该 URL 的用户可以创建并操作容器；本版用于受信用户的诊断环境，没有多用户权限或配额管理。前端资源随二进制内置，运行时无需 Node.js 或 CDN。
@@ -78,9 +97,15 @@ Chrome、其网络服务子进程的真实 PID、文件行为和 HTTP/HTTPS 内�
 
 右侧只展示进程节点与 PID，同一进程各线程的行为合并到一个时间线，不单独展示线程创建/退出。线程创建的子进程直接挂到所属进程；所有已知线程退出后才显示进程结束。节点默认收起，运行中新增可见事件短暂闪烁；展开状态和底部滚动跟随保留。exec 更新同一进程的命令，保留先前历史。TCP 网络记录关联建连发起进程；UDP 多参与者流仍显示未归属并保留参与者列表。点击行为查看原始字段，新记录统一使用 PID。PID 来自采集器 PID namespace 中的 TGID，未知时显示 `—`；进程生命周期标识 process_instance_id 防止把 PID 复用和晚到代理事件归到另一进程。
 
-右侧顶部 Event filters 支持多选具体事件（如 `memory.mmap`、`file.open`）和类别通配符（如 `file.*`），默认全选，提供 Select all / Clear all 和半选状态。过滤行为行时保留进程树、真实状态与耗时，显示可见/保留事件数；新事件沿用当前页面的选择。页面保留最近 1,000 条原始行为及必要祖先，过滤前后的完整日志继续保存在磁盘。
+右侧顶部 Event filters 支持多选具体事件（如 `memory.mmap`、`file.open`）和类别通配符（如 `file.*`），默认全选，提供 Select all / Clear all 和半选状态。过滤行为行时保留进程树、真实状态与耗时，显示可见/保留事件数；新事件沿用当前页面的选择。页面保留最近 1,000 条原始行为及必要祖先，过滤前后的完整日志继续保存在沙箱 tmpfs，直到沙箱销毁。
 
-Shell 退出后禁用输入，后代仍继续采集，直到显示 `Collection complete`。关闭工作区主页面、点击 `New session` 或用 SIGINT/SIGTERM 停止服务，会删除对应的临时容器，日志保留在 `<output-dir>/<session-id>/run/`。外围 `session.json` 记录容器信息，`session-result.json` 记录结束原因及清理结果。主动关闭未完成会话时，内层采集状态可能保留为 `running`，不能视为已完整采集；查看外围结束原因区分中止与完成。SIGKILL 或主机故障无法执行清理，可通过容器标签 `io.agenttomo.playground=true` 定位遗留容器。
+Shell 退出后禁用输入，后代仍继续采集，直到显示 `Collection complete`。运行期间所有诊断记录在容器 tmpfs 的 `/records/<session-id>/run/`；私有 Codex 配置与原生会话在 `/records/codex/`，控制 socket 在 `/records/control/`。宿主机没有可写 bind mount 或配置中转文件。网页通过一条常驻 Docker 标准输入/输出连接读取原有 API，多页监控和内容预览保持可用。单次 Chat 完成或 Stop 不销毁沙箱，仍可继续对话。
+
+`--session-tmpfs-size-mib` 默认 512，是这些数据共用的容量上限，按实际使用量占内存。满时会报告写入失败并结束沙箱，不退回宿主磁盘。不是整个容器的内存限额；系统启用 swap 时 tmpfs 页面可能换出。旧 Playground `--output-dir` 仍接受但不再写入；普通 `run --output-dir` 不变。
+
+采集完成、关闭工作区主页面、点击 `New session` 或用 SIGINT/SIGTERM 停止服务时，删除临时容器及其 tmpfs、可写层；启动失败也走同一清理流程。完成标记只用于排空末尾事件，不保留结束后的录制回放。独立监控页在记录消失后停止读取并显示会话结束；已经加载到浏览器的内容不等于仍有服务端记录。普通 `run` 的输出保留方式不变。
+
+Docker 持久日志关闭，避免终端内容另存。容器删除失败会报告原因。SIGKILL、主机故障无法执行正常清理，可能遗留活容器，可通过容器标签 `io.agenttomo.playground=true` 定位。这里的销毁是文件和容器删除，不承诺磁盘取证级擦除，也不能撤销已经发出的外部请求。
 
 宿主终端连续 Ctrl-C 不会打断 Docker 清理子进程。删除命令异常时会复核容器是否已不存在，避免 daemon 已完成删除但 CLI 被中断时误报失败；真正失败会显示退出码/信号、Docker 错误和复核结果。只清理当前服务自己的会话容器，不删除其他手动启动的容器。
 
@@ -106,7 +131,7 @@ target/debug/agenttomo-box run --capture-http \
 
 点击进程树中的网络连接事件可跳到 Traffic，按连接 ID 查看对应请求；同一连接的多个请求会一起列出，点击 **Show all requests** 解除连接筛选。没有采集到 HTTP 请求时会说明原因。左右工作区与观测区之间可拖拽调宽，也支持方向键和双击恢复默认比例。
 
-Body 默认用 **Decoded** 展示，查看时解压 gzip／deflate 并按 Content-Type 的 charset 解码文本；**Raw / Hex** 可查看保留的原始字节。解压预览最多 1 MiB，压缩内容被截断时仅展示可恢复前缀并标注不完整。解压失败、Brotli／Zstandard 或多层编码暂回到原始字节并说明原因。磁盘保存额度仍按原始正文计量，转发和记录内容保持原样。
+Body 默认用 **Decoded** 展示，查看时解压 gzip／deflate／zstd 并按 Content-Type 的 charset 解码文本；**Raw / Hex** 可查看保留的原始字节。解压预览最多 1 MiB，压缩内容被截断时仅展示可恢复前缀并标注不完整。解压失败、Brotli 或多层编码暂回到原始字节并说明原因。磁盘保存额度按原始正文计量。
 
 点击 **Body** 标题可折叠或展开正文，默认展开；数据刷新、切换 Decoded / Raw 时保留开合状态。收起后仍可切换表示方式和复制内容，原始事件详情继续保留。
 
@@ -182,7 +207,7 @@ UDP 来自 `udp_proxy`：实际上游 send 生成 `network.udp.send`，回包生
 - `run` 的目标使用普通管道，不提供 PTY。需要交互终端时使用 `playground`。
 - 根命令指最初启动的 `/bin/sh -c` 进程。它执行 `exec` 后 PID 不变，仍是同一个根进程；管道里的某个程序退出不等于整个根命令退出。
 - 对前台的 SIGINT/SIGTERM 转发给根命令的进程组。后代自行 `setsid` 离开该组后仍被跟踪，但不再收到该组信号。支持目标的 SIGSTOP/SIGCONT。
-- 当前不做逐进程输出归属、通用文件系统 CoW 隔离、任务总超时或 Agent 语义 trace 关联。OverlayFS 目前只用于可选的 CA 注入；HTTP 正文采集不等同于模型语义解析。
+- 当前不做逐进程输出归属、任务总超时或 Agent 语义 trace 关联。`--overlay-root` 可选覆盖能整目录挂载的一级目录及 `/etc/ssl`，包含子挂载或豁免的目录整体跳过，未覆盖区域仍写入容器原文件系统；详见[覆盖范围](../../docs/root-overlay-design.md)。不开启该参数时，OverlayFS 仅用于可选的 CA 注入。HTTP 正文采集不等同于模型语义解析。
 
 ## 前台与采集器生命周期
 

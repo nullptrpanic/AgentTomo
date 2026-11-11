@@ -52,15 +52,12 @@ pub async fn read(
     let result = tokio::task::spawn_blocking(move || {
         let dir = payload::session_directory(&app.settings.output_dir, &id)?;
         let metadata = read_json(&dir, "session.json")?;
-        let outcome = if running.is_none() {
-            match read_json(&dir, "session-result.json") {
-                Ok(value) => value,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Value::Null,
-                Err(error) => return Err(error),
-            }
-        } else {
-            Value::Null
+        let outcome = match read_json(&dir, "session-result.json") {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Value::Null,
+            Err(error) => return Err(error),
         };
+        let running = running.filter(|_| outcome.is_null());
         let root_pid = running
             .flatten()
             .map_or_else(|| outcome["root_pid"].clone(), |pid| json!(pid));

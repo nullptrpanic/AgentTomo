@@ -46,27 +46,29 @@ fn emit(sender: &mpsc::Sender<Event>, event: Event) -> io::Result<()> {
         .map_err(|_| io::Error::other("collector stopped receiving process events"))
 }
 
+pub struct Launch {
+    pub command: OsString,
+    pub with_terminal: bool,
+    pub capture_files: bool,
+    pub clear_proxy_environment: bool,
+    pub trust_overlay: Option<(std::path::PathBuf, String)>,
+    pub root_overlay: Option<(
+        crate::execution::rootfs::Root,
+        crate::execution::rootfs::Options,
+    )>,
+}
+
 pub fn spawn(
-    command: OsString,
-    with_terminal: bool,
+    launch: Launch,
     sender: mpsc::Sender<Event>,
     registry: crate::network::association::Registry,
     network: oneshot::Sender<crate::network::Endpoints>,
-    capture_files: bool,
-    trust_overlay: Option<(std::path::PathBuf, String)>,
+    agents: crate::agent::Hub,
 ) -> io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("agenttomo-tracer".into())
         .spawn(move || {
-            if let Err(error) = run(
-                command,
-                with_terminal,
-                &sender,
-                registry,
-                network,
-                capture_files,
-                trust_overlay,
-            ) {
+            if let Err(error) = run(launch, &sender, registry, network, agents) {
                 let _ = emit(&sender, Event::Failed(error.to_string()));
             }
             // EXITKILL applies to this tracing thread, including on error/panic.
@@ -74,15 +76,22 @@ pub fn spawn(
 }
 
 fn run(
-    command: OsString,
-    with_terminal: bool,
+    launch: Launch,
     sender: &mpsc::Sender<Event>,
     registry: crate::network::association::Registry,
     network: oneshot::Sender<crate::network::Endpoints>,
-    capture_files: bool,
-    trust_overlay: Option<(std::path::PathBuf, String)>,
+    agents: crate::agent::Hub,
 ) -> io::Result<()> {
-    let root_session = with_terminal && nix::unistd::geteuid().is_root();
+    let Launch {
+        command,
+        with_terminal,
+        capture_files,
+        clear_proxy_environment,
+        trust_overlay,
+        root_overlay,
+    } = launch;
+    let root_session =
+        (with_terminal || root_overlay.is_some()) && nix::unistd::geteuid().is_root();
     if root_session {
         // This thread reads target memory/FDs and spawns the root shell. Only
         // the recording/runtime threads retain the host filesystem identity.
@@ -96,11 +105,22 @@ fn run(
     let (mut control, child_control) = UnixStream::pair()?;
     let mut launch = Command::new(std::env::current_exe()?);
     launch.arg("__tracee").arg("-c").arg(command);
+    if clear_proxy_environment {
+        for name in crate::proxy::outbound::ENVIRONMENT_NAMES {
+            launch.env_remove(name);
+        }
+    }
     if root_session {
         launch.arg("--root-session");
     }
     if let Some((path, _)) = &trust_overlay {
         launch.arg("--trust-overlay").arg(path);
+    }
+    if let Some((root, options)) = &root_overlay {
+        launch
+            .arg("--root-overlay-directory")
+            .arg(root.path())
+            .args(options.arguments());
     }
     let master = if with_terminal {
         let pair = terminal::open()?;
@@ -255,6 +275,7 @@ fn run(
                 known.remove(&pid);
                 newborn.remove(&pid);
                 if let Some(identity) = processes.exit(pid) {
+                    agents.exited(identity);
                     let mut data = json!({"exit_code": code});
                     crate::process::fields(Some(identity), &mut data);
                     emit(
@@ -275,6 +296,7 @@ fn run(
                 known.remove(&pid);
                 newborn.remove(&pid);
                 if let Some(identity) = processes.exit(pid) {
+                    agents.exited(identity);
                     let mut data = json!({"signal": signal as i32, "core_dumped": core_dumped});
                     crate::process::fields(Some(identity), &mut data);
                     emit(
@@ -318,6 +340,10 @@ fn run(
                         };
                         let parent = processes.observe(pid);
                         let child = processes.child(new);
+                        if let (Some(parent), Some(child)) = (parent, child) {
+                            agents.fork(parent.process_instance_id, child.process_instance_id);
+                            agents.track(child)?;
+                        }
                         if parent.is_none() || child.is_none() || parent != child {
                             let mut data = json!({
                                 "parent_pid": parent.map(|p| p.pid),
@@ -337,7 +363,21 @@ fn run(
                         }
                         let identity = processes.exec(pid, old);
                         let mut data = exec_context(pid);
+                        let environment = crate::agent::environment(pid);
+                        agents.exec(
+                            identity.process_instance_id,
+                            &environment,
+                            crate::agent::codex::is_runtime(&data["argv"]),
+                        );
+                        agents.track(identity)?;
+                        if environment
+                            .as_object()
+                            .is_some_and(|values| !values.is_empty())
+                        {
+                            data["correlation_environment"] = environment;
+                        }
                         crate::process::fields(Some(identity), &mut data);
+                        agents.fields(&mut data);
                         emit(
                             sender,
                             Event::Process {

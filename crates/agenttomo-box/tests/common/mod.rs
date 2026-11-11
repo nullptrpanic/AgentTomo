@@ -37,7 +37,7 @@ impl Fixture {
     pub fn command(&self, command: &str) -> Command {
         let mut process = Command::new(env!("CARGO_BIN_EXE_agenttomo-box"));
         process
-            .args(["run", "--output-dir", "run", "-c", command])
+            .args(["run", "--no-proxy", "--output-dir", "run", "-c", command])
             .current_dir(&self.0)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())

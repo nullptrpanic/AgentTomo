@@ -8,6 +8,9 @@ const fields = new Map([
 ]);
 
 export const httpEventField = kind => fields.get(kind);
+// Older recordings prefixed CONNECT's authority with the proxy transport scheme.
+export const httpRequestTarget = (data = {}) => data.method === "CONNECT"
+  ? data.domain || data.url?.replace(/^https?:\/\//i, "") : data.url;
 
 export class TrafficModel {
   constructor(limit = 1000) {
@@ -49,7 +52,7 @@ export class TrafficModel {
     ).filter(row => {
       if (connectionId !== null && row.connectionId !== connectionId) return false;
       const data = row.request?.data || row.latest.data;
-      return !filter || [data.url, data.method, data.pid, row.response?.data.status_code, row.error?.data.error, row.stream?.data.protocol].join(" ").toLowerCase().includes(filter);
+      return !filter || [httpRequestTarget(data), data.method, data.pid, row.response?.data.status_code, row.error?.data.error, row.stream?.data.protocol].join(" ").toLowerCase().includes(filter);
     });
   }
 }

@@ -8,6 +8,13 @@ function entry(id, kind, data = {}, nodeId = "process-1") {
 const tcp = (id, kind, data = {}, owner) => entry(id, kind, { connection_id: 12, destination: "153.3.238.28:443", ...data }, owner);
 const http = (id, kind, data = {}, owner) => tcp(id, `network.http.${kind}`, { request_id: 7, started_unix_ns: 5e6, ...data }, owner);
 
+test("CONNECT cards retain authority-form targets, including older recordings", () => {
+  for (const url of ["www.baidu.com:443", "http://www.baidu.com:443"]) {
+    const [flow] = networkActivities([http(1, "request", {method:"CONNECT",url,domain:"www.baidu.com:443"})]);
+    assert.equal(flow.children[0].title, "CONNECT www.baidu.com:443");
+  }
+});
+
 test("TCP is one parent and each HTTP exchange is one child, with raw evidence retained", () => {
   const entries = [tcp(1, "network.upstream", { status: "connected" }),
     tcp(2, "network.protocol", { domain: "www.baidu.com", protocol: "tls" }),

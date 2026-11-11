@@ -22,6 +22,7 @@ const httpUrl = `http://${bridge}:${fixture.address().port}/chrome-observation`;
 const server = spawn(`${repo}/target/debug/agenttomo-box`, [
   "playground", "--listen", "127.0.0.1:0", "--output-dir", directory,
   "--capture-http",
+  ...(process.env.AGENTTOMO_TEST_ROOT_OVERLAY === "1" ? ["--overlay-root"] : []),
 ], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
 let output = "", errors = "", browser, page, session;
 const events = [], pageErrors = [], warnings = [];
@@ -112,7 +113,16 @@ try {
   const rootPid = events.find(event => event.kind === "process.exec").data.pid;
   assert.match(docker("exec", session.container, "cat", `/proc/${rootPid}/status`), /^Uid:\s+0\s+0\s+0\s+0$/m, "the terminal workload runs as root");
   const ca = docker("exec", session.container, "cat", `/proc/${rootPid}/root/etc/ssl/certs/agenttomo-task-ca.pem`);
-  const nss = docker("exec", session.container, "certutil", "-d", "sql:/tmp/.local/share/pki/nssdb", "-L", "-a", "-n", "AgentTomo task CA");
+  // Inspect the committed public certificate DB through the task's root. NSS
+  // module configuration contains paths in that root, so use an isolated copy
+  // without its pkcs11.txt rather than opening it in Docker's original root.
+  const nss = docker("exec", session.container, "/bin/sh", "-ec", `
+    check=$(mktemp -d)
+    trap 'rm -rf "$check"' EXIT
+    certutil -N --empty-password -d "sql:$check"
+    cp /proc/${rootPid}/root/tmp/.local/share/pki/nssdb/cert9.db "$check/cert9.db"
+    certutil -d "sql:$check" -L -a -n 'AgentTomo task CA'
+  `);
   assert.equal(nss.replace(/\s/g, ""), ca.replace(/\s/g, ""));
   assert.equal(docker("exec", session.container, "cat", "/etc/ssl/certs/ca-certificates.crt").includes(ca), false);
   await page.locator("[data-observation=traffic]").click();
@@ -145,10 +155,13 @@ try {
   await separator.dblclick();
   await until(async () => Math.abs((await page.locator(".terminal-panel").boundingBox()).width - initial.width) < 2);
   await page.locator("#terminal").click();
-  const previewPath = "/tmp/agenttomo-preview-regression.json";
+  const previewPath = "/root/agenttomo-preview-regression.json";
   await page.keyboard.type(`printf '{"preview":"after-browser-startup"}\\n' > ${previewPath}; cat ${previewPath}\n`, { delay: 5 });
   await until(() => events.some(e => e.kind === "file.open" && e.data.path === previewPath && e.data.result >= 0 && (e.data.flags & 3) === 0));
   const previewEvent = events.find(e => e.kind === "file.open" && e.data.path === previewPath && e.data.result >= 0 && (e.data.flags & 3) === 0);
+  if (process.env.AGENTTOMO_TEST_ROOT_OVERLAY === "1") {
+    assert.equal(docker("exec", session.container, "/bin/sh", "-c", `test ! -e ${previewPath} && printf private`).trim(), "private", "terminal writes must not reach the original root");
+  }
   assert.equal(previewEvent.data.preview?.status, "complete", JSON.stringify(previewEvent.data.preview));
   assert.ok(events.some(e => e.kind === "file.open" && e.data.preview?.reused), "repeated file snapshots must reuse storage");
   await page.locator("[data-observation=process]").click();
@@ -173,7 +186,8 @@ try {
 } catch (error) {
   console.error("Playground stderr:", errors);
   if (session) {
-    try { console.error("Chrome log:", docker("exec", session.container, "tail", "-30", "/tmp/agenttomo-chrome.log")); } catch { /* session may already be removed */ }
+    const pid = events.find(event => event.kind === "process.exec")?.data.pid;
+    try { console.error("Chrome log:", docker("exec", session.container, "tail", "-30", pid ? `/proc/${pid}/root/tmp/agenttomo-chrome.log` : "/tmp/agenttomo-chrome.log")); } catch { /* session may already be removed */ }
   }
   throw error;
 } finally {

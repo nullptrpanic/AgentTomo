@@ -71,6 +71,14 @@ impl Store {
 
     pub async fn capture(&mut self, opened: Opened) -> Value {
         let Opened { mut data, content } = opened;
+        if data["resolved_path"].as_str().is_some_and(|path| {
+            path.starts_with("/root/.agenttomo-codex/")
+                || path.starts_with("/root/.agenttomo-config/")
+                || path.starts_with("/records/codex/")
+        }) {
+            data["preview"] = json!({"status":"unavailable","source":"open_snapshot","reason":"agent_private_state"});
+            return data;
+        }
         if self.exclude_task_trust
             && self.limits.enabled()
             && data["resolved_path"].as_str().is_some_and(trust_material)

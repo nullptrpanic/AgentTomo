@@ -8,12 +8,34 @@ pub async fn get(Path(path): Path<String>) -> Response {
     let (mime, content) = match path.as_str() {
         "app.js" => ("text/javascript", include_str!("assets/app.js")),
         "workspace.mjs" => ("text/javascript", include_str!("assets/workspace.mjs")),
+        "agent-model.mjs" => ("text/javascript", include_str!("assets/agent-model.mjs")),
+        "agent-chat.mjs" => ("text/javascript", include_str!("assets/agent-chat.mjs")),
+        "agent-markdown.mjs" => ("text/javascript", include_str!("assets/agent-markdown.mjs")),
+        "agent-view.mjs" => ("text/javascript", include_str!("assets/agent-view.mjs")),
+        "agent.css" => ("text/css", include_str!("assets/agent.css")),
         "observation.mjs" => ("text/javascript", include_str!("assets/observation.mjs")),
         "monitor.mjs" => ("text/javascript", include_str!("assets/monitor.mjs")),
         "panel-resize.mjs" => ("text/javascript", include_str!("assets/panel-resize.mjs")),
         "browser-view.mjs" => ("text/javascript", include_str!("assets/browser-view.mjs")),
         "browser.css" => ("text/css", include_str!("assets/browser.css")),
         "vendor/novnc.mjs" => ("text/javascript", include_str!("assets/vendor/novnc.mjs")),
+        "vendor/marked.mjs" => ("text/javascript", include_str!("assets/vendor/marked.mjs")),
+        "vendor/dompurify.mjs" => (
+            "text/javascript",
+            include_str!("assets/vendor/dompurify.mjs"),
+        ),
+        "vendor/marked-LICENSE.txt" => (
+            "text/plain",
+            include_str!("assets/vendor/marked-LICENSE.txt"),
+        ),
+        "vendor/dompurify-LICENSE.txt" => (
+            "text/plain",
+            include_str!("assets/vendor/dompurify-LICENSE.txt"),
+        ),
+        "vendor/dompurify-LICENSE-MPL.txt" => (
+            "text/plain",
+            include_str!("assets/vendor/dompurify-LICENSE-MPL.txt"),
+        ),
         "vendor/novnc-LICENSE.txt" => (
             "text/plain",
             include_str!("assets/vendor/novnc-LICENSE.txt"),

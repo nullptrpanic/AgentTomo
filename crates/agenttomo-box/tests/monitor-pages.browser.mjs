@@ -34,7 +34,7 @@ const udpDestination = `${bridge}:${udpFixture.address().port}`;
 const server = spawn(`${repo}/target/debug/agenttomo-box`, [
   "playground", "--listen", "127.0.0.1:0", "--output-dir", directory,
   "--image", "agenttomo-playground:24.04", "--capture-http",
-], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+], { detached: true, env: {...process.env, HTTP_PROXY:"", HTTPS_PROXY:"", ALL_PROXY:"", http_proxy:"", https_proxy:"", all_proxy:""}, stdio: ["ignore", "pipe", "pipe"] });
 let output = "", errors = "", browser, owner, monitor, second, url;
 const sessions = [], events = [], pageErrors = [], sockets = [], observed = new Map();
 server.stdout.on("data", bytes => output += bytes);
@@ -82,8 +82,9 @@ async function expandGraph(page, event) {
 try {
   await until(() => { assert.equal(server.exitCode, null, errors); return output.includes("?token="); }, "server start");
   url = output.match(/http:\/\/\S+/)[0];
-  browser = await chromium.launch({ executablePath: process.env.AGENTTOMO_TEST_BROWSER || undefined,
-    headless: true, args: ["--no-sandbox", "--no-proxy-server", "--disable-dev-shm-usage"] });
+  browser = process.env.AGENTTOMO_CDP ? await chromium.connectOverCDP(process.env.AGENTTOMO_CDP)
+    : await chromium.launch({ executablePath: process.env.AGENTTOMO_TEST_BROWSER || undefined,
+      headless: true, args: ["--no-sandbox", "--no-proxy-server", "--disable-dev-shm-usage"] });
   const context = await browser.newContext({ viewport: { width: 1500, height: 950 } });
   context.on("page", page => {
     observed.set(page, []);
@@ -348,7 +349,7 @@ try {
   await second.locator(".traffic-row").filter({ hasText: httpUrl }).first().click();
   await until(async () => (await second.locator(".traffic-body").textContent()).includes("shared-monitor-response"), "HTTP replay after refresh");
   assert.equal(sessions.length, 1);
-  assert.deepEqual(await readdir(directory), [session.id]);
+  assert.deepEqual(await readdir(directory), [], "live recordings must stay in the container");
   console.log("PASS: HTTP inspector and same-session refresh");
 
   // A failed poll must resume from the existing cursor, not create a session.
@@ -386,28 +387,31 @@ try {
   await invalid.close();
   await owner.close();
   await until(async () => await monitor.locator("#status").textContent() === "Session ended", "closing owner ends the existing session");
-  assert.equal(JSON.parse(await readFile(`${directory}/${session.id}/session-result.json`)).container_removed, true);
+  assert.ok(!(await readdir(directory)).includes(session.id), "ended session records must be destroyed");
+  assert.equal(docker("ps", "-a", "--filter", `name=${session.container}`, "--format", "{{.Names}}").trim(), "");
+  assert.match(await monitor.locator("#notice").textContent(), /deleted when the sandbox ends/);
   await monitor.reload();
-  await until(async () => await monitor.locator("#status").textContent() === "Session ended", "archived session can be replayed");
-  assert.ok(Number((await monitor.locator("#event-count").textContent()).replaceAll(",", "")) > 0);
+  await until(async () => await monitor.locator("#status").textContent() === "Session ended", "destroyed session cannot be replayed");
+  assert.equal(Number((await monitor.locator("#event-count").textContent()).replaceAll(",", "")), 0);
   assert.equal(sessions.length, 1);
 
-  // Normal completion still drains the final event before the monitor ends.
+  // Normal completion drains the owner's events, then destroys the recording.
   owner = await context.newPage();
   await owner.goto(url);
   await until(async () => await owner.locator("#status").textContent() === "Connected", "second workspace ready");
   second = await openMonitor(owner);
   await command("exit");
-  await until(async () => await second.locator("#status").textContent() === "Collection complete", "complete monitor");
+  await until(async () => await owner.locator("#status").textContent() === "Collection complete", "owner completion");
+  await until(async () => await second.locator("#status").textContent() === "Session ended", "expired monitor");
   const ended = sessions[1];
-  const journal = (await readFile(`${directory}/${ended.id}/run/events.jsonl`, "utf8")).trim().split("\n").map(JSON.parse);
-  assert.deepEqual(observed.get(second).map(event => event.sequence), journal.map(event => event.sequence), "complete replay includes the last event exactly once");
+  assert.ok(!(await readdir(directory)).includes(ended.id));
   assert.deepEqual(pageErrors, []);
   assert.equal(errors, "");
-  console.log(JSON.stringify({ result: "PASS", checks: ["two icon controls", "independent live monitors", "read-only refresh", "local filters", "shared logical counts", "process/graph TCP and HTTP hierarchy", "live HTTP row identity and focus", "UDP flow aggregation", "process details", "file/traffic navigation", "file preview and raw event", "decoded HTTP body", "retry cursor", "monitor close", "owner cleanup", "archived replay", "final event", "both tracking layouts at 320/390/768 px"], events: events.length }));
+  console.log(JSON.stringify({ result: "PASS", checks: ["two icon controls", "independent live monitors", "read-only refresh", "local filters", "shared logical counts", "process/graph TCP and HTTP hierarchy", "live HTTP row identity and focus", "UDP flow aggregation", "process details", "file/traffic navigation", "file preview and raw event", "decoded HTTP body", "retry cursor", "monitor close", "owner cleanup", "recording destruction and expired monitor", "final event", "both tracking layouts at 320/390/768 px"], events: events.length }));
 } catch (error) {
   console.error("Playground stderr:", errors);
   if (monitor && !monitor.isClosed()) console.error("Monitor state:", await monitor.locator("#file-preview").textContent(), await monitor.locator("#status").textContent());
+  if (second && !second.isClosed()) console.error("Second monitor state:", await second.locator("#status").textContent());
   console.error("Preview events:", JSON.stringify(events.filter(event => event.kind === "file.open" && event.data.path === "/tmp/monitor-preview.txt").map(event => ({sequence:event.sequence, data:event.data}))));
   throw error;
 } finally {

@@ -1,0 +1,129 @@
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":15,"output_index":1,"item":{"type":"custom_tool_call","id":"ctc_codex_shell_sample","call_id":"call_codex_shell_sample","name":"exec","input":"","status":"in_progress"}}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":16,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"const"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":17,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":" result"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":18,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":" ="}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":19,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":" await"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":20,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":" tools"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":21,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":".exec"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":22,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"_command"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":23,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"({"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":24,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"cmd"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":25,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":":"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":26,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":" \""}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":27,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"printf"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":28,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":" '"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":29,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"AG"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":30,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"ENT"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":31,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"T"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":32,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"OMO"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":33,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"_CODE"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":34,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"X"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":35,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"_S"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":36,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"HELL"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":37,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"_PRO"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":38,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"BE"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":39,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"\\\\"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":40,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"n"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":41,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"';"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":42,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":" pwd"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":43,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"\","}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":44,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":" max"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":45,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"_output"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":46,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"_tokens"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":47,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":":"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":48,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":" "}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":49,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"100"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":50,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"0"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":51,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"});\n"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":52,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"text"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":53,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":"(result"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":54,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":".output"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":55,"item_id":"ctc_codex_shell_sample","output_index":1,"delta":");\n"}
+
+event: response.custom_tool_call_input.done
+data: {"type":"response.custom_tool_call_input.done","sequence_number":56,"item_id":"ctc_codex_shell_sample","output_index":1,"input":"const result = await tools.exec_command({cmd: \"printf 'AGENTTOMO_CODEX_SHELL_PROBE\\\\n'; pwd\", max_output_tokens: 1000});\ntext(result.output);\n"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":57,"output_index":1,"item":{"type":"custom_tool_call","id":"ctc_codex_shell_sample","call_id":"call_codex_shell_sample","name":"exec","input":"const result = await tools.exec_command({cmd: \"printf 'AGENTTOMO_CODEX_SHELL_PROBE\\\\n'; pwd\", max_output_tokens: 1000});\ntext(result.output);\n","status":"completed"}}
+

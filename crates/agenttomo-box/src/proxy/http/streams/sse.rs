@@ -12,6 +12,8 @@ pub(in crate::proxy::http) struct Observer {
     start: Option<u128>,
     line_has_bytes: bool,
     skip_lf: bool,
+    model: Option<crate::agent::Observer>,
+    context: MessageContext,
 }
 impl Observer {
     pub fn new(message: &MessageContext, encoding: &str) -> Self {
@@ -26,13 +28,19 @@ impl Observer {
             }
         };
         Self {
-            parser: SseParser::new().max_buffer(1024 * 1024),
+            parser: SseParser::new().max_buffer(if message.agent.is_some() {
+                crate::agent::MAX_CONTENT
+            } else {
+                1024 * 1024
+            }),
             recorder,
             decoder,
             failed,
             start: None,
             line_has_bytes: false,
             skip_lf: false,
+            model: message.model_observer(),
+            context: message.clone(),
         }
     }
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -43,6 +51,9 @@ impl Observer {
         for chunk in bytes.chunks(8192) {
             if let Some(decoder) = &mut decoder {
                 if let Err(error) = inflate::feed(decoder, chunk, &mut |bytes| self.parsed(bytes)) {
+                    if let Some(model) = &self.model {
+                        self.context.semantic(model.failure(&error));
+                    }
                     self.recorder.error(&error);
                     self.failed = true;
                     break;
@@ -85,11 +96,20 @@ impl Observer {
         let before = self.parser.overflows();
         self.parser.feed(bytes);
         if self.parser.overflows() != before {
-            self.recorder
-                .error("SSE block exceeded 1 MiB parser limit; skipped until the next event");
+            if let Some(model) = &self.model {
+                self.context.semantic(model.failure(
+                    "model SSE block exceeded 32 MiB; complete tool evidence is unavailable",
+                ));
+            }
+            self.recorder.error(
+                "SSE block exceeded the configured parser limit; skipped until the next event",
+            );
             self.start = None;
         }
         while let Some(event) = self.parser.next_event() {
+            if let Some(model) = &mut self.model {
+                self.context.semantic(model.event(&event.data));
+            }
             let mut prefix = Prefix::new(self.recorder.store.limits.message_bytes as usize);
             prefix.feed(event.data.as_bytes());
             let mut metadata = prefix.metadata();
@@ -106,7 +126,10 @@ impl Observer {
             self.recorder.record(metadata, prefix.bytes);
         }
     }
-    pub fn finish(&mut self) {
+    pub fn finish(&mut self, complete: bool) {
+        if let Some(model) = &self.model {
+            self.context.semantic(model.finish_response(complete));
+        }
         self.parser.finish();
     }
 }

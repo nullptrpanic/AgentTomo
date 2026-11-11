@@ -47,6 +47,12 @@ CA into its disposable container NSS database; see
 die with the target namespace. Failed setup stops launch with a clear
 error and does not run the target. Capabilities are dropped before target exec.
 
+With `--overlay-root`, the helper overlays [eligible top-level directories plus `/etc/ssl`](root-overlay-design.md).
+The CA/bundle goes into the private SSL view without a second certificate-directory overlay.
+Every trust path, including symlink targets, must actually be covered: paths in skipped directories,
+exemptions or read-only mounts fail startup before injection. Other paths retain the original
+container filesystem. The existing certificate-directory-only overlay remains the default.
+
 Domain certificates last one day, with a five-minute allowance before issuance
 for clock skew. Their CN names the certificate identity. A run-local Moka cache
 holds shared TLS configurations with a fixed one-hour TTL from insertion and a
@@ -128,8 +134,8 @@ the inspector does not display a copy-URL button.
 The inspector defaults to **Decoded** and provides **Raw / Hex** for the retained
 entity bytes. Following Charles's documented [decompress-on-view behavior](https://www.charlesproxy.com/documentation/configuration/preferences/)
 and [compressed-data viewer](https://www.charlesproxy.com/documentation/using-charles/requests-responses/),
-the optional `decode` query on the HTTP body range API decompresses gzip or zlib
-deflate with the existing flate2 dependency, outside the asynchronous runtime.
+the optional `decode` query on the HTTP body range API decompresses gzip, zlib
+deflate or zstd with flate2 and the approved zstd dependency, outside the asynchronous runtime.
 It does not rewrite recorded payloads or proxy traffic. Output is limited to
 1 MiB; `x-agenttomo-decoding` distinguishes complete, incomplete, output-limited,
 invalid and unsupported content. Incomplete streams expose only the recoverable

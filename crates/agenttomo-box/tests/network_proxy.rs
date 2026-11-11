@@ -7,6 +7,76 @@ use std::{
     net::TcpListener,
 };
 
+#[test]
+fn box_proxy_forwards_opaque_tcp_and_preserves_the_application_peer() {
+    let directory = std::env::temp_dir().join(format!("agenttomo-tunnel-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let fixture = Fixture(directory);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+            assert!(headers.len() < 4096);
+        }
+        assert!(headers.starts_with(b"CONNECT 192.0.2.42:2345 HTTP/1.1\r\n"));
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\n\r\n\x00READY\xff")
+            .unwrap();
+        let mut bytes = Vec::new();
+        socket.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, (0..=255).collect::<Vec<u8>>());
+        socket.write_all(&bytes).unwrap();
+    });
+    std::fs::write(
+        fixture.0.join("probe.py"),
+        r#"
+import socket
+s = socket.create_connection(('192.0.2.42', 2345), timeout=5)
+assert s.getpeername() == ('192.0.2.42', 2345)
+f = s.makefile('rb')
+assert f.read(7) == b'\x00READY\xff'
+s.sendall(bytes(range(256)))
+s.shutdown(socket.SHUT_WR)
+assert f.read() == bytes(range(256))
+print('OPAQUE_TCP_OK')
+"#,
+    )
+    .unwrap();
+    let mut command = fixture.command("exec python3 probe.py");
+    command.args(["--proxy", &format!("http://{address}")]);
+    let output = Fixture::wait(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"OPAQUE_TCP_OK\n");
+    server.join().unwrap();
+    let events = fixture.events();
+    let flows: Vec<_> = events
+        .iter()
+        .filter(|event| event["kind"] == "network.transfer")
+        .collect();
+    assert_eq!(flows.len(), 1);
+    assert_eq!(flows[0]["data"]["destination"], "192.0.2.42:2345");
+    assert_eq!(flows[0]["data"]["bytes_up"], 256);
+    assert_eq!(flows[0]["data"]["bytes_down"], 263);
+    assert!(flows[0]["data"]["pid"].is_number());
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"].as_str().unwrap().starts_with("network.http"))
+    );
+}
+
 fn check_ipv6_route_availability(with_route: bool) {
     let fixture = Fixture::compile("transparent");
     let setup = if with_route {

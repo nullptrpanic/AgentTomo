@@ -12,6 +12,11 @@ export function followMonitor({ id, token, onMessage }) {
       url.searchParams.set("token", token);
       url.searchParams.set("offset", offset);
       const response = await fetch(url, { cache: "no-store", signal: controller.signal });
+      if (response.status === 404) {
+        onMessage({ type: "monitor_expired" });
+        stop();
+        return;
+      }
       if (!response.ok) {
         const error = new Error(`Cannot read this session's recording (HTTP ${response.status}).`);
         error.fatal = response.status >= 400 && response.status < 500;

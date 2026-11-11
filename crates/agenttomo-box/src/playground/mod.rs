@@ -1,12 +1,15 @@
 //! Owner WebSockets manage Docker sessions; monitor pages only read their journals.
 
+mod agent_egress;
 mod assets;
+pub(crate) mod bridge;
 mod desktop;
 mod docker;
 mod monitor;
 #[cfg(test)]
 mod monitor_tests;
 mod payload;
+pub(crate) mod sandbox;
 mod session;
 mod streams;
 mod trace_feed;
@@ -34,9 +37,13 @@ struct Settings {
     image_id: String,
     binary: PathBuf,
     output_dir: PathBuf,
+    session_tmpfs_size_mib: u32,
     token: String,
     file_preview: crate::recording::file_preview::Limits,
     http: crate::proxy::http::Options,
+    rootfs: crate::execution::rootfs::Options,
+    codex: Option<crate::agent::codex::Installation>,
+    proxy: Option<crate::proxy::outbound::Proxy>,
 }
 
 #[derive(Clone)]
@@ -46,6 +53,9 @@ struct App {
     sessions: TaskTracker,
     desktops: Arc<Mutex<HashMap<String, CancellationToken>>>,
     running: Arc<Mutex<HashMap<String, Option<i32>>>>,
+    proxy_peers: agent_egress::Peers,
+    // None only inside the container read service (and filesystem API tests).
+    bridges: Option<Arc<Mutex<HashMap<String, bridge::Client>>>>,
 }
 
 #[derive(Deserialize)]
@@ -62,26 +72,41 @@ impl Access {
 pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
     let image_id = docker::check(&options.image).await?;
     let browser = docker::supports_browser(&image_id).await?;
-    tokio::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&options.output_dir)
-        .await?;
+    let shutdown = CancellationToken::new();
+    let proxy_peers = agent_egress::Peers::default();
+    let codex = crate::agent::codex::Installation::discover();
+    let proxy = agent_egress::configure(
+        options.proxy,
+        options.no_proxy,
+        proxy_peers.clone(),
+        shutdown.clone(),
+    )
+    .await?;
+    let mut http = options.http.options();
+    if codex.is_some() {
+        http.enabled = true;
+    }
     let app = App {
         settings: Arc::new(Settings {
             browser,
             image: options.image,
             image_id,
             binary: std::fs::canonicalize(std::env::current_exe()?)?,
-            output_dir: tokio::fs::canonicalize(options.output_dir).await?,
+            output_dir: options.output_dir,
+            session_tmpfs_size_mib: options.session_tmpfs_size_mib,
             token: uuid::Uuid::new_v4().simple().to_string(),
             file_preview: options.file_preview.limits(),
-            http: options.http.options(),
+            http,
+            rootfs: options.rootfs.options(),
+            codex,
+            proxy,
         }),
-        shutdown: CancellationToken::new(),
+        shutdown,
         sessions: TaskTracker::new(),
         desktops: Default::default(),
         running: Default::default(),
+        proxy_peers,
+        bridges: Some(Default::default()),
     };
     let listener = tokio::net::TcpListener::bind(options.listen).await?;
     let address = listener.local_addr()?;
@@ -106,9 +131,20 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
 }
 
 fn router(app: App) -> Router {
-    Router::new()
+    records_router()
+        .route_layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            bridge::forward,
+        ))
         .route("/", get(index))
         .route("/ws", get(websocket))
+        .route("/api/sessions/{session}/desktop", get(desktop::websocket))
+        .route("/assets/{*path}", get(assets::get))
+        .with_state(app)
+}
+
+fn records_router() -> Router<App> {
+    Router::new()
         .route("/api/sessions/{session}/events", get(monitor::read))
         .route(
             "/api/sessions/{session}/file-preview",
@@ -116,12 +152,17 @@ fn router(app: App) -> Router {
         )
         .route("/api/sessions/{session}/http-body", get(payload::http_body))
         .route(
+            "/api/sessions/{session}/agent-payload",
+            get(payload::agent_payload),
+        )
+        .route(
             "/api/sessions/{session}/stream-messages",
             get(streams::read),
         )
-        .route("/api/sessions/{session}/desktop", get(desktop::websocket))
-        .route("/assets/{*path}", get(assets::get))
-        .with_state(app)
+}
+
+fn valid_session(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 async fn index(State(app): State<App>, Query(access): Query<Access>) -> Response {
@@ -161,8 +202,8 @@ async fn websocket(
     // still completing their WebSocket handshake as well as active containers.
     let tracked = app.sessions.token();
     upgrade
-        .max_message_size(16 * 1024)
-        .max_frame_size(16 * 1024)
+        .max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
         .on_upgrade(move |socket| async move {
             let _tracked = tracked;
             session::serve(socket, app).await;
@@ -228,14 +269,20 @@ mod tests {
                 image_id: String::new(),
                 binary: PathBuf::new(),
                 output_dir: directory.clone(),
+                session_tmpfs_size_mib: 512,
                 token: "test-token".into(),
                 file_preview: Default::default(),
                 http: Default::default(),
+                rootfs: Default::default(),
+                codex: None,
+                proxy: None,
             }),
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
             desktops: Default::default(),
             running: Default::default(),
+            proxy_peers: Default::default(),
+            bridges: None,
         };
         let router = router(app);
         let base = format!("/api/sessions/{id}/stream-messages");
@@ -329,14 +376,20 @@ mod tests {
                 image_id: String::new(),
                 binary: PathBuf::new(),
                 output_dir: directory.clone(),
+                session_tmpfs_size_mib: 512,
                 token: "test-token".into(),
                 file_preview: Default::default(),
                 http: Default::default(),
+                rootfs: Default::default(),
+                codex: None,
+                proxy: None,
             }),
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
             desktops: Default::default(),
             running: Default::default(),
+            proxy_peers: Default::default(),
+            bridges: None,
         };
         let router = router(app);
         let base = format!("/api/sessions/{id}/{endpoint}");
@@ -493,14 +546,20 @@ mod tests {
                 image_id: String::new(),
                 binary: PathBuf::new(),
                 output_dir: PathBuf::new(),
+                session_tmpfs_size_mib: 512,
                 token: "test-token".into(),
                 file_preview: Default::default(),
                 http: Default::default(),
+                rootfs: Default::default(),
+                codex: None,
+                proxy: None,
             }),
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
             desktops: Default::default(),
             running: Default::default(),
+            proxy_peers: Default::default(),
+            bridges: None,
         };
         let router = router(app);
         for (path, expected) in [

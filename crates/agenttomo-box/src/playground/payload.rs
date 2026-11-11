@@ -65,6 +65,22 @@ pub async fn http_body(
     .await
 }
 
+pub async fn agent_payload(
+    State(app): State<App>,
+    Path(session): Path<String>,
+    Query(range): Query<Range>,
+) -> Response {
+    read(
+        app,
+        session,
+        range,
+        crate::agent::store::PAYLOAD_FILE,
+        crate::agent::MAX_CONTENT as u32,
+        None,
+    )
+    .await
+}
+
 async fn read(
     app: App,
     session: String,

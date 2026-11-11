@@ -116,6 +116,7 @@ async fn write(
             Some("file") => "file",
             Some("process") => "process",
             Some("memory") => "memory",
+            Some("agent") => "agent",
             _ => "other",
         };
         let mut bytes = serde_json::to_vec(&json!({

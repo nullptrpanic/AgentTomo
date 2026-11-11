@@ -1,4 +1,4 @@
-# Browser and terminal dependencies
+# Browser, terminal and Markdown dependencies
 
 Unmodified npm distribution files from the official npm registry:
 
@@ -28,3 +28,18 @@ esbuild node_modules/@novnc/novnc/core/rfb.js --bundle --format=esm \
 ```
 
 The application serves the bundle locally; browser sessions do not use a CDN.
+
+## Markdown
+
+Completed assistant messages use the unmodified npm ES modules:
+
+- `marked` 18.2.0, MIT; `lib/marked.esm.js` is vendored as `marked.mjs`.
+  Source: https://registry.npmjs.org/marked/-/marked-18.2.0.tgz
+- `dompurify` 3.4.17, Apache-2.0 OR MPL-2.0; `dist/purify.es.mjs` is
+  vendored as `dompurify.mjs`. Both license texts are included alongside it.
+  Source: https://registry.npmjs.org/dompurify/-/dompurify-3.4.17.tgz
+
+Refresh with `npm pack` as above and copy those files and licenses unchanged.
+Both modules are embedded and served locally. `agent-markdown.mjs` sanitizes
+parsed output to passive formatting and links; it does not allow scripts,
+forms, embedded media, or model-controlled styles.

@@ -44,13 +44,17 @@ fn respond(mut stream: impl Read + Write) {
 
 fn check_capture(fixture: &Fixture, scheme: &str) {
     let events = fixture.events();
+    let request = events
+        .iter()
+        .find(|event| event["kind"] == "network.http.request" && event["data"]["method"] == "POST")
+        .unwrap()["data"]
+        .clone();
     let event = |kind| -> &Value {
         events
             .iter()
-            .find(|e| e["kind"] == kind)
+            .find(|e| e["kind"] == kind && e["data"]["request_id"] == request["request_id"])
             .unwrap_or_else(|| panic!("missing {kind}: {events:?}"))
     };
-    let request = &event("network.http.request")["data"];
     assert_eq!(request["method"], "POST");
     assert_eq!(request["scheme"], scheme);
     assert!(request["pid"].is_number());
@@ -112,7 +116,75 @@ fn http_prefix_limits_do_not_truncate_forwarded_requests_or_responses() {
 }
 
 #[test]
+fn box_proxy_tunnels_http_without_application_proxy_settings() {
+    let fixture = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let headers = String::from_utf8(read_headers(&mut stream)).unwrap();
+        assert!(
+            headers.starts_with("CONNECT origin.test:80 HTTP/1.1\r\n"),
+            "{headers}"
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .unwrap();
+        respond(stream);
+    });
+    let mut command = fixture.command(
+        "test -z \"${HTTP_PROXY}${HTTPS_PROXY}${ALL_PROXY}${http_proxy}${https_proxy}${all_proxy}\" && exec curl --resolve origin.test:80:192.0.2.42 --max-time 10 -fsS -d hello-upload http://origin.test/echo",
+    );
+    // A conflicting inherited application setting must not create a second tunnel.
+    command.env("HTTPS_PROXY", "http://127.0.0.1:1").args([
+        "--proxy",
+        &format!("http://{proxy}"),
+        "--capture-http",
+        "--http-body-max-bytes",
+        "4",
+        "--http-body-total-bytes",
+        "8",
+    ]);
+    let output = Fixture::wait(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"hello-response");
+    server.join().unwrap();
+    check_capture(&fixture, "http");
+    let events = fixture.events();
+    assert!(
+        !events.iter().any(|e| e["data"]["method"] == "CONNECT"),
+        "box's transport is not an application request"
+    );
+    let upstream = events
+        .iter()
+        .find(|e| e["kind"] == "network.upstream")
+        .unwrap();
+    assert_eq!(upstream["data"]["destination"], "192.0.2.42:80");
+}
+
+#[test]
 fn https_uses_overlay_trust_without_changing_the_original_bundle() {
+    check_https_inspection(false, false);
+}
+
+#[test]
+fn https_connect_tunnels_preserve_no_sni_target_identity_and_capture_inner_http() {
+    check_https_inspection(true, false);
+}
+
+#[test]
+fn box_proxy_tunnels_https_with_overlay_ca_and_no_application_connect_event() {
+    check_https_inspection(false, true);
+}
+
+fn check_https_inspection(tunnel: bool, box_proxy: bool) {
     let before = std::fs::read("/etc/ssl/certs/ca-certificates.crt").unwrap();
     let fixture = fixture();
     let mut ca = rcgen::CertificateParams::default();
@@ -122,10 +194,11 @@ fn https_uses_overlay_trust_without_changing_the_original_bundle() {
     let trust = fixture.0.join("upstream-ca.pem");
     std::fs::write(&trust, ca_cert.pem()).unwrap();
     let leaf_key = rcgen::KeyPair::generate().unwrap();
-    let leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .unwrap()
-        .signed_by(&leaf_key, &rcgen::Issuer::new(ca, ca_key))
-        .unwrap();
+    let leaf =
+        rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.2".to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &rcgen::Issuer::new(ca, ca_key))
+            .unwrap();
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
@@ -136,14 +209,39 @@ fn https_uses_overlay_trust_without_changing_the_original_bundle() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
+        if tunnel || box_proxy {
+            let expected = if box_proxy {
+                "CONNECT localhost:443 HTTP/1.1"
+            } else {
+                "CONNECT 127.0.0.2:"
+            };
+            assert!(String::from_utf8_lossy(&read_headers(&mut stream)).starts_with(expected));
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .unwrap();
+        }
         let connection = rustls::ServerConnection::new(std::sync::Arc::new(config)).unwrap();
         respond(rustls::StreamOwned::new(connection, stream));
     });
-    let mut command = fixture.command(&format!("exec env -u SSL_CERT_FILE curl --noproxy '*' --resolve localhost:{port}:127.0.0.1 --max-time 10 -fsS -d hello-upload https://localhost:{port}/echo"));
+    let curl = if tunnel {
+        format!(
+            "exec env -u SSL_CERT_FILE curl --noproxy '' --proxy http://127.0.0.1:{port} --max-time 10 -fsS -d hello-upload https://127.0.0.2:{port}/echo"
+        )
+    } else if box_proxy {
+        "exec env -u SSL_CERT_FILE curl --resolve localhost:443:192.0.2.42 --max-time 10 -fsS -d hello-upload https://localhost/echo".to_owned()
+    } else {
+        format!(
+            "exec env -u SSL_CERT_FILE curl --noproxy '*' --resolve localhost:{port}:127.0.0.1 --max-time 10 -fsS -d hello-upload https://localhost:{port}/echo"
+        )
+    };
+    let mut command = fixture.command(&curl);
+    if box_proxy {
+        command.args(["--proxy", &format!("http://127.0.0.1:{port}")]);
+    }
     command.env("SSL_CERT_FILE", trust).args([
         "--capture-http",
         "--http-body-max-bytes",
@@ -160,6 +258,32 @@ fn https_uses_overlay_trust_without_changing_the_original_bundle() {
     assert_eq!(output.stdout, b"hello-response");
     server.join().unwrap();
     check_capture(&fixture, "https");
+    if box_proxy {
+        let events = fixture.events();
+        assert!(!events.iter().any(|e| e["data"]["method"] == "CONNECT"));
+        assert!(events.iter().any(|e| e["kind"] == "network.protocol"
+            && e["data"]["domain"] == "localhost"
+            && e["data"]["destination"] == "192.0.2.42:443"));
+    }
+    if tunnel {
+        let events = fixture.events();
+        let connect = events
+            .iter()
+            .find(|event| {
+                event["kind"] == "network.http.request" && event["data"]["method"] == "CONNECT"
+            })
+            .unwrap();
+        assert_eq!(connect["data"]["url"], format!("127.0.0.2:{port}"));
+        for event in events
+            .iter()
+            .filter(|event| event["data"]["request_id"] == connect["data"]["request_id"])
+        {
+            assert!(
+                event["data"].get("scheme").is_none(),
+                "CONNECT has no URI scheme: {event}"
+            );
+        }
+    }
     assert_eq!(
         std::fs::read("/etc/ssl/certs/ca-certificates.crt").unwrap(),
         before
