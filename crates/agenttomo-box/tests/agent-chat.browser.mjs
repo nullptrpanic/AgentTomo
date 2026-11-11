@@ -8,6 +8,7 @@ import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { zstdDecompressSync } from "node:zlib";
+import { assertSandboxSecretsAbsent } from "./credential-scan.mjs";
 
 const { chromium } = await import(process.env.AGENTTOMO_PLAYWRIGHT_MODULE || "playwright");
 const repo = fileURLToPath(new URL("../../..", import.meta.url));
@@ -15,10 +16,12 @@ const directory = await mkdtemp(`${tmpdir()}/agenttomo-agent-chat-`);
 const docker = (...args) => execFileSync("docker", args, { encoding:"utf8", timeout:15000 });
 const gateway = JSON.parse(docker("network", "inspect", "bridge"))[0].IPAM.Config[0].Gateway;
 let step = 0, holdResponses = false, recovering = false, rejectResponses = false;
-const requests = [], responses = [], observed = [];
+const requests = [], responses = [], observed = [], modelAuthorization = [];
+const hostCredential = "agenttomo-test-key-never-used-remotely";
 const fixture = createServer(async (req, res) => {
   if (req.url.startsWith("/resource")) { res.end("RESOURCE_EVIDENCE"); return; }
   if (!req.url.endsWith("/responses")) { res.writeHead(404); res.end(); return; }
+  modelAuthorization.push(req.headers.authorization);
   const chunks = []; for await (const chunk of req) chunks.push(chunk);
   let bytes = Buffer.concat(chunks);
   if (req.headers["content-encoding"] === "zstd") bytes = zstdDecompressSync(bytes);
@@ -75,8 +78,9 @@ upstreamProxy.on("connect", (req, client, head) => {
 });
 upstreamProxy.listen(0,"127.0.0.1"); await once(upstreamProxy,"listening");
 const home = `${directory}/codex-home`; await mkdir(home);
-await writeFile(`${home}/auth.json`, JSON.stringify({OPENAI_API_KEY:"agenttomo-test-key-never-used-remotely"}));
-await writeFile(`${home}/config.toml`, `model = "gpt-6-astra"\nmodel_provider = "local_fixture"\n[model_providers.local_fixture]\nname = "Local fixture"\nbase_url = "http://${destination}/v1"\nwire_api = "responses"\nsupports_websockets = false\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n[features]\nplugins = false\n`);
+const hostAuth = JSON.stringify({OPENAI_API_KEY:hostCredential});
+await writeFile(`${home}/auth.json`, hostAuth);
+await writeFile(`${home}/config.toml`, `model = "gpt-6-astra"\nmodel_provider = "local_fixture"\n[model_providers.local_fixture]\nname = "Local fixture"\nbase_url = "http://${destination}/v1"\nwire_api = "responses"\nsupports_websockets = false\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n[features]\nplugins = false\n`);
 const originalHome = Object.fromEntries(await Promise.all((await readdir(home)).map(async name => [name,await readFile(`${home}/${name}`,"utf8")])));
 const server = spawn(`${repo}/target/debug/agenttomo-box`, ["playground","--listen","127.0.0.1:0","--image","agenttomo-playground:24.04","--proxy",`http://127.0.0.1:${upstreamProxy.address().port}`,"--output-dir",`${directory}/sessions`, ...(process.env.AGENTTOMO_TEST_ROOT_OVERLAY === "1" ? ["--overlay-root"] : [])], {
   env:{...process.env,CODEX_HOME:home,HTTP_PROXY:"http://127.0.0.1:1",HTTPS_PROXY:"http://127.0.0.1:1",ALL_PROXY:"http://127.0.0.1:1",http_proxy:"",https_proxy:"",all_proxy:"",NO_PROXY:"*"}, stdio:["ignore","pipe","pipe"], detached:true,
@@ -120,6 +124,12 @@ try {
   assert.ok(docker("exec",session.container,"ls",`/records/${session.id}/run`).includes("agent-payloads.bin"),"evidence stays available in the live sandbox");
   assert.ok(docker("exec",session.container,"ls","/records/codex").includes("sessions"),"native Codex continuation lives inside the sandbox");
   assert.equal(requests.length,3);
+  assert.ok(modelAuthorization.every(value => value === `Bearer ${hostCredential}`), "host gateway authenticates model requests upstream");
+  assert.ok(!JSON.stringify(observed).includes(hostCredential), "the host credential cannot appear in captured evidence");
+  assert.ok(!docker("exec",session.container,"cat","/records/codex/auth.json").includes(hostCredential), "sandbox authentication uses placeholders");
+  assert.ok(!docker("exec",session.container,"cat","/records/codex/agenttomo-environment.json").includes(hostCredential));
+  assert.equal(await readFile(`${home}/auth.json`,"utf8"),hostAuth,"host login stays read-only");
+  await assertSandboxSecretsAbsent(session.container, [hostCredential]);
   const taskConnections = observed.filter(event=>event.kind==="network.upstream" && event.data.destination===destination && event.data.status==="connected");
   assert.ok(taskConnections.length >= 2,"model and tool open separate TCP flows");
   assert.equal(tunnels.filter(authority=>authority===destination).length,taskConnections.length,"every model/tool flow uses one box-owned CONNECT tunnel");
@@ -230,6 +240,8 @@ try {
   await until(()=>observed.filter(event=>event.kind==='agent.task.finished').length>beforeRecovery,90000);
   assert.equal(observed.filter(event=>event.kind==='agent.task.finished').at(-1).data.exit_code,0,"new sandbox accepts and completes the retained draft");
   assert.deepEqual(pageErrors,[]);
+  assert.ok(modelAuthorization.every(value => value === `Bearer ${hostCredential}`));
+  assert.ok(!JSON.stringify(observed).includes(hostCredential));
   if(process.env.AGENTTOMO_TEST_ARTIFACTS) { await mkdir(process.env.AGENTTOMO_TEST_ARTIFACTS,{recursive:true}); await page.screenshot({path:`${process.env.AGENTTOMO_TEST_ARTIFACTS}/agent-chat.png`}); await writeFile(`${process.env.AGENTTOMO_TEST_ARTIFACTS}/agent-events.json`,JSON.stringify(observed)); }
   console.log(JSON.stringify({passed:true,modelRequests:requests.length,proxyTunnels:tunnels.length,toolId:tool.data.agenttomo_toolcall_id,processPid:command.data.pid,events:observed.length,cancelled:true,disconnectionRecovery:true}));
 } catch (error) {

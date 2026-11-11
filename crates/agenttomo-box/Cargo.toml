@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+base64.workspace = true
 axum.workspace = true
 clap.workspace = true
 futures-util.workspace = true
@@ -18,6 +19,7 @@ hyper-util.workspace = true
 moka.workspace = true
 psl.workspace = true
 time.workspace = true
+toml.workspace = true
 rcgen.workspace = true
 rustls-native-certs.workspace = true
 tokio-rustls.workspace = true

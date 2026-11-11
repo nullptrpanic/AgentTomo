@@ -3,7 +3,7 @@ pub mod http;
 pub mod outbound;
 mod replay;
 pub mod tcp;
-mod tls;
+pub(crate) mod tls;
 pub mod udp;
 
 pub trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}

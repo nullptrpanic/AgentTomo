@@ -13,6 +13,7 @@ pub struct Bootstrap {
     pub metadata: Value,
     pub configuration: BTreeMap<String, String>,
     pub proxy: Option<crate::proxy::outbound::Proxy>,
+    pub proxy_ca: Option<String>,
 }
 
 pub async fn send(output: &mut (impl AsyncWrite + Unpin), bootstrap: &Bootstrap) -> io::Result<()> {
@@ -60,6 +61,18 @@ pub async fn initialize(id: &str) -> io::Result<Option<crate::proxy::outbound::P
         .mode(0o777)
         .create(Path::new(ROOT).join("control"))
         .await?;
+    if let Some(certificate) = bootstrap.proxy_ca {
+        let mut bundle = tokio::fs::read("/etc/ssl/certs/ca-certificates.crt").await?;
+        bundle.push(b'\n');
+        bundle.extend_from_slice(certificate.as_bytes());
+        let mut file = crate::recording::create_log(
+            Path::new(ROOT).join("control").as_path(),
+            "upstream-certs.pem",
+        )
+        .await?;
+        file.write_all(&bundle).await?;
+        file.flush().await?;
+    }
     for (name, contents) in bootstrap.configuration {
         if !crate::agent::codex::configuration_file(&name) && name != "agenttomo-environment.json" {
             return Err(io::Error::other("invalid configuration filename"));

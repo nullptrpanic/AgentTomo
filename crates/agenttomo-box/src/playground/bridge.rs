@@ -229,6 +229,7 @@ pub async fn serve(id: &str) -> io::Result<()> {
             rootfs: Default::default(),
             codex: None,
             proxy: None,
+            credential_gateway: None,
         }),
         shutdown: Default::default(),
         sessions: tokio_util::task::TaskTracker::new(),

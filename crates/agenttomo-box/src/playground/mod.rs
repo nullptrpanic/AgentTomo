@@ -44,6 +44,7 @@ struct Settings {
     rootfs: crate::execution::rootfs::Options,
     codex: Option<crate::agent::codex::Installation>,
     proxy: Option<crate::proxy::outbound::Proxy>,
+    credential_gateway: Option<Arc<crate::agent::codex::credentials::gateway::Gateway>>,
 }
 
 #[derive(Clone)]
@@ -75,11 +76,16 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
     let shutdown = CancellationToken::new();
     let proxy_peers = agent_egress::Peers::default();
     let codex = crate::agent::codex::Installation::discover();
+    let credential_gateway = codex
+        .as_ref()
+        .map(|_| crate::agent::codex::credentials::gateway::Gateway::new().map(Arc::new))
+        .transpose()?;
     let proxy = agent_egress::configure(
         options.proxy,
         options.no_proxy,
         proxy_peers.clone(),
         shutdown.clone(),
+        credential_gateway.clone(),
     )
     .await?;
     let mut http = options.http.options();
@@ -100,6 +106,7 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
             rootfs: options.rootfs.options(),
             codex,
             proxy,
+            credential_gateway,
         }),
         shutdown,
         sessions: TaskTracker::new(),
@@ -276,6 +283,7 @@ mod tests {
                 rootfs: Default::default(),
                 codex: None,
                 proxy: None,
+                credential_gateway: None,
             }),
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
@@ -383,6 +391,7 @@ mod tests {
                 rootfs: Default::default(),
                 codex: None,
                 proxy: None,
+                credential_gateway: None,
             }),
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
@@ -553,6 +562,7 @@ mod tests {
                 rootfs: Default::default(),
                 codex: None,
                 proxy: None,
+                credential_gateway: None,
             }),
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),

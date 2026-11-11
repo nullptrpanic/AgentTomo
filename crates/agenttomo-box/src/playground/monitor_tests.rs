@@ -34,6 +34,7 @@ impl Fixture {
                 rootfs: Default::default(),
                 codex: None,
                 proxy: None,
+                credential_gateway: None,
             }),
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),

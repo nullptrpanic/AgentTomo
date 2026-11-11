@@ -201,6 +201,8 @@ pub async fn create(options: Create<'_>) -> io::Result<()> {
             .arg("--env")
             .arg("AGENTTOMO_WORKSPACE=1")
             .arg("--env")
+            .arg("SSL_CERT_FILE=/records/control/upstream-certs.pem")
+            .arg("--env")
             .arg(format!("AGENTTOMO_AGENT_ID={agent_id}"));
     }
     let output = execute(

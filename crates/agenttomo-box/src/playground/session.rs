@@ -35,11 +35,20 @@ pub async fn serve(mut socket: WebSocket, app: App) {
         .insert(id.clone(), None);
     let result = async {
         let configuration = match &app.settings.codex {
-            Some(codex) => codex.snapshot().await?,
+            Some(codex) => {
+                let prepared = codex.snapshot().await?;
+                app.settings.credential_gateway.as_ref().ok_or_else(|| io::Error::other("host credential gateway is unavailable"))?.register(name.clone(), prepared.policy);
+                prepared.files
+            },
             None => Default::default(),
         };
         let metadata = json!({"session_id":id,"container":name,"image":app.settings.image,"browser":app.settings.browser,"http_capture":app.settings.http.enabled,"agent_available":app.settings.codex.is_some()});
-        let bootstrap = sandbox::Bootstrap { metadata, configuration, proxy: app.settings.proxy.clone() };
+        let bootstrap = sandbox::Bootstrap {
+            metadata,
+            configuration,
+            proxy: app.settings.proxy.clone(),
+            proxy_ca: app.settings.credential_gateway.as_ref().map(|gateway| gateway.certificate()),
+        };
         socket
             .send(WsMessage::Text(
                 json!({"type":"session","id":id,"container":name,"image":app.settings.image,"http_capture":app.settings.http.enabled,"browser":app.settings.browser,"agent_available":app.settings.codex.is_some()})
@@ -75,6 +84,9 @@ pub async fn serve(mut socket: WebSocket, app: App) {
 
     if let Some(lifetime) = app.desktops.lock().expect("desktop registry").remove(&id) {
         lifetime.cancel();
+    }
+    if let Some(gateway) = &app.settings.credential_gateway {
+        gateway.remove(&name);
     }
     let cleanup = docker::remove(&name).await;
     app.proxy_peers.remove(&name);

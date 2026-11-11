@@ -1,4 +1,5 @@
 //! Reach a host-loopback proxy from owned Docker sessions without host networking.
+use crate::agent::codex::credentials::gateway::Gateway;
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -93,6 +94,14 @@ impl Peers {
             .values()
             .any(|peers| peers.contains(&ip))
     }
+    fn owner(&self, ip: IpAddr) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, peers)| peers.contains(&ip))
+            .map(|(owner, _)| owner.clone())
+    }
 }
 
 pub async fn configure(
@@ -100,11 +109,11 @@ pub async fn configure(
     disabled: bool,
     peers: Peers,
     shutdown: CancellationToken,
+    gateway: Option<Arc<Gateway>>,
 ) -> io::Result<Option<crate::proxy::outbound::Proxy>> {
-    if disabled {
-        return Ok(None);
-    }
-    let proxy = if let Some(proxy) = explicit {
+    let proxy = if disabled {
+        None
+    } else if let Some(proxy) = explicit {
         Some(proxy)
     } else {
         let inherited: Vec<_> = crate::proxy::outbound::ENVIRONMENT_NAMES
@@ -139,6 +148,22 @@ pub async fn configure(
         // Preserve an explicitly empty inherited override as direct mode.
         selected.or_else(|| (!has_override).then(Default::default))
     };
+    if let Some(gateway) = gateway {
+        let listener = TcpListener::bind(SocketAddr::new(bridge_gateway().await?, 0)).await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(credential_relay(
+            listener,
+            proxy,
+            peers,
+            gateway,
+            shutdown.child_token(),
+        ));
+        return Ok(Some(
+            format!("http://{address}")
+                .parse()
+                .map_err(io::Error::other)?,
+        ));
+    }
     let Some(proxy) = proxy else { return Ok(None) };
     let host = proxy.host();
     let loopback = host.eq_ignore_ascii_case("localhost")
@@ -158,6 +183,27 @@ pub async fn configure(
             .parse()
             .map_err(io::Error::other)?,
     ))
+}
+
+async fn credential_relay(
+    listener: TcpListener,
+    proxy: Option<crate::proxy::outbound::Proxy>,
+    peers: Peers,
+    gateway: Arc<Gateway>,
+    shutdown: CancellationToken,
+) {
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => {
+                let Ok((client, source)) = accepted else { break };
+                let Some(owner) = peers.owner(source.ip()) else { continue };
+                connections.spawn(gateway.clone().serve(client, owner, proxy.clone(), shutdown.child_token()));
+            },
+            _ = connections.join_next(), if !connections.is_empty() => {},
+        }
+    }
 }
 
 async fn bridge_gateway() -> io::Result<IpAddr> {

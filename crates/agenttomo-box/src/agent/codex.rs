@@ -1,4 +1,5 @@
 //! The only adapter that knows Codex installation, configuration and CLI flags.
+pub mod credentials;
 use std::{
     io,
     path::{Path, PathBuf},
@@ -63,8 +64,8 @@ impl Installation {
         None
     }
 
-    /// Copy only configuration into memory; never stage credentials on host disk.
-    pub async fn snapshot(&self) -> io::Result<std::collections::BTreeMap<String, String>> {
+    /// Prepare sandbox configuration and keep authentication grants on the host.
+    pub async fn snapshot(&self) -> io::Result<credentials::Prepared> {
         let mut files = std::collections::BTreeMap::new();
         let mut total = 0;
         let entries = match std::fs::read_dir(&self.home) {
@@ -98,17 +99,7 @@ impl Installation {
                 );
             }
         }
-        let mut environment = Vec::new();
-        for name in ["OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"] {
-            if let Ok(value) = std::env::var(name) {
-                environment.push((name.to_owned(), value));
-            }
-        }
-        files.insert(
-            "agenttomo-environment.json".into(),
-            serde_json::to_string(&environment)?,
-        );
-        Ok(files)
+        credentials::prepare(&self.home, files, std::env::vars().collect())
     }
 }
 
@@ -263,7 +254,7 @@ mod tests {
             .await
             .unwrap();
         std::os::unix::fs::symlink(&source, home.join("config.toml")).unwrap();
-        let auth = b"{\"auth_mode\":\"chatgpt\",\"tokens\":{\"access_token\":\"local-fixture\"}}";
+        let auth = b"{\"OPENAI_API_KEY\":\"local-fixture\"}";
         tokio::fs::write(home.join("auth.json"), auth)
             .await
             .unwrap();
@@ -271,9 +262,10 @@ mod tests {
             distribution: PathBuf::new(),
             home,
         };
-        let mut snapshot = installation.snapshot().await.unwrap();
-        assert_eq!(snapshot["auth.json"].as_bytes(), auth);
-        assert_eq!(snapshot["config.toml"], "model = 'example'\n");
+        let mut snapshot = installation.snapshot().await.unwrap().files;
+        assert!(!snapshot["auth.json"].contains("local-fixture"));
+        let config: toml::Value = toml::from_str(&snapshot["config.toml"]).unwrap();
+        assert_eq!(config["model"].as_str(), Some("example"));
         snapshot.insert("auth.json".into(), "private change".into());
         assert_eq!(
             tokio::fs::read(installation.home.join("auth.json"))

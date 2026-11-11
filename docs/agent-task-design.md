@@ -18,8 +18,9 @@ flowchart LR
     Codex --> Tools[Tool subprocesses]
     Codex --> Proxy[Built-in HTTP / TLS proxy]
     Tools --> Proxy
-    Proxy --> Model[Model endpoint]
-    Proxy --> Resources[Other HTTP resources]
+    Proxy --> Egress[Host egress and credential injection]
+    Egress --> Model[Model endpoint]
+    Egress --> Resources[Other HTTP resources]
     Proxy --> Semantic[Responses parser]
     Semantic --> Payloads[Complete semantic payload store]
     Semantic --> Journal[Shared event journal]
@@ -32,7 +33,7 @@ flowchart LR
 
 The server discovers the native Codex distribution through PATH or an npm installation under `/opt/nvm`. The distribution is read-only mounted into the sandbox, including the Code Mode host and supporting resources.
 
-For each session, `config.toml`, named `.config.toml` profiles, `auth.json` and `models_cache.json`, when present, are copied from the external `CODEX_HOME`. Configuration is staged inside the container before the workload starts. Codex receives a private writable home under `/records/codex`, initialized before the terminal starts. Terminal and Chat share this home, the mounted Codex executable path, CA settings and the box-owned TCP egress. The host configuration remains the source for subsequent sessions. Configuration is read into a bounded in-memory snapshot and transferred over Docker stdin without host staging files. The private home, native continuation state, control socket and evidence share container tmpfs and disappear when the sandbox is destroyed. The sandbox root user can read this authentication copy. Host keychain-backed authentication and absolute host paths referenced by configuration require their resources to be made available separately.
+For each session, the server reads `config.toml`, named `.config.toml` profiles, `auth.json` and `models_cache.json`, when present, from the external `CODEX_HOME`. The Codex adapter replaces login tokens, API keys and configured authentication headers with session placeholders, then audits the resulting files before transferring the bounded snapshot over Docker stdin. Codex receives a private writable home under `/records/codex`, initialized before the terminal starts. Terminal and Chat share this home, the mounted executable path, CA settings and box-owned TCP egress. A host-side gateway injects real authentication only for the session's permitted API operations after traffic has left container capture. The host authentication file is read for each authenticated request. Expired credentials require host reauthentication and an account change requires a new session. The private home, native continuation state, control socket and evidence share container tmpfs and disappear when the sandbox is destroyed. Authentication formats beyond the file-based ChatGPT and API-key adapter require explicit support. The credential boundary and checks are described in [Codex credential isolation](codex-credential-isolation.md).
 
 Codex runs with approvals and its additional command sandbox disabled inside the existing AgentTomo Docker sandbox. The AgentTomo tracing, network redirection and temporary CA trust still apply. The existing model choice and provider configuration are reused. HTTP capture is enabled automatically when an external Codex installation is available.
 
@@ -40,7 +41,7 @@ Codex runs with approvals and its additional command sandbox disabled inside the
 
 After CONNECT, the connector forwards arbitrary TCP bytes. Original socket destinations, recorded five-tuples and process attribution remain intact. HTTP/TLS content capture is independent, and transport CONNECT headers are not recorded as application requests. With this option, inherited application proxy variables are removed; Codex and its tools use their original destinations. Proxy errors never fall back to direct. This milestone supports unauthenticated HTTP CONNECT upstreams; UDP is unchanged.
 
-A host-loopback proxy is reached through the existing temporary TCP relay bound to the Docker bridge. The relay accepts only registered, owned sandbox container addresses and closes with the Playground server. The setting crosses container bootstrap in memory, rather than entering Codex configuration or environment. Hyper's upgraded stream preserves prefetched bytes for server-first protocols and half-close behavior.
+A host-loopback proxy is reached through the host entry bound to the Docker bridge. With the Codex adapter active, that entry performs scoped authentication forwarding and relays other TCP connections through the selected upstream. It accepts registered, owned sandbox container addresses and closes with the Playground server. The upstream setting and public gateway CA cross container bootstrap in memory. Hyper's upgraded stream preserves prefetched bytes for server-first protocols and half-close behavior. Container capture and host authentication forwarding reuse the same HTTP transport implementation.
 
 Playground also reads an optional `.agenttomo/playground.json` relative to its working directory. This ignored local file persists the proxy across clean shells.
 

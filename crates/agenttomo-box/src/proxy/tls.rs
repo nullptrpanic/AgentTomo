@@ -1,4 +1,4 @@
-//! Task-local signing material. Private keys never leave the collector's memory.
+//! Ephemeral signing material. Private keys stay in the owning process.
 use moka::sync::Cache;
 use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
 use rustls::{

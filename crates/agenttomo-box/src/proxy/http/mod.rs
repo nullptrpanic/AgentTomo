@@ -2,6 +2,7 @@
 mod body;
 mod io;
 mod streams;
+pub(crate) mod transport;
 
 use crate::{
     proxy::{
@@ -18,8 +19,7 @@ use axum::{
     http::{HeaderMap, Method, Request, Response, StatusCode},
 };
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
-use hyper::{body::Incoming, service::service_fn};
-use hyper_util::rt::TokioIo;
+use hyper::body::Incoming;
 use io::{BoxIo, Counters, Metered};
 use serde_json::{Value, json};
 use std::{
@@ -33,7 +33,7 @@ use std::{
 };
 use tokio::{
     sync::{Mutex, mpsc},
-    time::{timeout, timeout_at},
+    time::timeout_at,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -363,37 +363,14 @@ fn bridge(
     session: Session,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = stdio::Result<()>> + Send>> {
     Box::pin(async move {
-        let (sender, connection) = hyper::client::conn::http1::Builder::new()
-            .preserve_header_case(true)
-            .handshake::<_, body::Observed>(TokioIo::new(upstream))
-            .await
-            .map_err(stdio::Error::other)?;
-        let driver = tokio::spawn(connection.with_upgrades());
-        let sender = Arc::new(Mutex::new(sender));
-        let handler = session.clone();
-        let service = service_fn(move |request| handle(request, sender.clone(), handler.clone()));
-        let connection = hyper::server::conn::http1::Builder::new()
-            .preserve_header_case(true)
-            .half_close(true)
-            .serve_connection(TokioIo::new(client), service)
-            .with_upgrades();
-        let mut connection = Box::pin(connection);
-        let result = tokio::select! {
-            biased;
-            result = &mut connection => result.map_err(stdio::Error::other),
-            _ = session.finished.cancelled() => {
-                connection.as_mut().graceful_shutdown();
-                timeout(Duration::from_secs(5), &mut connection).await.map_err(stdio::Error::other).and_then(|result| result.map_err(stdio::Error::other))
-            },
-        };
-        driver.abort();
-        let _ = driver.await;
-        // All body drops and upgrade jobs finish before the proxy relinquishes its
-        // observation sender, so the recorder can flush complete metadata/payloads.
-        drop(connection);
-        session.writes.close();
-        session.writes.wait().await;
-        result
+        transport::bridge(
+            client,
+            upstream,
+            session.finished.clone(),
+            session.writes.clone(),
+            move |request, sender| handle(request, sender, session.clone()),
+        )
+        .await
     })
 }
 
@@ -518,12 +495,7 @@ async fn handle(
     .flatten();
     let client_upgrade = upgrade_requested.then(|| hyper::upgrade::on(&mut request));
     let request = request.map(|inner| body::Observed::new(inner, message.clone(), None));
-    let result = async {
-        let mut sender = sender.lock().await;
-        sender.ready().await?;
-        sender.send_request(request).await
-    }
-    .await;
+    let result = transport::send(sender, request).await;
     let mut response = match result {
         Ok(response) => response,
         Err(error) => {
@@ -570,13 +542,9 @@ async fn handle(
         let upgraded_message = message.clone();
         message.session.writes.spawn(async move {
             let mut complete = false;
-            if let Ok(Ok((client, upstream))) = timeout(Duration::from_secs(5), async {
-                tokio::try_join!(client_upgrade, upstream_upgrade)
-            })
-            .await
+            if let Ok((mut client, mut upstream)) =
+                transport::upgraded(client_upgrade, upstream_upgrade).await
             {
-                let mut client: BoxIo = Box::new(TokioIo::new(client));
-                let mut upstream: BoxIo = Box::new(TokioIo::new(upstream));
                 if websocket {
                     client =
                         streams::websocket::observe(client, &upgraded_message, &extensions, true);
