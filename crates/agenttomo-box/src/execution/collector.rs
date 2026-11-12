@@ -254,10 +254,14 @@ async fn record_input(
         let copy = async {
             loop {
                 match protocol::receive(&mut input).await? {
-                    Input::AgentPrompt { task_id, prompt } => {
+                    Input::AgentPrompt {
+                        task_id,
+                        prompt,
+                        sample,
+                    } => {
                         if task_id.len() != 32
                             || !task_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-                            || prompt.trim().is_empty()
+                            || sample.is_none() && prompt.trim().is_empty()
                             || prompt.len() > 8192
                         {
                             return Err(io::Error::other("invalid agent prompt"));
@@ -271,6 +275,7 @@ async fn record_input(
                                     task_id,
                                 },
                                 prompt,
+                                sample,
                             })
                             .await
                             .map_err(io::Error::other)?;

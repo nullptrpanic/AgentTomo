@@ -1,5 +1,5 @@
 #file-preview { flex: 0 1 auto; min-height: 140px; max-height: 40%; overflow: auto; border-top: 1px solid #3d4a59; padding: 12px 18px; background: #14212c; font-size: 11px; scrollbar-color: #45596c transparent; }
-.trace-panel:has(#file-preview:not([hidden])) :is(#trace-scroll, #graph-scroll) { min-height: 120px; }
+.trace-panel:has(#file-preview:not([hidden])) #trace-scroll { min-height: 120px; }
 .trace-panel:has(#file-preview:not([hidden])) #event-detail { min-height: 40px; overflow: auto; }
 #file-preview button { border: 1px solid #45596c; background: #21323e; color: #c7d7e4; padding: 5px 8px; border-radius: 4px; font-size: 10px; white-space: nowrap; }
 #file-preview button:hover, #file-preview button[aria-pressed="true"] { border-color: #9be9c2; color: #9be9c2; }

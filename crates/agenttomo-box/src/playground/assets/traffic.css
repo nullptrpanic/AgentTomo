@@ -1,4 +1,4 @@
-.observation-tabs { display: flex; gap: 8px; padding: 0 23px 12px; }
+.observation-tabs { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 23px 12px; }
 .observation-tabs button, #traffic button { border: 1px solid #344b5a; border-radius: 5px; background: #1b2935; color: #cbd8e4; padding: 6px 9px; font-size: 11px; }
 .observation-tabs [aria-pressed=true], #traffic [aria-pressed=true] { color: #9be9c2; border-color: #66a88c; background: #213b36; }
 #traffic .traffic-icon { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 5px; flex-shrink: 0; }

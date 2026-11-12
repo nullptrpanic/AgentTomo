@@ -64,20 +64,6 @@ async function caughtUp(page) {
   const sequence = events.at(-1)?.sequence;
   await until(() => observed.get(page)?.some(event => event.sequence === sequence), `monitor must receive event ${sequence}`);
 }
-async function expandGraph(page, event) {
-  await page.locator('[data-observation="graph"]').click();
-  const process = page.locator(`.graph-process-card[data-pid="${event.data.pid}"][data-instance="${event.data.process_instance_id}"]`);
-  await process.waitFor({ state: "attached" });
-  await process.evaluate(button => {
-    const ancestors = [];
-    for (let branch = button.closest(".graph-branch"); branch; branch = branch.parentElement.closest(".graph-branch")) ancestors.unshift(branch);
-    for (const branch of ancestors) {
-      const control = branch.querySelector(":scope > .graph-layout > .graph-process-card");
-      if (control.getAttribute("aria-expanded") === "false") control.click();
-    }
-  });
-  return process;
-}
 
 try {
   await until(() => { assert.equal(server.exitCode, null, errors); return output.includes("?token="); }, "server start");
@@ -106,7 +92,7 @@ try {
   owner = await context.newPage();
   await owner.goto(url);
   await until(async () => await owner.locator("#status").textContent() === "Connected", "workspace ready");
-  assert.equal(await owner.locator('[data-observation="graph"]').count(), 1, "the live monitor must expose the behavior graph");
+  assert.equal(await owner.locator('[data-observation="findings"]').count(), 1, "the live monitor exposes Findings");
   const session = sessions[0];
   const initialWidth = (await owner.locator("#workspace-panel").boundingBox()).width;
   monitor = await openMonitor(owner);
@@ -149,52 +135,8 @@ try {
   await monitor.locator("#event-filter summary").click();
   console.log("PASS: icon controls, independent monitors, file preview and filters");
 
-  await expandGraph(owner, preview);
-  assert.equal(await owner.locator('.graph-event-card[data-kind^="process."]').count(), 0, "lifecycle belongs to the process card, not separate event cards");
-  const lifecycle = owner.locator(`.graph-process-card[data-instance="${preview.data.process_instance_id}"]`).locator("..").locator(":scope > .graph-body > .graph-context > .event-evidence");
-  await lifecycle.locator("summary").click();
-  const execEvent = events.find(event => event.kind === "process.exec" && event.data.process_instance_id === preview.data.process_instance_id);
-  await lifecycle.locator(`[data-sequence="${execEvent.sequence}"]`).click();
-  assert.equal(await owner.locator("#selected-sequence").textContent(), `#${execEvent.sequence}`);
-  assert.equal(await owner.locator("#graph-scroll").isVisible(), true);
-  await lifecycle.locator("summary").click();
-  const fileCard = owner.locator(`.graph-event-card[data-sequence="${preview.sequence}"]`);
-  await fileCard.click();
-  await until(async () => (await owner.locator(".file-inspector-body").textContent()).includes("shared-preview-content"), "graph file card must open the captured file");
-  assert.equal(await owner.locator("#selected-sequence").textContent(), `#${preview.sequence}`);
-  await owner.locator("#event-detail summary").click();
-  assert.ok((await owner.locator("#event-json").textContent()).includes("/tmp/monitor-preview.txt"));
-  await owner.locator("#event-detail summary").click();
-  await owner.getByRole("button", { name: "Close file preview", exact: true }).click();
-  await owner.locator("#event-filter summary").click();
-  await owner.getByRole("checkbox", { name: "file.*", exact: true }).uncheck();
-  await until(async () => await owner.locator('.graph-event-card[data-kind="file.open"]').count() === 0, "graph applies file wildcard filter");
-  await owner.locator('[data-observation="process"]').click();
-  assert.equal(await owner.locator('input[aria-label="file.*"]').isChecked(), false, "graph and tree share filter state");
-  await owner.getByRole("checkbox", { name: "file.*", exact: true }).check();
-  await owner.locator("#event-filter summary").click();
-  await owner.locator('[data-observation="graph"]').click();
-  await fileCard.waitFor();
-  await expandGraph(second, preview);
-  const secondFile = second.locator(`.graph-event-card[data-sequence="${preview.sequence}"]`);
-  await secondFile.focus();
-  const focusedCard = await secondFile.elementHandle();
-  // Activity from another page must preserve this card and its keyboard focus.
-  await command("sh -c 'sleep 1; uname -m'");
-  await until(() => events.some(event => event.kind === "process.exec" && event.data.argv?.join(" ").includes("uname -m")), "graph receives a new real process");
-  await caughtUp(second);
-  assert.ok(await focusedCard.evaluate(node => node.isConnected && node === document.activeElement), "live graph updates must preserve the focused card");
-  await focusedCard.dispose();
-  const ids = await owner.locator(".graph-process-card").evaluateAll(cards => cards.map(card => card.dataset.instance));
-  assert.equal(new Set(ids).size, ids.length, "graph must have one card per process lifetime");
-  const graphTop = await owner.locator("#graph-scroll").evaluate(node => { node.scrollTop = 93; return node.scrollTop; });
-  await owner.locator("#toggle-monitor").click();
-  await command("sh -c 'sleep 1; printf graph-hidden-update; sleep 1'");
-  await until(() => events.some(event => event.kind === "process.exec" && event.data.argv?.[0] === "sleep" && event.sequence > preview.sequence), "hidden graph receives live work");
-  await owner.waitForTimeout(1600);
-  await owner.locator("#toggle-monitor").click();
-  assert.ok(Math.abs(await owner.locator("#graph-scroll").evaluate(node => node.scrollTop) - graphTop) < 2, "hidden graph must retain its reading position");
-  console.log("PASS: real graph cards, file inspection, shared filters and stable process identities");
+  assert.equal(await owner.locator('[data-observation="graph"]').count(), 0, "removed Graph must not remain as a dead entry point");
+  assert.equal(await owner.locator('#graph-scroll').count(), 0);
 
   // Send both requests through one actual socket, independent of a client's
   // connection-pool policy. The second response explicitly closes the stream.
@@ -248,65 +190,6 @@ try {
     await traceFlow.scrollIntoViewIfNeeded();
     await second.screenshot({ path: process.env.AGENTTOMO_TEST_PROCESS_SCREENSHOT, fullPage: true });
   }
-  await expandGraph(second, httpEvent);
-  assert.equal(await second.locator("#event-count").textContent(), "3", "Graph and process list share the same logical count");
-  await second.locator("#event-filter summary").click();
-  await second.locator('[data-filter-action="all"]').click();
-  await second.locator("#event-filter summary").click();
-  const flow = second.locator(`.graph-network-flow[data-connection-id="${httpEvent.data.connection_id}"]`);
-  await flow.waitFor();
-  assert.equal(await flow.count(), 1, "one TCP parent per connection");
-  const requests = flow.locator(":scope > .graph-flow-body > .graph-http-requests > .graph-event-item > .graph-event-card");
-  assert.deepEqual(await requests.evaluateAll(cards => cards.map(card => Number(card.dataset.requestId))),
-    [httpEvent.data.request_id, nextHttp.data.request_id], "keep-alive requests must be chronological siblings");
-  assert.match(await requests.first().textContent(), /200/);
-  assert.equal(await second.locator('.graph-event-card[data-kind="network.http.response"], .graph-event-card[data-kind="network.http.response.body"], .graph-event-card[data-kind="network.protocol"]').count(), 0, "stages must not appear as independent graph cards");
-  const flowButton = flow.locator(":scope > .graph-event-card");
-  const graphProcess = second.locator(`.graph-process-card[data-instance="${httpEvent.data.process_instance_id}"]`);
-  const parentBox = await graphProcess.boundingBox(), flowBox = await flowButton.boundingBox();
-  const requestBoxes = await requests.evaluateAll(cards => cards.map(card => {
-    const box = card.getBoundingClientRect();
-    return { x: box.x, y: box.y, height: box.height };
-  }));
-  assert.ok(flowBox.x > parentBox.x && flowBox.y >= parentBox.y + parentBox.height, "TCP must be indented below its owning process");
-  assert.ok(requestBoxes[0].x > flowBox.x && requestBoxes[0].y >= flowBox.y + flowBox.height, "HTTP must be indented below its TCP parent");
-  assert.ok(Math.abs(requestBoxes[0].x - requestBoxes[1].x) < 1 && requestBoxes[1].y >= requestBoxes[0].y + requestBoxes[0].height, "HTTP siblings must be vertically stacked at the same tree depth");
-  await flowButton.click();
-  assert.equal(await requests.first().isVisible(), false);
-  await graphProcess.click();
-  assert.equal(await flowButton.isVisible(), false, "collapsing a process hides its whole subtree");
-  await command("printf 'flow-stays-collapsed\\n'");
-  await caughtUp(second);
-  assert.equal(await graphProcess.getAttribute("aria-expanded"), "false", "new events must not reopen a collapsed parent");
-  await graphProcess.click();
-  assert.equal(await flowButton.getAttribute("aria-expanded"), "false");
-  assert.equal(await requests.first().isVisible(), false, "expanding a process preserves its TCP child's collapsed state");
-  await flowButton.click();
-  await flow.locator(":scope > .graph-flow-body > .graph-context > .event-evidence > summary").click();
-  const evidence = flow.locator(`.evidence-record[data-sequence="${httpEvent.sequence}"]`);
-  await evidence.click();
-  assert.equal(await second.locator("#graph-scroll").isVisible(), true, "raw evidence inspection stays in Graph");
-  assert.equal(await second.locator("#selected-sequence").textContent(), `#${httpEvent.sequence}`);
-  await flow.locator(":scope > .graph-flow-body > .graph-context > .event-evidence > summary").click();
-  await second.locator("#event-detail summary").click();
-  const httpCard = second.locator(`.graph-event-card[data-sequence="${httpEvent.sequence}"]`);
-  await httpCard.scrollIntoViewIfNeeded();
-  assert.match(await httpCard.locator("time").textContent(), /^\d{2}:\d{2}:\d{2}\.\d{3}$/, "graph must show the full operation start time, not only fractional seconds");
-  if (process.env.AGENTTOMO_TEST_SCREENSHOT) {
-    await second.locator("#event-filter summary").click();
-    await second.locator('[data-filter-action="none"]').click();
-    await second.getByRole("checkbox", { name: "network.*", exact: true }).check();
-    await second.locator("#event-filter summary").click();
-    await graphProcess.scrollIntoViewIfNeeded();
-    await second.screenshot({ path: process.env.AGENTTOMO_TEST_SCREENSHOT, fullPage: true });
-    await second.locator("#event-filter summary").click();
-    await second.locator('[data-filter-action="all"]').click();
-    await second.locator("#event-filter summary").click();
-  }
-  await httpCard.click();
-  assert.equal(await second.locator("#traffic").isVisible(), true, "HTTP card opens the Traffic inspector");
-  await until(async () => (await second.locator(".traffic-body").textContent()).includes("shared-monitor-response"), "decoded HTTP body in detached monitor");
-  assert.equal(await owner.locator("#graph-scroll").isVisible(), true, "view selection stays local");
   await command(`bash -c 'exec 3<>/dev/udp/${bridge}/${udpFixture.address().port}; printf "one\\n" >&3; IFS= read -r -t 2 reply <&3; printf "two\\n" >&3; IFS= read -r -t 2 reply <&3'`);
   await until(() => events.filter(event => event.kind === "network.udp.receive" && event.data.destination === udpDestination).length === 2, "UDP echo replies captured");
   const udpEvent = events.find(event => event.kind === "network.udp.send" && event.data.destination === udpDestination);
@@ -321,13 +204,6 @@ try {
   assert.match(await udpRow.textContent(), /↑ 2 packets · 8 B.*↓ 2 packets · 8 B/s);
   await udpRow.click();
   await until(async () => await second.locator(`.trace-network-flow[data-flow-id="${udpEvent.data.flow_id}"] .evidence-record`).count() === 4, "UDP packet evidence stays expandable in the process list");
-  await expandGraph(second, udpEvent);
-  const udpCard = second.locator(`.graph-network-flow[data-flow-id="${udpEvent.data.flow_id}"] > .graph-event-card`);
-  assert.equal(await udpCard.count(), 1);
-  assert.match(await udpCard.textContent(), /↑ 2 packets · 8 B.*↓ 2 packets · 8 B/s);
-  await udpCard.click();
-  await until(async () => await udpCard.getAttribute("aria-expanded") === "true", "UDP card exposes its actual details expansion state");
-  assert.equal(await second.locator(`.graph-network-flow[data-flow-id="${udpEvent.data.flow_id}"] .evidence-record`).count(), 4);
   console.log("PASS: TCP parent, chronological keep-alive children, retained evidence and grouped UDP");
   await owner.locator('[data-observation="process"]').click();
   await owner.locator(".process-node").evaluateAll(nodes => nodes.forEach(node => node.open = true));
@@ -365,14 +241,7 @@ try {
 
   for (const width of [768, 390, 320]) {
     for (const page of [owner, monitor]) {
-      await expandGraph(page, httpEvent);
       await page.setViewportSize({ width, height: 900 });
-      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), `overflow at ${width}`);
-      assert.ok(await page.locator("#graph-scroll").evaluate(node => node.scrollWidth <= node.clientWidth + 1), `graph overflow at ${width}`);
-      const card = page.locator(`.graph-event-card[data-request-id="${httpEvent.data.request_id}"]`);
-      const parent = page.locator(`.graph-network-flow[data-connection-id="${httpEvent.data.connection_id}"] > .graph-event-card`);
-      const childBox = await card.boundingBox(), parentBox = await parent.boundingBox();
-      assert.ok(childBox.x > parentBox.x && childBox.y >= parentBox.y + parentBox.height, `HTTP hierarchy must remain visible at ${width}`);
       await page.locator('[data-observation="process"]').click();
       await page.locator(".process-node").evaluateAll(nodes => nodes.forEach(node => node.open = true));
       assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), `process view overflow at ${width}`);
@@ -406,7 +275,7 @@ try {
   assert.ok(!(await readdir(directory)).includes(ended.id));
   assert.deepEqual(pageErrors, []);
   assert.equal(errors, "");
-  console.log(JSON.stringify({ result: "PASS", checks: ["two icon controls", "independent live monitors", "read-only refresh", "local filters", "shared logical counts", "process/graph TCP and HTTP hierarchy", "live HTTP row identity and focus", "UDP flow aggregation", "process details", "file/traffic navigation", "file preview and raw event", "decoded HTTP body", "retry cursor", "monitor close", "owner cleanup", "recording destruction and expired monitor", "final event", "both tracking layouts at 320/390/768 px"], events: events.length }));
+  console.log(JSON.stringify({ result: "PASS", checks: ["two icon controls", "independent live monitors", "read-only refresh", "local filters", "shared logical counts", "process TCP and HTTP hierarchy", "live HTTP row identity and focus", "UDP flow aggregation", "process details", "file/traffic navigation", "file preview and raw event", "decoded HTTP body", "retry cursor", "monitor close", "owner cleanup", "recording destruction and expired monitor", "final event", "process layout at 320/390/768 px"], events: events.length }));
 } catch (error) {
   console.error("Playground stderr:", errors);
   if (monitor && !monitor.isClosed()) console.error("Monitor state:", await monitor.locator("#file-preview").textContent(), await monitor.locator("#status").textContent());

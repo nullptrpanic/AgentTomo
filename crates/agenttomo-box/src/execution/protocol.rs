@@ -18,8 +18,16 @@ pub enum Message {
 pub enum Input {
     Bytes(Vec<u8>),
     Closed,
-    Resize { rows: u16, cols: u16 },
-    AgentPrompt { task_id: String, prompt: String },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
+    AgentPrompt {
+        task_id: String,
+        prompt: String,
+        #[serde(default)]
+        sample: Option<String>,
+    },
     AgentCancel,
 }
 

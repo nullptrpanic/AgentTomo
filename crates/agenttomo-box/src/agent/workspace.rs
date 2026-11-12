@@ -14,7 +14,12 @@ pub const SOCKET: &str = "/records/control/workspace.sock";
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
-    Start { scope: Scope, prompt: String },
+    Start {
+        scope: Scope,
+        prompt: String,
+        #[serde(default)]
+        sample: Option<String>,
+    },
     Cancel,
 }
 
@@ -42,20 +47,38 @@ pub async fn run(browser: bool) -> io::Result<u8> {
     let mut output = None;
     let mut current = None;
     let mut conversation = None;
+    let mut sample_run: Option<crate::playground::samples::Run> = None;
+    let mut cancelled = false;
     let (diagnostics, mut notices) = tokio::sync::mpsc::channel::<String>(32);
     loop {
         tokio::select! {
             status = terminal.wait() => { kill_group(task.as_mut()); return Ok(status?.code().unwrap_or(125) as u8) },
             action = read.receive::<Action>() => {
                 match action? {
-                    Action::Cancel => kill_group(task.as_mut()),
-                    Action::Start { scope, prompt } => {
-                        if task.is_some() || prompt.trim().is_empty() || prompt.len() > 8192 {
+                    Action::Cancel => { cancelled = true; kill_group(task.as_mut()); },
+                    Action::Start { scope, mut prompt, sample } => {
+                        if task.is_some() || sample.is_none() && prompt.trim().is_empty() || prompt.len() > 8192 {
+                            if let Some(id) = &sample {
+                                protocol::send(&mut write, &json!({"kind":"security.sample.finished","scope":scope,"sample_id":id,"status":"error","error":"Another task is already running, or the request is invalid."})).await?;
+                            }
                             protocol::send(&mut write, &json!({"kind":"agent.task.rejected","scope":scope,"error":"one active task is allowed; prompt must be 1–8192 bytes"})).await?;
                             continue;
                         }
+                        cancelled = false;
                         let start = async {
-                            let mut child = start(adapter, &scope, conversation.as_deref(), &prompt).await?;
+                            if let Some(id) = sample.as_deref() {
+                                protocol::send(&mut write, &json!({"kind":"security.sample.progress","scope":scope,"sample_id":id,"status":"running","phase":"preparing"})).await?;
+                                let run = crate::playground::samples::prepare(id, &scope.task_id).await?;
+                                protocol::send(&mut write, &json!({"kind":"security.sample.progress","scope":scope,"sample_id":id,"status":"running","phase":"injecting"})).await?;
+                                run.inject().await?;
+                                prompt = run.prompt.clone();
+                                let mut event = run.started();
+                                event["kind"] = "security.sample.started".into();
+                                event["scope"] = json!(scope);
+                                protocol::send(&mut write, &event).await?;
+                                sample_run = Some(run);
+                            }
+                            let mut child = start(adapter, &scope, if sample.is_some() { None } else { conversation.as_deref() }, &prompt).await?;
                             let stdout = child.stdout.take().unwrap();
                             let stderr = child.stderr.take().unwrap();
                             let diagnostics = diagnostics.clone();
@@ -64,6 +87,16 @@ pub async fn run(browser: bool) -> io::Result<u8> {
                             current = Some(scope.clone());
                             Ok::<_, io::Error>(())
                         }.await;
+                        if start.is_err() && let Some(id) = sample {
+                            let mut event = match sample_run.take() {
+                                Some(run) => run.evaluate(Some(125), false).await,
+                                None => json!({"sample_id":id,"status":"error"}),
+                            };
+                            event["kind"] = "security.sample.finished".into();
+                            event["scope"] = json!(scope);
+                            event["error"] = start.as_ref().unwrap_err().to_string().into();
+                            protocol::send(&mut write, &event).await?;
+                        }
                         let event = match start {
                             Ok(()) => json!({"kind":"agent.task.started","scope":scope,"prompt":prompt}),
                             Err(error) => json!({"kind":"agent.task.rejected","scope":scope,"error":error.to_string()}),
@@ -87,12 +120,20 @@ pub async fn run(browser: bool) -> io::Result<u8> {
                     },
                     None => (super::adapter::RuntimeOutput::default(), String::new()),
                 };
-                if let Some(id) = captured.0.conversation_id { conversation = Some(id); }
+                if sample_run.is_none() && let Some(id) = captured.0.conversation_id { conversation = Some(id); }
                 let error = captured.0.error.unwrap_or_else(|| {
                     if captured.1.trim().is_empty() { format!("{} exited unsuccessfully ({code:?})", adapter.metadata().name) }
                     else { captured.1.chars().take(8192).collect::<String>() }
                 });
-                protocol::send(&mut write, &json!({"kind":"agent.task.finished","scope":current.take(),"exit_code":code,"error":if code == Some(0) { Value::Null } else { error.into() }})).await?;
+                if let Some(run) = sample_run.take() {
+                    protocol::send(&mut write, &json!({"kind":"security.sample.progress","scope":current,"sample_id":run.id(),"status":"running","phase":"verifying"})).await?;
+                    let mut event = run.evaluate(code, cancelled).await;
+                    event["kind"] = "security.sample.finished".into();
+                    event["scope"] = json!(current);
+                    protocol::send(&mut write, &event).await?;
+                }
+                protocol::send(&mut write, &json!({"kind":"agent.task.finished","scope":current,"exit_code":code,"error":if code == Some(0) { Value::Null } else { error.into() }})).await?;
+                current = None;
                 while notices.try_recv().is_ok() {}
                 task = None;
             }
@@ -207,9 +248,13 @@ pub async fn drive(
                     Some("agent.task.finished") => "agent.task.finished",
                     Some("agent.task.rejected") => "agent.task.rejected",
                     Some("agent.task.diagnostic") => "agent.task.diagnostic",
+                    Some("security.sample.started") => "security.sample.started",
+                    Some("security.sample.progress") => "security.sample.progress",
+                    Some("security.sample.finished") => "security.sample.finished",
                     _ => return Err(io::Error::other("invalid workspace control event")),
                 };
                 let scope: Scope = serde_json::from_value(data["scope"].take())?;
+                if kind == "security.sample.finished" && cancelled { data["status"] = "cancelled".into(); }
                 if kind == "agent.task.started" { running = Some(scope.clone()); }
                 if kind == "agent.task.rejected" && running.as_ref() == Some(&scope) {
                     data["cancelled"] = cancelled.into();

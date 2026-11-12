@@ -39,13 +39,15 @@ export function startWorkspace({ token, onMessage, notice, onView }) {
     for (const button of document.querySelectorAll("[data-workspace]")) button.setAttribute("aria-pressed", String(button.dataset.workspace === name));
     const visible = name === "browser";
     const chat = name === "chat";
-    $("terminal").hidden = visible || chat;
+    const samples = name === "samples";
+    $("terminal").hidden = visible || chat || samples;
+    $("security-samples").hidden = !samples;
     $("browser").hidden = !visible;
     $("agent-chat").hidden = !chat;
-    $("terminal-title").textContent = chat ? "Agent conversation" : visible ? "Container browser" : "Container terminal";
-    $("workspace-hint").textContent = chat ? "Enter to send · Shift-Enter for a new line" : visible ? "Mouse and keyboard control Chrome" : "Ctrl-C to interrupt · Ctrl-D to exit";
+    $("terminal-title").textContent = samples ? "Security tests" : chat ? "Agent conversation" : visible ? "Container browser" : "Container terminal";
+    $("workspace-hint").textContent = samples ? "Real Agent · Disposable sample files" : chat ? "Enter to send · Shift-Enter for a new line" : visible ? "Mouse and keyboard control Chrome" : "Ctrl-C to interrupt · Ctrl-D to exit";
     browser.show(visible);
-    if (!visible && !chat) { resize(); terminal.focus(); }
+    if (!visible && !chat && !samples) { resize(); terminal.focus(); }
     onView?.(name);
   }
   for (const button of document.querySelectorAll("[data-workspace]")) button.addEventListener("click", () => workspaceView(button.dataset.workspace));
@@ -148,6 +150,10 @@ export function startWorkspace({ token, onMessage, notice, onView }) {
     prompt(task_id, prompt) {
       if (!acceptingInput || socket.readyState !== WebSocket.OPEN) throw new Error("Sandbox is not connected");
       socket.send(JSON.stringify({ type:"agent_prompt", task_id, prompt }));
+    },
+    sample(task_id, sample_id) {
+      if (!acceptingInput || socket.readyState !== WebSocket.OPEN) throw new Error("Sandbox is not connected");
+      socket.send(JSON.stringify({type:"sample_run",task_id,sample_id}));
     },
     cancel() { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type:"agent_cancel" })); },
   };

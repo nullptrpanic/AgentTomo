@@ -47,6 +47,8 @@ Playground 兼容工作目录下的 `.agenttomo/playground.json`，例如 `{"pro
 
 Chat 按首次观察到的顺序穿插回复和工具卡片。卡片默认折叠，展开后按需加载完整参数与返回，并可定位到轨迹详情。流式更新保留选中文字、焦点和展开状态；向上阅读会暂停跟随，点击 Latest 返回最新消息。停止操作立即显示 Stopping，失败时会在输入框没有新草稿的情况下恢复原始任务。
 
+左侧 **Security tests** 提供三个受控演示：工具泄露假凭据、健康检查越权修改配置、伪造检查结果导致错误放行。点击卡片查看说明，再点击 **Run** 自动准备独立文件并启动真实 Agent。右侧 **Findings** 根据实际产物展示结果和证据；Chat 与 Task trajectory 只展示执行，不添加攻击判定。启用 `--overlay-root` 时，样本注入写入 `/home` 的 OverlayFS upper，原目录保持不变；所有样本随沙箱销毁。需要 Python 3 和可用 Agent。详见[内置样本说明](../../docs/builtin-security-samples.md)。
+
 需要能访问本机 Docker daemon，默认使用本地 `agenttomo-playground-chrome:24.04` 镜像并自动启动 Chrome。它基于 Ubuntu 24.04 工具镜像，包含 ifconfig/netstat、ip/ss、curl/wget、dig、nc、jq、strace、Python 和图形桌面组件。首次使用前在仓库根目录构建，需已有 Ubuntu 基础镜像及软件源访问。
 
 ```bash

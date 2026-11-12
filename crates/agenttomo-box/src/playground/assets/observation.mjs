@@ -4,8 +4,8 @@ import { TrafficView } from "./traffic-view.mjs";
 import { ProcessTree } from "./process-tree.mjs";
 import { EventFilter, FilterMenu } from "./event-filter.mjs";
 import { activitySnapshot } from "./activity-model.mjs";
-import { BehaviorGraph } from "./behavior-graph.mjs";
 import { AgentView } from "./agent-view.mjs";
+import { SamplesView } from "./samples-view.mjs";
 
 // Shared by the workspace page and independent read-only monitor pages.
 export function createObservation(token) {
@@ -50,6 +50,20 @@ export function createObservation(token) {
   const agent = new AgentView({ root:$("agent-trajectory"), chat:$("agent-chat"), detail:$("agent-detail"), load:loadAgent, onSelect:selectEvent,
     onRaw:event => { files.close(); selectRaw(event); $("event-detail").open = false; },
     reveal:() => observationView("agent"), filter });
+  const samples = new SamplesView({root:$("security-samples"), findings:$("findings"),
+    onRun:(id, sample) => {
+      if (!agent.control || !agent.available || !agent.ready) throw new Error("Sandbox is not ready");
+      agent.control.sample(id, sample);
+      observationView("agent");
+    },
+    onCancel:() => agent.control?.cancel(),
+    onTask:id => { observationView("agent"); agent.focus(`task-${id}`); },
+    onChat:id => { $("chat-tab").click(); agent.history.querySelector(`[data-task-id="${id}"]`)?.scrollIntoView({block:"nearest"}); },
+    onEvidence:inspectEvidence,
+    onCount:count => { $("finding-count").textContent = count; $("finding-count").hidden = !count; },
+  });
+  const sampleControls = () => samples.setAvailable(Boolean(agent.control && agent.available && agent.ready),
+    [...agent.model.tasks.values()].some(task => task.state === "running"));
 
   function selectRaw(event) {
     $("selected-sequence").textContent = event.sequence === undefined ? `message #${event.data.id}` : `#${event.sequence}`;
@@ -60,13 +74,14 @@ export function createObservation(token) {
     for (const button of document.querySelectorAll("[data-observation]")) button.setAttribute("aria-pressed", String(button.dataset.observation === name));
     $("traffic").hidden = name !== "traffic";
     $("trace-scroll").hidden = name !== "process";
-    $("graph-scroll").hidden = name !== "graph";
     $("agent-trajectory").hidden = name !== "agent";
-    document.querySelector(".trace-tools").hidden = name === "traffic";
-    document.querySelector(".trace-description").hidden = name === "traffic";
-    $("view-description").textContent = name === "agent" ? "Task → model calls → tools → processes → resource activity. Dashed edges are inferred." : name === "graph" ? "Expand a process to reveal event cards and child processes." : "Expand a process to inspect its behavior and descendants.";
+    $("findings").hidden = name !== "findings";
+    document.querySelector(".trace-tools").hidden = name === "traffic" || name === "findings";
+    document.querySelector(".trace-description").hidden = name === "traffic" || name === "findings";
+    $("view-description").textContent = name === "agent" ? "Task → model calls → tools → processes → resource activity. Dashed edges are inferred." : "Expand a process to inspect its behavior and descendants.";
     if (name !== "agent") agent.closeDetail();
-    if (name === "traffic") files.close();
+    if (name === "traffic" || name === "findings") files.close();
+    if (name === "findings") $("event-detail").open = false;
     schedule();
   }
   for (const button of document.querySelectorAll("[data-observation]")) button.addEventListener("click", () => observationView(button.dataset.observation));
@@ -89,9 +104,7 @@ export function createObservation(token) {
   const trace = new TraceView({
     root: $("process-tree"), scroll: $("trace-scroll"), empty: $("empty-trace"), onSelect: selectEvent, onInspect: inspectEvidence,
   });
-  const graph = new BehaviorGraph({ root: $("behavior-graph"), scroll: $("graph-scroll"), empty: $("empty-graph"), onSelect: selectEvent,
-    onInspect: inspectEvidence,
-  });
+
 
   function schedule() {
     if (scheduled) return;
@@ -101,7 +114,6 @@ export function createObservation(token) {
       const snapshot = activitySnapshot(tree, filter);
       filters.update();
       if (activeView === "process") trace.render(snapshot);
-      if (activeView === "graph") graph.render(snapshot);
       if (activeView === "agent") {
         const summary = agent.render();
         $("event-count").textContent = (summary.tools + summary.resources).toLocaleString();
@@ -117,13 +129,14 @@ export function createObservation(token) {
     session(message) {
       sessionId = message.id;
       agent.configure(message);
+      sampleControls();
       traffic.setEnabled(Boolean(message.http_capture));
       $("capture-description").textContent = message.http_capture ? "Process lifecycle · files · TCP / UDP · HTTP/HTTPS content available in Traffic." : "Process lifecycle · files · TCP / UDP · HTTP Host / TLS SNI. HTTPS stays encrypted.";
     },
-    start(pid) { tree.start(pid); agent.setReady(true); schedule(); },
-    stop(reason) { agent.setReady(false, reason); },
-    control(control) { agent.setControl(control); },
+    start(pid) { tree.start(pid); agent.setReady(true); sampleControls(); schedule(); },
+    stop(reason) { agent.setReady(false, reason); samples.end(); sampleControls(); },
+    control(control) { agent.setControl(control); sampleControls(); },
     view:observationView,
-    add(event) { agent.add(event); if (!event.kind.startsWith("agent.")) { filter.observe(event.kind); tree.add(event); traffic.add(event); } schedule(); },
+    add(event) { samples.add(event); if (event.kind.startsWith("security.sample.")) { sampleControls(); return; } agent.add(event); sampleControls(); if (!event.kind.startsWith("agent.")) { filter.observe(event.kind); tree.add(event); traffic.add(event); } schedule(); },
   };
 }

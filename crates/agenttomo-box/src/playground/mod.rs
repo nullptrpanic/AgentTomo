@@ -9,6 +9,7 @@ mod monitor;
 #[cfg(test)]
 mod monitor_tests;
 mod payload;
+pub(crate) mod samples;
 pub(crate) mod sandbox;
 mod session;
 mod streams;
@@ -587,8 +588,8 @@ mod tests {
             ("/assets/activity-model.mjs", StatusCode::OK),
             ("/assets/network-activity.mjs", StatusCode::OK),
             ("/assets/event-evidence.mjs", StatusCode::OK),
-            ("/assets/behavior-graph.mjs", StatusCode::OK),
-            ("/assets/behavior-graph.css", StatusCode::OK),
+            ("/assets/behavior-graph.mjs", StatusCode::NOT_FOUND),
+            ("/assets/behavior-graph.css", StatusCode::NOT_FOUND),
             ("/assets/event-filter.mjs", StatusCode::OK),
             ("/assets/legacy-process-tree.mjs", StatusCode::OK),
             ("/assets/event-description.mjs", StatusCode::OK),

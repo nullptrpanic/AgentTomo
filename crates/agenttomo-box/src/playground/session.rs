@@ -23,6 +23,7 @@ pub enum Frame {
 enum Control {
     Resize { rows: u16, cols: u16 },
     AgentPrompt { task_id: String, prompt: String },
+    SampleRun { task_id: String, sample_id: String },
     AgentCancel,
 }
 
@@ -244,7 +245,23 @@ async fn drive(
                             && !prompt.trim().is_empty()
                             && prompt.len() <= 8192 =>
                     {
-                        Input::AgentPrompt { task_id, prompt }
+                        Input::AgentPrompt {
+                            task_id,
+                            prompt,
+                            sample: None,
+                        }
+                    }
+                    Control::SampleRun { task_id, sample_id }
+                        if app.settings.agent.is_some()
+                            && task_id.len() == 32
+                            && task_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            && super::samples::contains(&sample_id) =>
+                    {
+                        Input::AgentPrompt {
+                            task_id,
+                            prompt: String::new(),
+                            sample: Some(sample_id),
+                        }
                     }
                     Control::AgentCancel if app.settings.agent.is_some() => Input::AgentCancel,
                     Control::Resize { rows, cols }
