@@ -15,6 +15,20 @@ function fixture(limit = 1000) {
   return { tree, filter, add };
 }
 
+test("the unfiltered network projection supplies both visible and total counts", () => {
+  const { tree, filter, add } = fixture();
+  const flow = { pid: 20, process_instance_id: 2, connection_id: 7, request_id: 9 };
+  add("network.http.request", {...flow, method:"GET", url:"https://example.test/"});
+  add("network.http.response", {...flow, status_code:200});
+  const all = activitySnapshot(tree, filter);
+  assert.equal(all.behaviorCount, 2);
+  assert.strictEqual(all.behaviorCounts, all.totalBehaviorCounts, "reuse the counts for the same visible records");
+  filter.set("network.*", false);
+  const hidden = activitySnapshot(tree, filter);
+  assert.equal(hidden.behaviorCount, 0);
+  assert.equal(hidden.totalBehaviorCount, 2);
+});
+
 test("shared filtering retains process lineage and marks only matching descendant activity", () => {
   const { tree, filter, add } = fixture();
   add("file.open", { pid: 20, process_instance_id: 2, path: "/tmp/a" });

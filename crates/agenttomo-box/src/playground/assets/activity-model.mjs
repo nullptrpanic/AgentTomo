@@ -29,9 +29,11 @@ export function activitySnapshot(tree, filter) {
     processRecords.get(entry.nodeId).push(entry);
   }
   const records = entries.filter(entry => !isLifecycle(entry));
-  const behaviors = networkActivities(records, visible.filter(entry => !isLifecycle(entry)));
+  const visibleRecords = visible.filter(entry => !isLifecycle(entry));
+  let totalBehaviorCounts = visibleRecords.length === records.length ? null : new Map();
+  const behaviors = networkActivities(records, visibleRecords, totalBehaviorCounts);
   const behaviorCounts = countBehaviors(behaviors);
-  const totalBehaviorCounts = countBehaviors(networkActivities(records));
+  totalBehaviorCounts ??= behaviorCounts;
   return { nodes, entries, visible, counts, processRecords, behaviors, behaviorCounts, totalBehaviorCounts,
     behaviorCount: total(behaviorCounts), totalBehaviorCount: total(totalBehaviorCounts) };
 }

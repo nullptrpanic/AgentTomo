@@ -111,15 +111,15 @@ export function createObservation(token) {
     scheduled = true;
     requestAnimationFrame(() => {
       scheduled = false;
-      const snapshot = activitySnapshot(tree, filter);
       filters.update();
-      if (activeView === "process") trace.render(snapshot);
       if (activeView === "agent") {
         const summary = agent.render();
         $("event-count").textContent = (summary.tools + summary.resources).toLocaleString();
         $("trace-summary").textContent = `${summary.tasks} tasks · ${summary.tools} tools · ${summary.processes} processes · ${summary.resources} resource cards`;
         return;
       }
+      const snapshot = activitySnapshot(tree, filter);
+      if (activeView === "process") trace.render(snapshot);
       $("event-count").textContent = snapshot.behaviorCount.toLocaleString();
       $("trace-summary").textContent = `${snapshot.nodes.size} process${snapshot.nodes.size === 1 ? "" : "es"} · ${snapshot.behaviorCount}/${snapshot.totalBehaviorCount} behaviors${tree.total > tree.limit ? " · recent history" : ""}`;
     });

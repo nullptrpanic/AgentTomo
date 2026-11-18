@@ -93,9 +93,13 @@ function udpSummary(card) {
 
 // A stateless projection of the shared bounded window. IDs are scoped to the
 // owning process lifetime; neither destination nor packet size is an identity.
-export function networkActivities(entries, visible = entries) {
+export function networkActivities(entries, visible = entries, totalCounts) {
   const allowed = new Set(visible.map(entry => entry.id));
   const flows = new Map(), requests = new Map(), cards = [];
+  // Count each logical item before the display filter hides it.
+  const count = nodeId => {
+    if (totalCounts) totalCounts.set(nodeId, (totalCounts.get(nodeId) ?? 0) + 1);
+  };
   for (const entry of entries) {
     const { kind, data: d = {} } = entry.event;
     if (kind.startsWith("network.udp.") && validId(d.flow_id)) {
@@ -106,10 +110,14 @@ export function networkActivities(entries, visible = entries) {
     const isHttp = httpEventField(kind) && validId(d.request_id);
     if (isTcp) group(flows, entry, "tcp", d.connection_id).records.push(entry);
     if (isHttp) group(requests, entry, "http", d.request_id).records.push(entry);
-    if (!isTcp && !isHttp && allowed.has(entry.id)) cards.push(entry);
+    if (!isTcp && !isHttp) {
+      count(entry.nodeId);
+      if (allowed.has(entry.id)) cards.push(entry);
+    }
   }
   const matches = card => card.records.some(entry => allowed.has(entry.id));
   for (const request of requests.values()) {
+    count(request.nodeId);
     const entry = request.records.find(entry => validId(entry.event.data.connection_id));
     const parent = entry && flows.get(key(entry, "tcp", entry.event.data.connection_id));
     if (parent) {
@@ -121,6 +129,7 @@ export function networkActivities(entries, visible = entries) {
     } else if (matches(request)) cards.push(httpSummary(request));
   }
   for (const flow of flows.values()) {
+    count(flow.nodeId);
     if (!matches(flow)) continue;
     chronological(flow.children);
     cards.push(flow.type === "tcp" ? tcpSummary(flow) : udpSummary(flow));

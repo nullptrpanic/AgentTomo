@@ -97,6 +97,20 @@ test("filters remove HTTP children, retain TCP context, and never alter known re
   assert.deepEqual(networkActivities(entries, []), []);
 });
 
+test("filtered projections count every logical activity once for its owning process", () => {
+  const entries = [
+    tcp(1, "network.upstream"), http(2, "request"), http(3, "response"),
+    http(4, "request", { request_id: 8 }), entry(5, "file.open"),
+    entry(6, "network.http.error", { request_id: 7 }, "process-2"),
+    entry(7, "network.udp.send", { flow_id: 10 }, "process-2"),
+    entry(8, "network.udp.receive", { flow_id: 10 }, "process-2"),
+  ];
+  const totals = new Map();
+  assert.deepEqual(networkActivities(entries, [entries[4]], totals), [entries[4]]);
+  assert.equal(totals.get("process-1"), 4);
+  assert.equal(totals.get("process-2"), 2);
+});
+
 test("partial histories do not invent URLs or transport IDs, and old unkeyed events stay separate", () => {
   const body = http(9, "response.body", { body: { observed_bytes: 11, complete: true } });
   const cards = networkActivities([body, entry(10, "network.http.error", { request_id: 8, error: "reset" }),
