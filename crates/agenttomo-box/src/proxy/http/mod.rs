@@ -149,7 +149,7 @@ struct MessageContext {
     request_id: u64,
     start: Instant,
     unix_ns: u128,
-    response: bool,
+    status: Option<StatusCode>,
     connect: bool,
     agent: Option<crate::agent::Scope>,
     model_protocol: Option<crate::agent::Protocol>,
@@ -173,11 +173,14 @@ impl MessageContext {
             let _ordered = message.session.inspection.semantic_serial.lock().await;
             for mut event in events {
                 if let Some(content) = event.content {
-                    event.data["preview"] = content
-                        .as_str()
-                        .map(|text| text.chars().take(4096).collect::<String>())
-                        .unwrap_or_else(|| "Structured content".to_owned())
-                        .into();
+                    if let Some(text) = content.as_str() {
+                        if event.kind == "agent.message" {
+                            event.data["text_bytes"] = text.len().into();
+                        }
+                        event.data["preview"] = text.chars().take(4096).collect::<String>().into();
+                    } else {
+                        event.data["preview"] = "Structured content".into();
+                    }
                     event.data["payload"] =
                         match message.session.inspection.semantic.save(&content).await {
                             Ok(reference) => reference,
@@ -228,7 +231,7 @@ impl MessageContext {
         completed: u128,
         duration: u128,
     ) -> stdio::Result<()> {
-        self.emit(if self.response { "network.http.response.body" } else { "network.http.request.body" }, json!({"body":body,"trailers":trailers,"completed_unix_ns":completed,"duration_ns":duration})).await
+        self.emit(if self.status.is_some() { "network.http.response.body" } else { "network.http.request.body" }, json!({"body":body,"trailers":trailers,"completed_unix_ns":completed,"duration_ns":duration})).await
     }
 }
 
@@ -456,7 +459,7 @@ async fn handle(
         session,
         start: Instant::now(),
         unix_ns: now(),
-        response: false,
+        status: None,
         connect,
         agent,
         model_protocol,
@@ -502,7 +505,8 @@ async fn handle(
     })
     .flatten();
     let client_upgrade = upgrade_requested.then(|| hyper::upgrade::on(&mut request));
-    let request = request.map(|inner| body::Observed::new(inner, message.clone(), None));
+    let request =
+        request.map(|inner| body::Observed::new(inner, message.clone(), body::Format::Model));
     let result = transport::send(sender, request).await;
     let mut response = match result {
         Ok(response) => response,
@@ -582,7 +586,7 @@ async fn handle(
         });
     }
     let response_message = MessageContext {
-        response: true,
+        status: Some(response.status()),
         encoding: response
             .headers()
             .get("content-encoding")
@@ -591,38 +595,21 @@ async fn handle(
             .to_owned(),
         ..message
     };
-    let sse = response_message.agent.is_some()
-        && response_message
+    let format = body::Format::response(
+        response.headers(),
+        response.status(),
+        response_message
             .model_protocol
-            .is_some_and(crate::agent::Protocol::expects_sse)
-        && !upgrade_requested
-        || response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .eq_ignore_ascii_case("text/event-stream")
-            });
-    let encoding = sse.then(|| {
-        response
-            .headers()
-            .get("content-encoding")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_owned()
-    });
-    if sse {
+            .filter(|_| response_message.agent.is_some()),
+        upgrade_requested,
+    );
+    if format == body::Format::Sse {
         response_message
             .emit(
                 "network.stream.open",
-                json!({"protocol":"sse","content_encoding":encoding,"retention":"sliding_window"}),
+                json!({"protocol":"sse","content_encoding":response_message.encoding,"retention":"sliding_window"}),
             )
             .await?;
     }
-    Ok(response.map(|inner| body::Observed::new(inner, response_message, encoding).boxed_unsync()))
+    Ok(response.map(|inner| body::Observed::new(inner, response_message, format).boxed_unsync()))
 }

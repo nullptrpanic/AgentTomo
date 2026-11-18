@@ -1,7 +1,7 @@
 //! Decode retained HTTP entity bytes only for inspection; never alter forwarding.
 
-use flate2::read::{MultiGzDecoder, ZlibDecoder};
-use std::io::{self, Read};
+use crate::content_encoding::ContentEncoding;
+use std::io;
 
 pub const MAX_DECODED_BYTES: usize = 1024 * 1024;
 
@@ -12,25 +12,15 @@ pub struct Decoded {
 
 pub fn decode(bytes: Vec<u8>, encoding: &str) -> Decoded {
     let mut output = Vec::new();
-    let limit = MAX_DECODED_BYTES as u64 + 1;
-    let result = match encoding.trim().to_ascii_lowercase().as_str() {
-        "" | "identity" => {
+    let result = match ContentEncoding::parse(encoding) {
+        Some(ContentEncoding::Identity) => {
             return Decoded {
                 bytes,
                 status: "identity",
             };
         }
-        "gzip" | "x-gzip" => MultiGzDecoder::new(bytes.as_slice())
-            .take(limit)
-            .read_to_end(&mut output),
-        "deflate" => ZlibDecoder::new(bytes.as_slice())
-            .take(limit)
-            .read_to_end(&mut output),
-        "zstd" => zstd::stream::read::Decoder::new(bytes.as_slice()).and_then(|mut decoder| {
-            decoder.window_log_max(26)?;
-            decoder.take(limit).read_to_end(&mut output)
-        }),
-        _ => {
+        Some(encoding) => encoding.read(&bytes, MAX_DECODED_BYTES + 1, &mut output),
+        None => {
             return Decoded {
                 bytes,
                 status: "unsupported",

@@ -1,4 +1,5 @@
 use super::{Prefix, Recorder, inflate};
+use crate::content_encoding::ContentEncoding;
 use crate::proxy::http::MessageContext;
 use flate2::Decompress;
 use serde_json::json;
@@ -18,10 +19,10 @@ pub(in crate::proxy::http) struct Observer {
 impl Observer {
     pub fn new(message: &MessageContext, encoding: &str) -> Self {
         let recorder = Recorder::new(message, "sse", "downstream");
-        let (decoder, failed) = match encoding.trim().to_ascii_lowercase().as_str() {
-            "" | "identity" => (None, false),
-            "gzip" => (Some(Decompress::new_gzip(15)), false),
-            "deflate" => (Some(Decompress::new(true)), false),
+        let (decoder, failed) = match ContentEncoding::parse(encoding) {
+            Some(ContentEncoding::Identity) => (None, false),
+            Some(ContentEncoding::Gzip) => (Some(Decompress::new_gzip(15)), false),
+            Some(ContentEncoding::Deflate) => (Some(Decompress::new(true)), false),
             _ => {
                 recorder.error("unsupported SSE Content-Encoding; forwarding continues");
                 (None, true)

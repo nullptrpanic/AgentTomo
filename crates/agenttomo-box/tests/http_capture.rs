@@ -83,6 +83,73 @@ fn check_capture(fixture: &Fixture, scheme: &str) {
 }
 
 #[test]
+fn json_model_responses_keep_http_evidence_and_semantic_outcomes() {
+    for (status, body, outcome) in [
+        (
+            "200 OK",
+            r#"{"id":"response-1","status":"completed","output":[{"id":"reply","type":"message","content":[{"type":"output_text","text":"local answer"}]}]}"#,
+            "completed",
+        ),
+        (
+            "401 Unauthorized",
+            r#"{"error":{"message":"fixture authorization expired"}}"#,
+            "failed",
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_headers(&mut stream);
+            let mut request = [0; 2];
+            stream.read_exact(&mut request).unwrap();
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: Application/Json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let fixture = fixture();
+        let mut command = fixture.command(&format!("export AGENTTOMO_AGENT_ID=fixture AGENTTOMO_TASK_ID=task; exec curl --noproxy '*' --max-time 5 -sS -d '{{}}' http://{address}/v1/responses"));
+        command.arg("--capture-http");
+        let output = Fixture::wait(command);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, body.as_bytes());
+        server.join().unwrap();
+        let events = fixture.events();
+        let data = |kind: &str| {
+            &events
+                .iter()
+                .find(|e| e["kind"] == kind)
+                .unwrap_or_else(|| panic!("missing {kind} for {status}"))["data"]
+        };
+        assert_eq!(
+            data("network.http.response.body")["body"]["status"],
+            "complete"
+        );
+        assert!(!events.iter().any(|e| e["kind"] == "network.stream.open"));
+        assert_eq!(data("agent.model.complete")["status"], outcome);
+        let payload = &data("agent.model.complete")["payload"];
+        let offset = payload["offset"].as_u64().unwrap() as usize;
+        let size = payload["captured_bytes"].as_u64().unwrap() as usize;
+        let stored = std::fs::read(fixture.0.join("run/agent-payloads.bin")).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&stored[offset..offset + size]).unwrap(),
+            serde_json::from_str::<Value>(body).unwrap()
+        );
+        if outcome == "completed" {
+            assert_eq!(data("agent.message")["preview"], "local answer");
+        } else {
+            assert!(
+                data("agent.capture.error")["error"]
+                    .to_string()
+                    .contains("fixture authorization expired")
+            );
+        }
+    }
+}
+
+#[test]
 fn http_prefix_limits_do_not_truncate_forwarded_requests_or_responses() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

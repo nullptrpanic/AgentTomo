@@ -33,6 +33,11 @@ pub trait ModelProtocol: Send + Sync {
 /// sentinels belong here; forwarding, limits and evidence correlation do not.
 pub trait ModelDecoder: Send {
     fn request(&mut self, bytes: &[u8]) -> io::Result<Vec<Event>>;
+    fn http_response(
+        &mut self,
+        status: axum::http::StatusCode,
+        bytes: &[u8],
+    ) -> io::Result<Vec<Event>>;
     fn event(&mut self, data: &str) -> io::Result<Vec<Event>>;
     fn websocket_request(&mut self, bytes: &[u8]) -> io::Result<Vec<Event>>;
 }
@@ -84,6 +89,13 @@ mod tests {
     }
 
     impl ModelDecoder for PlainDecoder {
+        fn http_response(
+            &mut self,
+            _: axum::http::StatusCode,
+            bytes: &[u8],
+        ) -> io::Result<Vec<Event>> {
+            self.event(std::str::from_utf8(bytes).map_err(io::Error::other)?)
+        }
         fn request(&mut self, bytes: &[u8]) -> io::Result<Vec<Event>> {
             Ok(vec![Event {
                 kind: "agent.model.request",
@@ -122,8 +134,8 @@ mod tests {
     #[test]
     fn selected_decoder_owns_payload_syntax_and_completion_sentinels() {
         let mut observer = observer(Protocol::new(&PlainProtocol));
-        observer.feed_request(b"plain request, not JSON");
-        let request = observer.finish_request("identity", true);
+        observer.feed_body(b"plain request, not JSON");
+        let request = observer.finish_body("identity", true, None);
         assert_eq!(request[0].kind, "agent.model.request");
         assert_eq!(request[0].content, Some("plain request, not JSON".into()));
         assert_eq!(request[0].data["task_id"], "t");

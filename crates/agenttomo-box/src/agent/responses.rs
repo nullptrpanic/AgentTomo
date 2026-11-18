@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::{collections::HashSet, io};
 
 use super::protocol::{Event, MessageKind, ModelDecoder, ModelProtocol};
-use axum::http::{Method, Uri};
+use axum::http::{Method, StatusCode, Uri};
 
 pub struct Responses;
 
@@ -24,6 +24,61 @@ impl ModelProtocol for Responses {
 impl ModelDecoder for Response {
     fn request(&mut self, bytes: &[u8]) -> io::Result<Vec<Event>> {
         Ok(request(&serde_json::from_slice(bytes)?))
+    }
+    fn http_response(&mut self, status: StatusCode, bytes: &[u8]) -> io::Result<Vec<Event>> {
+        let value: Value = match serde_json::from_slice(bytes) {
+            Ok(value) => value,
+            Err(_) if !status.is_success() => {
+                Value::String(String::from_utf8_lossy(bytes).into_owned())
+            }
+            Err(error) => {
+                return Err(io::Error::other(format!(
+                    "invalid model response JSON: {error}"
+                )));
+            }
+        };
+        let failed =
+            !status.is_success() || !value["error"].is_null() || value["status"] == "failed";
+        if !failed && matches!(value["status"].as_str(), Some("queued" | "in_progress")) {
+            return Ok(vec![Event {
+                kind: "agent.model.started",
+                data: json!({"response_id":value["id"],"model":value["model"],"status":value["status"],"status_code":status.as_u16()}),
+                content: Some(value),
+            }]);
+        }
+        if !failed && !value["output"].is_array() && !value["status"].is_string() {
+            return Err(io::Error::other(
+                "missing output or status in model response JSON",
+            ));
+        }
+        let mut events = Vec::new();
+        if failed {
+            let detail = value["error"]["message"]
+                .as_str()
+                .or(value["error"].as_str())
+                .or(value["detail"].as_str())
+                .or(value["message"].as_str())
+                .or(value.as_str());
+            let message = detail
+                .map(|text| text.chars().take(4096).collect::<String>())
+                .unwrap_or_default();
+            events.push(Event {
+                kind: "agent.capture.error",
+                data: json!({"error":format!("HTTP {status} {message}").trim_end(), "status_code":status.as_u16()}),
+                content: None,
+            });
+        }
+        let outcome = if failed {
+            "failed"
+        } else {
+            value["status"].as_str().unwrap_or("completed")
+        };
+        let mut complete = self.complete(&value, outcome);
+        for event in &mut complete {
+            event.data["status_code"] = status.as_u16().into();
+        }
+        events.extend(complete);
+        Ok(events)
     }
     fn event(&mut self, data: &str) -> io::Result<Vec<Event>> {
         if data.trim() == "[DONE]" {
@@ -96,23 +151,20 @@ impl Response {
                     events.push(tool(item, "agent.tool.started", None));
                 }
             }
-            "response.output_text.delta" => events.push(Event {
+            "response.output_text.delta" | "response.refusal.delta" => events.push(Event {
                 kind: "agent.message.delta",
                 data: json!({"item_id":value["item_id"],"delta":value["delta"]}),
                 content: None,
             }),
             "response.output_item.done" => self.complete_item(&value["item"], &mut events),
-            "response.completed" | "response.incomplete" | "response.failed" => {
-                if let Some(items) = value["response"]["output"].as_array() {
-                    for item in items {
-                        self.complete_item(item, &mut events);
-                    }
-                }
-                events.push(Event {
-                    kind: "agent.model.complete",
-                    data: json!({"response_id":value["response"]["id"],"status":value["response"]["status"],"usage":value["response"]["usage"],"error":value["response"]["error"]}),
-                    content: Some(value["response"].clone()),
-                });
+            kind @ ("response.completed" | "response.incomplete" | "response.failed") => {
+                let response = &value["response"];
+                events = self.complete(
+                    response,
+                    response["status"]
+                        .as_str()
+                        .unwrap_or(&kind["response.".len()..]),
+                );
             }
             "error" => events.push(Event {
                 kind: "agent.capture.error",
@@ -128,6 +180,26 @@ impl Response {
                 }
             }
         }
+        events
+    }
+
+    fn complete(&mut self, response: &Value, status: &str) -> Vec<Event> {
+        let mut events = Vec::new();
+        if let Some(items) = response["output"].as_array() {
+            for item in items {
+                self.complete_item(item, &mut events);
+            }
+        }
+        if let Some(id) = response["id"].as_str() {
+            for event in &mut events {
+                event.data["response_id"] = id.into();
+            }
+        }
+        events.push(Event {
+            kind: "agent.model.complete",
+            data: json!({"response_id":response["id"],"status":status,"usage":response["usage"],"error":response["error"]}),
+            content: Some(response.clone()),
+        });
         events
     }
 
@@ -164,8 +236,11 @@ impl Response {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter(|part| part["type"] == "output_text")
-                .filter_map(|part| part["text"].as_str())
+                .filter_map(|part| match part["type"].as_str() {
+                    Some("output_text") => part["text"].as_str(),
+                    Some("refusal") => part["refusal"].as_str(),
+                    _ => None,
+                })
                 .collect::<String>();
             events.push(Event {
                 kind: "agent.message",
@@ -193,6 +268,35 @@ fn tool(item: &Value, kind: &'static str, content: Option<Value>) -> Event {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn plain_json_preserves_tool_arguments_and_background_status() {
+        let mut decoder = Responses.decoder();
+        let pending = decoder
+            .http_response(StatusCode::ACCEPTED, br#"{"id":"r","status":"queued"}"#)
+            .unwrap();
+        assert_eq!(pending[0].kind, "agent.model.started");
+        let completed = decoder.http_response(StatusCode::OK, br#"{"id":"r","status":"completed","output":[{"type":"function_call","id":"tool","call_id":"c","name":"lookup","arguments":"{}"}]}"#).unwrap();
+        assert_eq!(completed[0].kind, "agent.tool.call");
+        assert_eq!(completed[0].data["response_id"], "r");
+        assert_eq!(completed[0].content, Some(json!("{}")));
+        assert_eq!(completed[1].kind, "agent.model.complete");
+    }
+
+    #[test]
+    fn refusal_and_text_are_retained_in_output_order() {
+        let mut response = Response::default();
+        let delta = response
+            .event(json!({"type":"response.refusal.delta","item_id":"m","delta":"Declined"}));
+        assert_eq!(
+            delta.first().map(|e| &e.data["delta"]),
+            Some(&json!("Declined"))
+        );
+        let output = response.event(json!({"type":"response.output_item.done","item":{
+            "id":"m","type":"message","content":[{"type":"refusal","refusal":"Declined."},{"type":"output_text","text":" Another option."}]
+        }}));
+        assert_eq!(output[0].content, Some(json!("Declined. Another option.")));
+    }
 
     #[test]
     fn messages_normalize_semantics_without_losing_original_phase() {

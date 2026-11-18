@@ -8,6 +8,54 @@ use std::{
     task::{Context, Poll},
 };
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Format {
+    Ordinary,
+    Model,
+    Sse,
+}
+
+impl Format {
+    pub fn response(
+        headers: &axum::http::HeaderMap,
+        status: axum::http::StatusCode,
+        protocol: Option<crate::agent::Protocol>,
+        upgrade_requested: bool,
+    ) -> Self {
+        if status.is_informational()
+            || status.is_redirection()
+            || matches!(status.as_u16(), 204 | 205)
+        {
+            return Self::Ordinary;
+        }
+        if protocol.is_some() && (status.is_client_error() || status.is_server_error()) {
+            return Self::Model;
+        }
+        let header = headers.get("content-type");
+        let media = header
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if media == "text/event-stream" {
+            return Self::Sse;
+        }
+        let Some(protocol) = protocol else {
+            return Self::Ordinary;
+        };
+        if media == "application/json" || media.ends_with("+json") {
+            return Self::Model;
+        }
+        if header.is_none() && status.is_success() && !upgrade_requested && protocol.expects_sse() {
+            return Self::Sse;
+        }
+        Self::Ordinary
+    }
+}
+
 pub struct Observed {
     inner: Incoming,
     capture: Option<Capture>,
@@ -19,14 +67,14 @@ pub struct Observed {
 }
 
 impl Observed {
-    pub fn new(inner: Incoming, message: MessageContext, encoding: Option<String>) -> Self {
-        let model = (!message.response && !inner.is_end_stream())
-            .then(|| message.model_observer())
-            .flatten();
-        let capture = encoding
-            .is_none()
-            .then(|| message.session.inspection.store.capture());
-        let sse = encoding.map(|encoding| super::streams::sse::Observer::new(&message, &encoding));
+    pub(super) fn new(inner: Incoming, message: MessageContext, format: Format) -> Self {
+        let model = (format == Format::Model
+            && (message.status.is_some() || !inner.is_end_stream()))
+        .then(|| message.model_observer())
+        .flatten();
+        let capture = (format != Format::Sse).then(|| message.session.inspection.store.capture());
+        let sse = (format == Format::Sse)
+            .then(|| super::streams::sse::Observer::new(&message, &message.encoding));
         let mut body = Self {
             inner,
             capture,
@@ -47,8 +95,11 @@ impl Observed {
         }
         self.done = true;
         if let Some(model) = &mut self.model {
-            self.message
-                .semantic(model.finish_request(&self.message.encoding, complete));
+            self.message.semantic(model.finish_body(
+                &self.message.encoding,
+                complete,
+                self.message.status,
+            ));
         }
         let capture = self.capture.take();
         let streaming = self.sse.is_some();
@@ -80,7 +131,7 @@ impl Body for Observed {
                 if let Some(bytes) = frame.data_ref()
                     && let Some(model) = &mut self.model
                 {
-                    model.feed_request(bytes);
+                    model.feed_body(bytes);
                 }
                 if let Some(bytes) = frame.data_ref()
                     && let Some(capture) = &mut self.capture
@@ -116,5 +167,63 @@ impl Body for Observed {
 impl Drop for Observed {
     fn drop(&mut self) {
         self.finish(self.inner.is_end_stream());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Format;
+    use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+
+    #[test]
+    fn model_stream_fallback_respects_response_headers_and_status() {
+        let protocol =
+            crate::agent::Protocol::detect(&Method::POST, &"/v1/responses".parse().unwrap());
+        for (content_type, status, upgrade, expected) in [
+            (None, StatusCode::OK, false, Format::Sse),
+            (None, StatusCode::NO_CONTENT, false, Format::Ordinary),
+            (
+                Some("application/json"),
+                StatusCode::NO_CONTENT,
+                false,
+                Format::Ordinary,
+            ),
+            (
+                Some("text/event-stream"),
+                StatusCode::UNAUTHORIZED,
+                false,
+                Format::Model,
+            ),
+            (None, StatusCode::OK, true, Format::Ordinary),
+            (
+                Some("application/json"),
+                StatusCode::TEMPORARY_REDIRECT,
+                false,
+                Format::Ordinary,
+            ),
+            (None, StatusCode::UNAUTHORIZED, false, Format::Model),
+            (
+                Some("Application/Problem+JSON; charset=utf-8"),
+                StatusCode::OK,
+                false,
+                Format::Model,
+            ),
+            (Some("text/plain"), StatusCode::OK, false, Format::Ordinary),
+            (
+                Some("text/event-stream"),
+                StatusCode::OK,
+                false,
+                Format::Sse,
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = content_type {
+                headers.insert("content-type", HeaderValue::from_static(value));
+            }
+            assert_eq!(
+                Format::response(&headers, status, protocol, upgrade),
+                expected
+            );
+        }
     }
 }

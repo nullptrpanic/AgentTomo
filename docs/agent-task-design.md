@@ -4,7 +4,7 @@
 
 The Playground offers Chat alongside Terminal and Browser. Chat launches the externally installed Codex executable inside the existing traced sandbox. Each conversation permits one active foreground task and supports subsequent turns through `codex exec resume`.
 
-Model semantics come from observed Responses HTTP requests and SSE or WebSocket messages. The collector reads allowlisted correlation environment variables at successful exec. Codex session and rollout files are excluded from file-content previews. The launcher uses the CLI stdout `thread.started` control notification to retain the conversation ID.
+Model semantics come from observed Responses HTTP requests, JSON responses, and SSE or WebSocket messages. The collector reads allowlisted correlation environment variables at successful exec. Codex session and rollout files are excluded from file-content previews. The launcher uses the CLI stdout `thread.started` control notification to retain the conversation ID.
 
 Model and tool records are grouped using transport request IDs and Responses IDs, including successive responses on one WebSocket connection. Process attribution retains its separate inferred provenance.
 
@@ -69,7 +69,7 @@ At the executable boundary, the selected adapter supplies runtime executable nam
 
 `proxy/credentials` owns the existing host-only gateway, placeholder matching, exact origin/method/path enforcement, session revocation and static or reloadable header sources. `agent/codex/credentials` supplies the allowed operations and interprets Codex login/config formats. Host login reload still checks account consistency and token expiry. Credential sources and policies are never serialized; bootstrap sends only sanitized files. The gateway continues to reuse the common HTTP transport, TLS authority and outbound CONNECT implementation.
 
-`agent/protocol.rs` registers `ModelProtocol` implementations and selects one from HTTP request metadata. Each creates its own mutable `ModelDecoder`, which receives decompressed request bytes and framed SSE/WebSocket payloads, then emits normalized events. JSON parsing and the `[DONE]` sentinel belong to the Responses implementation in `agent/responses.rs`; this parser is shared by any agent speaking that protocol. `agent/wire.rs` retains compression, size limits, completion checks and correlation, while the existing proxy retains framing and forwarding. Decoder state is never shared between streams. Agent adapters and model protocol adapters are independent: adding an agent that speaks Responses does not require another Responses parser.
+`agent/protocol.rs` registers `ModelProtocol` implementations and selects one from HTTP request metadata. Each creates its own mutable `ModelDecoder`, which receives decompressed HTTP bodies, the response status, and framed SSE/WebSocket payloads, then emits normalized events. JSON parsing and the `[DONE]` sentinel belong to the Responses implementation in `agent/responses.rs`; this parser is shared by any agent speaking that protocol. `agent/wire.rs` retains compression, size limits, completion checks and correlation, while the existing proxy retains framing and forwarding. Decoder state is never shared between streams. Agent adapters and model protocol adapters are independent: adding an agent that speaks Responses does not require another Responses parser.
 
 Adding a built-in adapter requires implementing these contracts and registering it, rather than adding Agent-specific branches to the collector, workspace or UI. This is compile-time integration, without dynamic library loading or a separate plugin framework. Tests exercise the common launcher with a non-Codex input format and exercise separate decoders with non-JSON payloads.
 
@@ -90,10 +90,10 @@ For compatibility, the frontend converts old events without `message_kind` once 
 | Task | `agent.task.started`, `agent.task.diagnostic`, `agent.task.finished`, `agent.task.rejected` | Submitted prompt, live runtime diagnostics and execution outcome |
 | Model call | `agent.model.request`, `agent.model.started`, `agent.model.complete` | Full decoded request and final response object, response ID, usage and status |
 | Tool call | `agent.tool.started`, `agent.tool.call`, `agent.tool.result` | Complete model-visible parameters and returned content |
-| Assistant message | `agent.message.delta`, `agent.message` | Streaming text and complete final message |
+| Assistant message | `agent.message.delta`, `agent.message` | Streaming text, refusals and complete final message |
 | Capture issue | `agent.capture.error` | Unsupported, malformed, incomplete or oversized protocol data |
 
-`agent-payloads.bin` stores complete JSON-encoded semantic values. Journal records reference byte ranges. The authenticated `agent-payload` endpoint applies the same session-directory and no-symlink checks as existing payload endpoints. The network preview prefix and stream sliding window do not determine semantic retention. Forwarding preserves the original bodies.
+`agent-payloads.bin` stores complete JSON-encoded semantic values. Journal records reference byte ranges. The authenticated `agent-payload` endpoint applies the same session-directory and no-symlink checks as existing payload endpoints. The network preview prefix and stream sliding window do not determine semantic retention. Explicit JSON responses retain their HTTP body and model outcome, including error responses. A successful Responses exchange without a content type retains the existing SSE fallback. Forwarding preserves the original bodies.
 
 Responses custom tools include Code Mode source text. Function tools retain their complete argument string. Outputs found in later model requests are joined using the model call ID, with duplicates from repeated conversation history removed. Native or provider-side tool records are retained when present in Responses output. Returned fields are shown when the protocol exposes them.
 
@@ -147,7 +147,7 @@ Owner and independent monitor pages project the same journal using separate curs
 | Resource | Limit |
 | --- | --- |
 | Submitted prompt | 8 KiB UTF-8 |
-| Decoded model request, model SSE event, semantic payload | 32 MiB each |
+| Decoded model HTTP body, model SSE event, semantic payload | 32 MiB each |
 | Zstd decoder window | 64 MiB |
 | Semantic payload budget | 512 MiB per run |
 | Trajectory resource history in the browser | Latest 20,000 records, with an omission notice |

@@ -1,6 +1,7 @@
 mod agent;
 mod cli;
 mod collectors;
+mod content_encoding;
 mod credentials;
 mod execution;
 mod network;
