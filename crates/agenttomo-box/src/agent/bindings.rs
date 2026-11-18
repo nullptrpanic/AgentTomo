@@ -62,7 +62,12 @@ impl Hub {
         }
         let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, identity.pid, 0) };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error());
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(nix::libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(error)
+            };
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
         if cancelled {
@@ -251,6 +256,26 @@ fn kill(fd: &OwnedFd) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tracking_a_process_that_already_exited_keeps_its_historical_binding() {
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let identity = crate::process::Identity {
+            pid: child.id() as i32,
+            process_instance_id: 123,
+        };
+        child.wait().unwrap();
+        let hub = Hub::default();
+        hub.exec(
+            123,
+            &json!({"AGENTTOMO_AGENT_ID":"fixture","AGENTTOMO_TASK_ID":"t"}),
+            false,
+        );
+        hub.track(identity).unwrap();
+        let state = hub.state.lock().unwrap();
+        assert!(state.processes.contains_key(&123));
+        assert!(!state.live.contains_key(&123));
+    }
     #[test]
     fn runtime_helpers_keep_later_workers_on_their_current_calls() {
         let hub = Hub::default();

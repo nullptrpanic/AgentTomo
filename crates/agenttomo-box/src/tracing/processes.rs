@@ -20,6 +20,12 @@ struct Group {
     members: HashSet<Pid>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct Child {
+    pub identity: Identity,
+    pub exited: bool,
+}
+
 impl Registry {
     pub fn observe(&mut self, handle: Pid) -> Option<Identity> {
         if let Some(tracee) = self.tracees.get(&handle) {
@@ -52,14 +58,20 @@ impl Registry {
         identity
     }
 
-    pub fn child(&mut self, handle: Pid) -> Option<Identity> {
+    pub fn child(&mut self, handle: Pid) -> Option<Child> {
         // A child can finish before waitpid reports the parent's creation stop.
         if let Some(identity) = self.unparented_exits.remove(&handle) {
-            return Some(identity);
+            return Some(Child {
+                identity,
+                exited: true,
+            });
         }
         let identity = self.observe(handle)?;
         self.tracees.get_mut(&handle).unwrap().linked = true;
-        Some(identity)
+        Some(Child {
+            identity,
+            exited: false,
+        })
     }
 
     pub fn exec(&mut self, handle: Pid, former: Pid) -> Identity {
@@ -132,7 +144,21 @@ mod tests {
         let child = Pid::from_raw(11);
         let identity = registry.register(child, 11);
         assert_eq!(registry.exit(child), Some(identity));
-        assert_eq!(registry.child(child), Some(identity));
-        assert_ne!(registry.register(child, 11), identity);
+        let reused = registry.register(child, 11);
+        assert_ne!(reused, identity);
+        assert_eq!(
+            registry.child(child),
+            Some(Child {
+                identity,
+                exited: true
+            })
+        );
+        assert_eq!(
+            registry.child(child),
+            Some(Child {
+                identity: reused,
+                exited: false
+            })
+        );
     }
 }

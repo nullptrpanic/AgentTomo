@@ -330,9 +330,6 @@ fn run(
                     | nix::libc::PTRACE_EVENT_VFORK
                     | nix::libc::PTRACE_EVENT_CLONE => {
                         let new = Pid::from_raw(ptrace::getevent(pid)? as i32);
-                        if known.insert(new) {
-                            newborn.insert(new);
-                        }
                         let kind = match event {
                             nix::libc::PTRACE_EVENT_FORK => "process.fork",
                             nix::libc::PTRACE_EVENT_VFORK => "process.vfork",
@@ -340,10 +337,19 @@ fn run(
                         };
                         let parent = processes.observe(pid);
                         let child = processes.child(new);
-                        if let (Some(parent), Some(child)) = (parent, child) {
-                            agents.fork(parent.process_instance_id, child.process_instance_id);
-                            agents.track(child)?;
+                        if !child.as_ref().is_some_and(|child| child.exited) && known.insert(new) {
+                            newborn.insert(new);
                         }
+                        if let (Some(parent), Some(child)) = (parent, &child) {
+                            agents.fork(
+                                parent.process_instance_id,
+                                child.identity.process_instance_id,
+                            );
+                            if !child.exited {
+                                agents.track(child.identity)?;
+                            }
+                        }
+                        let child = child.map(|child| child.identity);
                         if parent.is_none() || child.is_none() || parent != child {
                             let mut data = json!({
                                 "parent_pid": parent.map(|p| p.pid),
