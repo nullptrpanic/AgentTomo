@@ -75,4 +75,4 @@ socket 成功创建时，读取该已知 FD 的 inode 并分配运行内 socket 
 
 文件预览从成功打开的已知 FD 固定可读普通文件对象，由 recording 异步保存有上限的内容前缀，不在浏览器点击时重读路径。默认 64 KiB/文件、16 MiB/运行，可通过 `--file-preview-max-bytes`、`--file-preview-total-bytes` 调整或设为 0 禁用。快照与 JSONL 分开保存，事件包含范围和完整性状态；它不是 read 调用记录，也不是原子文件快照。支持范围及 Web 读取边界见[内容检查设计](content-inspection-design.md)。
 
-根命令退出时前台返回；ptrace 继续跟踪全部后代。全部目标退出后代理排空已接收的上行数据，停止等待无接收者的下行，落盘后才标记 complete。上游 TCP 建连有 30 秒超时。
+根命令退出时前台返回；ptrace 继续跟踪全部后代。全部目标退出后，透明 TCP 字节转发最多用 5 秒排空上行数据，同时停止等待下行。超时会在 `network.transfer` 中记录 `upload_drain_timeout`，普通 TCP 记录已写入上游的字节数。事件落盘后采集状态转为 complete。上游 TCP 建连有 30 秒超时。

@@ -24,65 +24,79 @@ pub async fn copy(
     context: &Context,
     events: &mpsc::Sender<Observation>,
 ) -> io::Result<Outcome> {
-    let (mut client_read, mut client_write) = tokio::io::split(client);
-    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
-    let upload = async {
-        let mut inspector = Inspector::default();
-        let mut buffer = [0; 8192];
-        let mut count = 0;
+    let (client_read, mut client_write) = tokio::io::split(client);
+    let (mut upstream_read, upstream_write) = tokio::io::split(upstream);
+    let mut up = 0;
+    let mut down = None;
+    let reason = {
+        let upload = upload(client_read, upstream_write, &mut up, context, events);
+        let download = async {
+            let count = copy_stream(&mut upstream_read, &mut client_write).await?;
+            client_write.shutdown().await?;
+            Ok::<_, io::Error>(count)
+        };
+        tokio::pin!(upload, download);
+        let mut uploaded = false;
         loop {
-            let length = client_read.read(&mut buffer).await?;
-            if length == 0 {
-                break;
+            tokio::select! {
+                biased;
+                result = &mut upload, if !uploaded => { result?; uploaded = true; }
+                _ = scope_finished.cancelled() => {
+                    // Preserve queued writes after the last tracee exits, but
+                    // an upstream that stops reading cannot hold cleanup forever.
+                    if !uploaded {
+                        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut upload).await {
+                            Ok(result) => result?,
+                            Err(_) => break "upload_drain_timeout",
+                        }
+                    }
+                    break if down.is_some() { "closed" } else { "scope_finished" };
+                }
+                result = &mut download, if down.is_none() => down = Some(result?),
             }
-            let name = inspector.observe(&buffer[..length]);
-            // Forward each chunk immediately, even while the parser needs more
-            // bytes or has rejected its format. Never send TLS parser alerts.
-            upstream_write.write_all(&buffer[..length]).await?;
-            count += length as u64;
-            if let Some(name) = name {
-                events
-                    .send(context.event(
-                        "network.protocol",
-                        json!({
-                            "protocol":name.protocol, "domain":name.domain,
-                            "domain_source":name.source, "scope":"connection_preface",
-                        }),
-                    ))
-                    .await
-                    .map_err(io::Error::other)?;
+            if uploaded && down.is_some() {
+                break "closed";
             }
         }
-        upstream_write.shutdown().await?;
-        Ok::<_, io::Error>(count)
     };
-    let download = async {
-        let count = copy_stream(&mut upstream_read, &mut client_write).await?;
-        client_write.shutdown().await?;
-        Ok::<_, io::Error>(count)
-    };
-    tokio::pin!(upload, download);
-    let (mut up, mut down) = (None, None);
-    let mut finished = false;
+    Ok(Outcome { up, down, reason })
+}
+
+async fn upload(
+    mut client: impl AsyncRead + Unpin,
+    mut upstream: impl AsyncWrite + Unpin,
+    sent: &mut u64,
+    context: &Context,
+    events: &mpsc::Sender<Observation>,
+) -> io::Result<()> {
+    let mut inspector = Inspector::default();
+    let mut buffer = [0; 8192];
     loop {
-        if let Some(up) = up
-            && (down.is_some() || finished)
-        {
-            return Ok(Outcome {
-                up,
-                down,
-                reason: if down.is_some() {
-                    "closed"
-                } else {
-                    "scope_finished"
-                },
-            });
+        let length = client.read(&mut buffer).await?;
+        if length == 0 {
+            return upstream.shutdown().await;
         }
-        tokio::select! {
-            biased;
-            result = &mut upload, if up.is_none() => up = Some(result?),
-            _ = scope_finished.cancelled(), if !finished => finished = true,
-            result = &mut download, if down.is_none() && !finished => down = Some(result?),
+        let name = inspector.observe(&buffer[..length]);
+        let mut remaining = &buffer[..length];
+        while !remaining.is_empty() {
+            let n = upstream.write(remaining).await?;
+            if n == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            *sent += n as u64;
+            remaining = &remaining[n..];
+        }
+        if let Some(name) = name {
+            events
+                .send(context.event(
+                    "network.protocol",
+                    json!({
+                        "protocol": name.protocol, "domain": name.domain,
+                        "domain_source": name.source, "scope": "connection_preface",
+                    }),
+                ))
+                .await
+                .map_err(io::Error::other)?;
         }
     }
 }
@@ -95,6 +109,38 @@ mod tests {
         net::{TcpListener, TcpStream},
         time::{Duration, timeout},
     };
+
+    #[tokio::test]
+    async fn finished_scope_bounds_a_blocked_upload_and_counts_forwarded_bytes() {
+        let (mut writer, client) = tokio::io::duplex(256);
+        writer.write_all(&[42; 128]).await.unwrap();
+        writer.shutdown().await.unwrap();
+        let (upstream, mut peer) = tokio::io::duplex(8);
+        let finished = CancellationToken::new();
+        finished.cancel();
+        let (events, _receiver) = mpsc::channel(1);
+        let context = Context {
+            connection_id: 1,
+            key: crate::network::association::Key {
+                transport: crate::network::association::Transport::Tcp,
+                source: ([127, 0, 0, 1], 1).into(),
+                destination: ([127, 0, 0, 1], 2).into(),
+            },
+            metadata: None,
+        };
+        let result = timeout(
+            Duration::from_secs(7),
+            copy(client, upstream, finished, &context, &events),
+        )
+        .await
+        .expect("an unresponsive upstream held the finished session")
+        .unwrap();
+        let mut delivered = Vec::new();
+        peer.read_to_end(&mut delivered).await.unwrap();
+        assert_eq!(result.reason, "upload_drain_timeout");
+        assert_eq!(delivered.len(), 8);
+        assert_eq!(result.up, delivered.len() as u64);
+    }
 
     #[tokio::test]
     async fn finished_scope_drains_upload_even_if_the_download_half_is_closed() {

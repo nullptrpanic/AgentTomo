@@ -283,7 +283,13 @@ pub async fn forward(
     } else {
         // No HTTP parser sees opaque protocols. Existing passive SNI/Host
         // observation and half-close behavior stay available in this branch.
-        transfer::copy(client, upstream, finished, context, events).await?;
+        let mut outcome = transfer::copy(client, upstream, finished, context, events).await?;
+        if tls {
+            // The outer TCP record counts encrypted bytes, including the handshake.
+            outcome.up = counts.up.load(Ordering::Relaxed);
+        }
+        outcome.down = Some(counts.down.load(Ordering::Relaxed));
+        return Ok(outcome);
     }
     Ok(transfer::Outcome {
         up: counts.up.load(Ordering::Relaxed),
