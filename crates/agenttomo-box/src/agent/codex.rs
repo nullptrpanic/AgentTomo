@@ -72,8 +72,48 @@ impl adapter::Installation for Installation {
     fn adapter(&self) -> Adapter {
         Adapter::new(&Codex)
     }
-    fn mount(&self) -> (&Path, &'static str) {
-        (&self.distribution, DISTRIBUTION)
+    fn mounts(&self) -> io::Result<Vec<(PathBuf, String)>> {
+        // A native installation can live in ~/bin. Share only runtime components,
+        // at their original relative locations so Codex can find its helpers.
+        let root = self.distribution.canonicalize()?;
+        let mut private_paths = Vec::new();
+        for path in [self.home.clone(), self.home.join("auth.json")] {
+            match path.canonicalize() {
+                Ok(path) => private_paths.push(path),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut mounts = Vec::new();
+        for (relative, directory) in [
+            ("bin/codex", false),
+            ("bin/codex-code-mode-host", false),
+            ("codex-package.json", false),
+            ("codex-path/rg", false),
+            ("codex-resources/bwrap", false),
+            ("codex-resources/zsh", true),
+            ("codex-resources/voice", true),
+        ] {
+            let path = root.join(relative);
+            let metadata = match path.symlink_metadata() {
+                Err(e) if e.kind() == io::ErrorKind::NotFound && relative != "bin/codex" => {
+                    continue;
+                }
+                other => other?,
+            };
+            if path.canonicalize()? != path
+                || !(directory && metadata.is_dir() || !directory && metadata.is_file())
+                || private_paths
+                    .iter()
+                    .any(|private| private.starts_with(&path))
+            {
+                return Err(io::Error::other(format!(
+                    "invalid Codex runtime component: {relative}"
+                )));
+            }
+            mounts.push((path, format!("{DISTRIBUTION}/{relative}")));
+        }
+        Ok(mounts)
     }
     fn snapshot(&self) -> BoxFuture<'_, io::Result<Prepared>> {
         Box::pin(self.snapshot())
@@ -337,5 +377,53 @@ mod tests {
         );
         assert!(!session.exists(), "a snapshot must not stage on the host");
         tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[test]
+    fn runtime_mounts_exclude_neighboring_files_from_a_home_bin_installation() {
+        use super::adapter::Installation as _;
+        let root = std::env::temp_dir().join(format!("agenttomo-install-{}", uuid::Uuid::new_v4()));
+        let home = root.join(".codex");
+        for directory in ["bin", ".codex", "codex-path", "codex-resources/voice"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        for name in [
+            "bin/codex",
+            "bin/codex-code-mode-host",
+            "codex-package.json",
+            "codex-path/rg",
+            "bin/unrelated",
+            ".codex/private-fixture",
+        ] {
+            std::fs::write(root.join(name), b"fixture").unwrap();
+        }
+        let install = Installation {
+            distribution: root.clone(),
+            home,
+        };
+        let mounts = install.mounts().unwrap();
+        for (source, destination) in &mounts {
+            let relative = source.strip_prefix(&root).unwrap().to_str().unwrap();
+            assert!(
+                [
+                    "bin/codex",
+                    "bin/codex-code-mode-host",
+                    "codex-package.json",
+                    "codex-path/rg",
+                    "codex-resources/voice"
+                ]
+                .contains(&relative)
+            );
+            assert_eq!(destination, &format!("{DISTRIBUTION}/{relative}"));
+        }
+        assert_eq!(mounts.len(), 5);
+        std::os::unix::fs::symlink(&install.home, root.join("codex-resources/zsh")).unwrap();
+        assert!(install.mounts().is_err());
+        std::fs::remove_file(root.join("codex-resources/zsh")).unwrap();
+        let target = root.join("codex-resources/voice/fixture");
+        std::fs::write(&target, b"fixture").unwrap();
+        std::os::unix::fs::symlink(target, install.home.join("auth.json")).unwrap();
+        assert!(install.mounts().is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

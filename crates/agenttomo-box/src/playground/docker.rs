@@ -196,10 +196,10 @@ pub async fn create(options: Create<'_>) -> io::Result<()> {
             .arg(format!("/records:rw,exec,nosuid,nodev,size={tmpfs_size_mib}m,mode=0711"))
             ;
     if let Some(agent) = agent {
-        let (source, target) = agent.mount();
+        for (source, target) in agent.mounts()? {
+            command.arg("--mount").arg(mount(&source, &target, true)?);
+        }
         command
-            .arg("--mount")
-            .arg(mount(source, target, true)?)
             .arg("--env")
             .arg("AGENTTOMO_WORKSPACE=1")
             .arg("--env")

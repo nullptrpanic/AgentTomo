@@ -74,7 +74,7 @@ pub trait AgentAdapter: Send + Sync {
 /// Installation-specific host paths and credential preparation stay with the plugin.
 pub trait Installation: Send + Sync {
     fn adapter(&self) -> Adapter;
-    fn mount(&self) -> (&Path, &'static str);
+    fn mounts(&self) -> io::Result<Vec<(PathBuf, String)>>;
     fn snapshot(&self) -> BoxFuture<'_, io::Result<Prepared>>;
 }
 
