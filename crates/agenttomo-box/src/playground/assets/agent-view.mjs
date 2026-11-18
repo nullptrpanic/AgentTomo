@@ -41,7 +41,7 @@ export class AgentView {
     this.form.addEventListener("submit", event => { event.preventDefault(); this.submit(); });
     this.prompt.addEventListener("keydown", event => { if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); this.submit(); } });
     this.stop.addEventListener("click", () => this.cancel());
-    this.dirty = true; this.selected = null;
+    this.selected = null;
     this.renderChat();
   }
   configure(message) {
@@ -57,35 +57,31 @@ export class AgentView {
     this.updateControls();
   }
   setReady(value, reason) {
-    if (!value && this.ready) { this.model.end(); this.dirty = true; this.renderChat(); if (this.snapshot && !this.root.hidden) this.render(); }
+    if (!value && this.ready) { this.model.end(); this.renderChat(); if (this.snapshot && !this.root.hidden) this.render(); }
     if (value) this.stopReason = null;
     else if (reason || this.ready) this.stopReason = reason || "Sandbox disconnected.";
     this.ready = value; this.updateControls();
   }
   setControl(control) { this.control = control; this.updateControls(); }
   updateControls() {
-    const running = [...this.model.tasks.values()].find(task => task.state === "running");
+    const running = this.model.runningTasks.values().next().value;
     const busy = Boolean(running);
     this.prompt.disabled = !this.available || !this.control;
     this.send.disabled = !this.ready || this.prompt.disabled || busy;
     this.stop.disabled = !this.ready || !busy || !this.control || running.stopping;
     this.stop.textContent = running?.stopping ? "Stopping…" : "Stop";
-    this.status.textContent = !this.ready && this.stopReason ? this.stopReason : !this.available ? `External ${this.agentName || "agent"} was not found on the server.` : !this.ready ? "Waiting for the sandbox" : busy ? "You can stop this task at any time" : "Enter to send · Shift+Enter for a new line";
-    if (busy && !this.progressTimer) this.progressTimer = setInterval(() => this.updateProgress(), 1000);
+    this.status.textContent = !this.ready && this.stopReason ? this.stopReason : !this.available ? `External ${this.agentName || "agent"} was not found on the server.` : !this.ready ? "Waiting for the sandbox" : running?.stopping ? "Stopping task…" : busy ? "You can stop this task at any time" : "Enter to send · Shift+Enter for a new line";
+    if (busy && !this.progressTimer) this.progressTimer = setInterval(() => {
+      for (const task of this.model.runningTasks) this.chatHistory.updateProgress(task);
+    }, 1000);
     if (!busy && this.progressTimer) { clearInterval(this.progressTimer); this.progressTimer = null; }
-    this.updateProgress();
-  }
-  updateProgress() {
-    this.chatHistory.updateProgress();
-    const task = [...this.model.tasks.values()].find(task => task.state === "running");
-    if (task && this.ready) this.status.textContent = task.stopping ? "Stopping task…" : "You can stop this task at any time";
   }
   cancel() {
-    const task = [...this.model.tasks.values()].find(task => task.state === "running");
+    const task = this.model.runningTasks.values().next().value;
     if (!task || task.stopping || !this.control) return;
     try {
       this.control.cancel(); task.stopping = true;
-      this.dirty = true; this.renderChat(); this.updateControls();
+      this.renderChat(task); this.updateControls();
     } catch (error) { this.status.textContent = error.message; }
   }
   submit() {
@@ -95,16 +91,22 @@ export class AgentView {
     const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
     try {
       this.control.prompt(id, prompt);
-      this.model.task(id).prompt = prompt;
-      this.prompt.value = ""; this.dirty = true; this.renderChat(); this.updateControls(); this.reveal();
+      const task = this.model.task(id);
+      task.prompt = prompt;
+      this.prompt.value = ""; this.renderChat(task); this.updateControls(); this.reveal();
     } catch (error) { this.status.textContent = error.message; }
   }
   add(event) {
+    const busy = this.model.runningTasks.size;
     this.model.add(event);
     const task = this.model.tasks.get(event.data?.task_id);
     if (["agent.task.finished", "agent.task.rejected"].includes(event.kind) && ["failed", "rejected"].includes(task?.state) && !this.prompt.value) this.prompt.value = task.prompt;
-    if (!event.kind.startsWith("agent.") && event.data?.agent) this.tree.add(event);
-    if (event.kind.startsWith("agent.")) { this.dirty = true; this.renderChat(); this.updateControls(); }
+    if (!event.kind.startsWith("agent.") && event.data?.agent) {
+      this.tree.add(event);
+      this.resourcesDirty = true;
+    }
+    if (task && event.kind.startsWith("agent.")) this.renderChat(task);
+    if (this.model.runningTasks.size !== busy) this.updateControls();
     if (this.selected && event.data?.agenttomo_toolcall_id === this.selected) {
       const tool = this.model.tools.get(this.selected);
       if (event.kind === "agent.tool.result" && this.abort && !this.abort.signal.aborted) {
@@ -117,17 +119,22 @@ export class AgentView {
       this.section("Model response", event, this.abort.signal);
     }
     if (event.kind === "agent.message" && event.data.payload?.status === "complete") {
-      const task = this.model.tasks.get(event.data.task_id), message = task?.messages.get(event.data.item_id);
-      if (message) this.load(event.data.payload).then(value => {
-        message.text = display(value); this.dirty = true; this.renderChat();
-        if (this.snapshot && !this.root.hidden) this.render(this.snapshot);
-      }).catch(error => { message.captureError = error.message; });
+      const id = event.data.item_id || `message-${event.data.request_id}`;
+      const message = task?.messages.get(id);
+      if (message && !message.fullPreview) this.load(event.data.payload).then(value => {
+        if (message.event !== event) return;
+        message.text = display(value); message.partial = false; message.captureError = null;
+      }, error => {
+        if (message.event === event && message.partial) message.captureError = error.message;
+      }).then(() => {
+        if (message.event !== event) return;
+        this.renderChat(task);
+        if (this.snapshot && !this.root.hidden) this.render();
+      });
     }
   }
-  renderChat() {
-    if (!this.dirty) return;
-    this.dirty = false;
-    this.chatHistory.render(this.model.tasks);
+  renderChat(task) {
+    this.chatHistory.render(this.model.tasks, task);
   }
   branch(id, category, title, meta, children, select, open = true) {
     let record = this.branches.get(id);
@@ -196,8 +203,12 @@ export class AgentView {
     if (elapsed < 800) card.style.animationDelay = `${-elapsed}ms`;
   }
   render() {
-    const snapshot = activitySnapshot(this.tree, this.filter);
-    this.snapshot = snapshot;
+    if (!this.snapshot || this.resourcesDirty || this.filter.revision === undefined || this.snapshotFilter !== this.filter.revision) {
+      this.snapshot = activitySnapshot(this.tree, this.filter);
+      this.resourcesDirty = false;
+      this.snapshotFilter = this.filter.revision;
+    }
+    const snapshot = this.snapshot;
     const follow = this.root.scrollHeight - this.root.scrollTop - this.root.clientHeight < 70;
     const bindings = this.model.bindings;
     const processes = [...snapshot.nodes.values()].filter(node => bindings.has(node.instanceId));

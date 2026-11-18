@@ -1,6 +1,8 @@
 // Agent semantics are projected separately from process and resource records.
 import { orderByStart } from "./event-time.mjs";
 
+const utf8 = new TextEncoder();
+
 export function orderedRounds(task) {
   return orderByStart(task.rounds.map(round => ({
     event: round.request || round.started || round.first,
@@ -25,10 +27,40 @@ function messageKind(data) {
   return data.phase ? data.phase === "final_answer" ? "final" : "intermediate" : "unknown";
 }
 
+function finishMessage(message, event) {
+  const d = event.data;
+  message.fullPreview = false;
+  if (typeof d.preview === "string") {
+    const hasSize = Number.isSafeInteger(d.text_bytes) && d.text_bytes >= 0;
+    const previewBytes = hasSize ? utf8.encode(d.preview).length : null;
+    message.fullPreview = hasSize && previewBytes === d.text_bytes;
+    // Older recordings only identify previews through the recorder's character limit.
+    const shortened = hasSize ? previewBytes < d.text_bytes : [...d.preview].length === 4096;
+    const streamedBytes = shortened && hasSize ? utf8.encode(message.text).length : 0;
+    const keepStream = shortened && message.text.startsWith(d.preview) && (!hasSize || streamedBytes <= d.text_bytes);
+    if (!keepStream) message.text = d.preview;
+    message.partial = shortened && !(keepStream && hasSize && streamedBytes === d.text_bytes);
+  } else message.partial = Boolean(d.payload || message.deltaGap);
+  message.captureError = message.partial && d.payload?.status !== "complete"
+    ? d.payload?.error || "Complete payload unavailable" : null;
+  message.kind = messageKind(d);
+  message.event = event;
+  message.complete = true;
+}
+
+function progress(task, phase) {
+  task.phase = phase;
+  task.activeDiagnostic = null;
+}
+
 export class AgentModel {
-  constructor() { this.name = "Agent"; this.tasks = new Map(); this.tools = new Map(); this.bindings = new Map(); }
+  constructor() { this.name = "Agent"; this.tasks = new Map(); this.runningTasks = new Set(); this.tools = new Map(); this.bindings = new Map(); }
   task(id) {
-    if (!this.tasks.has(id)) this.tasks.set(id, { id, prompt: "", state: "running", phase: `Starting ${this.name}`, queuedAt: Date.now(), activity: 0, timeline: [], rounds: [], messages: new Map(), tools: new Map(), errors: [], current: null });
+    if (!this.tasks.has(id)) {
+      const task = { id, prompt: "", state: "running", phase: `Starting ${this.name}`, queuedAt: Date.now(), activity: 0, timeline: [], rounds: [], messages: new Map(), tools: new Map(), errors: [], current: null };
+      this.tasks.set(id, task);
+      this.runningTasks.add(task);
+    }
     return this.tasks.get(id);
   }
   add(event) {
@@ -37,25 +69,32 @@ export class AgentModel {
     if (!event.kind.startsWith("agent.") || !d.task_id) return;
     const task = this.task(d.task_id);
     task.activity = Math.max(task.activity, event.sequence || 0);
-    if (event.kind === "agent.task.started") { task.prompt = d.prompt; task.started = event; task.state = "running"; task.phase = "Connecting to model"; }
+    if (event.kind === "agent.task.started") { task.prompt = d.prompt; task.started = event; task.state = "running"; this.runningTasks.add(task); progress(task, "Connecting to model"); }
     if (event.kind === "agent.task.finished") { task.state = d.cancelled ? "cancelled" : d.exit_code === 0 ? "completed" : "failed"; task.finished = event; }
     if (event.kind === "agent.task.rejected") { task.state = d.cancelled ? "cancelled" : "rejected"; task.finished = event; }
+    if (task.state !== "running") this.runningTasks.delete(task);
     if (d.error && !d.cancelled && ["agent.task.diagnostic", "agent.task.finished", "agent.task.rejected", "agent.capture.error"].includes(event.kind) && task.errors.at(-1)?.data.error !== d.error) {
       task.errors.push(event);
     }
-    if (event.kind === "agent.task.diagnostic") task.phase = /reconnect|retry/i.test(d.error || "") ? "Retrying connection" : `${this.name} reported a problem`;
+    if (d.error && task.state === "running" && ["agent.task.diagnostic", "agent.capture.error"].includes(event.kind)) {
+      task.activeDiagnostic = event;
+      if (event.kind === "agent.task.diagnostic") task.phase = /reconnect|retry/i.test(d.error) ? "Retrying connection" : `${this.name} reported a problem`;
+    }
     if (event.kind === "agent.model.request") {
       const round = task.rounds.findLast(round => !round.request && round.requestId === d.request_id) || this.newRound(task,event);
       round.request = event; task.current = round;
       round.activity = Math.max(round.activity || 0, event.sequence || 0);
-      task.phase = "Waiting for model";
+      progress(task, "Waiting for model");
     }
     if (event.kind === "agent.model.started") {
       const round = this.round(task,event);
       round.started = event; round.responseId = d.response_id;
-      task.phase = "Receiving model response";
+      progress(task, "Receiving model response");
     }
-    if (event.kind === "agent.model.complete") this.round(task,event).complete = event;
+    if (event.kind === "agent.model.complete") {
+      this.round(task,event).complete = event;
+      if (task.activeDiagnostic && d.status === "completed") progress(task, "Model response received");
+    }
     if (event.kind.startsWith("agent.tool.")) {
       const id = d.agenttomo_toolcall_id;
       if (!id) return;
@@ -67,7 +106,7 @@ export class AgentModel {
       }
       if (d.name) tool.name = d.name;
       tool.activity = Math.max(tool.activity || 0, event.sequence || 0);
-      task.phase = event.kind === "agent.tool.result" ? "Waiting for model" : `Running ${tool.name}`;
+      progress(task, event.kind === "agent.tool.result" ? "Waiting for model" : `Running ${tool.name}`);
       if (event.kind === "agent.tool.call") tool.arguments = event;
       if (event.kind === "agent.tool.result") tool.output = event;
       if (event.kind !== "agent.tool.result") {
@@ -76,14 +115,16 @@ export class AgentModel {
     }
     if (event.kind === "agent.message.delta" || event.kind === "agent.message") {
       const id = d.item_id || `message-${d.request_id}`;
-      task.phase = "Receiving reply";
+      progress(task, "Receiving reply");
       let message = task.messages.get(id);
       if (!message) {
         message = { id, text: "", kind: messageKind(d), event, started: event };
         task.timeline.push({type:"message",id});
       }
-      if (event.kind === "agent.message.delta") message.text += d.delta || "";
-      else { message.text = d.preview ?? message.text; message.kind = messageKind(d); message.event = event; message.complete = true; }
+      if (event.kind === "agent.message.delta") {
+        if (!message.complete && !message.deltaGap) message.text += d.delta || "";
+        if (d.delta_truncated) message.deltaGap = true;
+      } else finishMessage(message, event);
       task.messages.set(id, message);
       message.activity = Math.max(message.activity || 0, event.sequence || 0);
       this.round(task,event).messages.set(id, message);
@@ -102,8 +143,9 @@ export class AgentModel {
     task.rounds.push(round); task.current = round; return round;
   }
   end() {
-    for (const task of this.tasks.values()) if (task.state === "running") {
+    for (const task of this.runningTasks) if (task.state === "running") {
       task.state = "interrupted"; task.endedAt = Date.now();
     }
+    this.runningTasks.clear();
   }
 }

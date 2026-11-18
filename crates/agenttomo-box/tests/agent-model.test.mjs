@@ -2,6 +2,50 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentModel, isFinalMessage } from "../src/playground/assets/agent-model.mjs";
 
+test("completion keeps the streamed answer while its full payload is unavailable", () => {
+  const model = new AgentModel();
+  const prefix = "文".repeat(4096), answer = prefix + " — the ending";
+  const add = (kind,data) => model.add({kind,data:{task_id:"t",item_id:"m",...data}});
+  add("agent.message.delta", {delta:answer});
+  add("agent.message", {preview:prefix, text_bytes:new TextEncoder().encode(answer).length, payload:{status:"unavailable"}});
+  assert.equal(model.task("t").messages.get("m").text,answer);
+  add("agent.message", {preview:"文",text_bytes:3});
+  assert.equal(model.task("t").messages.get("m").text,"文","a shorter authoritative answer wins");
+});
+
+test("a retry diagnostic becomes historical when a later attempt makes progress", () => {
+  const model = new AgentModel();
+  const add = (kind,data={}) => model.add({kind,data:{task_id:"t",request_id:1,...data}});
+  const task = model.task("t");
+  add("agent.task.diagnostic",{error:"Reconnecting 1/5"});
+  assert.equal(task.activeDiagnostic?.data.error,"Reconnecting 1/5");
+  add("agent.model.request");
+  assert.equal(task.phase,"Waiting for model");
+  assert.equal(task.activeDiagnostic,null);
+  assert.equal(task.errors.length,1);
+  add("agent.task.diagnostic",{error:"Runtime stopped responding"});
+  assert.equal(task.phase,"Agent reported a problem");
+  add("agent.tool.call",{agenttomo_toolcall_id:"tool",name:"shell"});
+  assert.equal(task.phase,"Running shell");
+  assert.equal(task.activeDiagnostic,null);
+});
+
+test("legacy previews preserve longer deltas and a skipped delta keeps its gap visible", () => {
+  const model = new AgentModel(), prefix = "🌤".repeat(4096);
+  const add = (kind,data) => model.add({kind,data:{task_id:"t",item_id:"m",...data}});
+  add("agent.message.delta",{delta:prefix + " ending"});
+  add("agent.message",{preview:prefix,payload:{status:"unavailable"}});
+  assert.equal(model.task("t").messages.get("m").text,prefix + " ending");
+
+  add("agent.message.delta",{item_id:"gap",delta:prefix,delta_truncated:true});
+  add("agent.message.delta",{item_id:"gap",delta:"tail after the gap"});
+  add("agent.message",{item_id:"gap",preview:prefix,text_bytes:65536,payload:{status:"unavailable",error:"budget exhausted"}});
+  const incomplete = model.task("t").messages.get("gap");
+  assert.equal(incomplete.text,prefix);
+  assert.equal(incomplete.partial,true);
+  assert.equal(incomplete.captureError,"budget exhausted");
+});
+
 test("normalized message kinds override protocol fields and survive streaming completion", () => {
   const model = new AgentModel(); let sequence = 0;
   const add = (kind,data={}) => model.add({kind,sequence:++sequence,data:{task_id:"t",request_id:1,...data}});

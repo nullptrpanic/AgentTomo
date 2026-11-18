@@ -63,7 +63,7 @@ export function createObservation(token) {
     onCount:count => { $("finding-count").textContent = count; $("finding-count").hidden = !count; },
   });
   const sampleControls = () => samples.setAvailable(Boolean(agent.control && agent.available && agent.ready),
-    [...agent.model.tasks.values()].some(task => task.state === "running"));
+    agent.model.runningTasks.size > 0);
 
   function selectRaw(event) {
     $("selected-sequence").textContent = event.sequence === undefined ? `message #${event.data.id}` : `#${event.sequence}`;

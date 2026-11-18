@@ -7,6 +7,7 @@ const category = (kind) => kind.includes(".") ? kind.split(".")[0] : "other";
 
 export class EventFilter {
   constructor() {
+    this.revision = 0;
     this.defaultEnabled = true;
     this.rules = new Map();
     this.groups = new Map();
@@ -24,6 +25,7 @@ export class EventFilter {
   }
 
   set(pattern, enabled) {
+    this.revision++;
     if (pattern === "*") {
       this.defaultEnabled = enabled;
       this.rules.clear();

@@ -32,10 +32,11 @@ try {
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   await page.evaluate(async () => {
     const { AgentView } = await import("/agent-view.mjs");
+    const { EventFilter } = await import("/event-filter.mjs");
     const root = document.querySelector("#agent-chat");
     window.view = new AgentView({root:document.querySelector("#agent-trajectory"),chat:root,detail:document.querySelector("#detail"),
       load:async payload => ({0:{model:"test-model",generate:false},1:{cmd:"curl https://example.test/",timeout_ms:1000},2:"Complete tool output",3:{id:"response",status:"completed",output:[{type:"message",content:[{type:"output_text",text:"Full model answer"}]}]}})[payload.offset],
-      onSelect:() => {},onRaw:() => {},reveal:() => {},filter:{allows:() => true}});
+      onSelect:() => {},onRaw:() => {},reveal:() => {},filter:new EventFilter()});
     window.cancels = 0;
     view.configure({agent_available:true, agent:{id:"fixture",name:"Example Agent",avatar:"EA",authentication_hint:"Sign in to the fixture on the host."}});
     view.setControl({prompt:() => {},cancel:() => { window.cancels++; }});
@@ -364,6 +365,59 @@ try {
   assert.ok(await simple.evaluate(node=>node.closest('.agent-history').clientWidth-node.clientWidth<=48),"wide chat uses the panel width with compact side margins");
   assert.ok(await emptySummary.evaluate(node=>node.getBoundingClientRect().right-node.querySelector('.agent-chat-outcome').getBoundingClientRect().right<64),"the status duration stays right-aligned without an arrow");
   if(process.env.AGENTTOMO_TEST_ARTIFACTS) await page.screenshot({path:`${process.env.AGENTTOMO_TEST_ARTIFACTS}/chat-wide.png`});
+  const recovered = page.locator('[data-task-id="recovered"]');
+  await page.evaluate(() => {
+    add("agent.task.started",{task_id:"recovered",prompt:"Local retry"});
+    add("agent.task.diagnostic",{task_id:"recovered",error:"Reconnecting 1/5"});
+  });
+  assert.equal(await recovered.locator(".agent-work-title").textContent(),"Retrying connection");
+  await page.evaluate(() => add("agent.model.request",{task_id:"recovered",request_id:500}));
+  await recovered.locator(".agent-work-title").filter({hasText:/^Task in progress$/}).waitFor();
+  assert.equal(await recovered.locator(".agent-work-title").textContent(),"Task in progress");
+  assert.equal(await recovered.locator(".agent-progress").isVisible(),true);
+  assert.equal(await recovered.locator(".agent-progress-text").textContent(),"Waiting for model");
+  await recovered.locator(".agent-error-details summary").click();
+  assert.match(await recovered.locator(".agent-error-details pre").innerText(),/Reconnecting 1\/5/);
+  await page.evaluate(() => {
+    const prefix = "文".repeat(4096), message = prefix + " end";
+    add("agent.message.delta",{task_id:"recovered",request_id:500,item_id:"long",delta:message});
+    add("agent.message",{task_id:"recovered",request_id:500,item_id:"long",message_kind:"final",preview:prefix,text_bytes:new TextEncoder().encode(message).length,payload:{status:"unavailable"}});
+    view.load = async () => { throw new Error("Recording unavailable"); };
+    add("agent.message",{task_id:"recovered",request_id:501,item_id:"partial",preview:prefix,text_bytes:20000,payload:{offset:999,status:"complete"}});
+  });
+  assert.match(await recovered.locator('[data-entry-id="long"] .agent-message-text').innerText(),/ end$/);
+  assert.equal(await recovered.locator('[data-entry-id="long"] .agent-answer-note').isVisible(),false);
+  await recovered.locator(".agent-final-answers .agent-copy").click();
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),"文".repeat(4096) + " end");
+  await recovered.locator('[data-entry-id="partial"]').getByText(/Partial answer · Recording unavailable/).waitFor();
+  const refresh = await page.evaluate(async () => {
+    await new Promise(requestAnimationFrame);
+    let historyChanges = 0;
+    const observer = new MutationObserver(records => historyChanges += records.length);
+    observer.observe(document.querySelector('[data-task-id="simple"]'), {subtree:true, attributes:true, childList:true, characterData:true});
+    const reads = [];
+    view.load = async ref => { reads.push(ref.offset); return "Full legacy answer"; };
+    const preview = "你好 ✓";
+    add("agent.message", {task_id:"recovered", item_id:"short", preview, text_bytes:new TextEncoder().encode(preview).length, payload:{status:"complete", offset:101}});
+    add("agent.message", {task_id:"recovered", item_id:"legacy", preview:"Legacy prefix", payload:{status:"complete", offset:102}});
+    await new Promise(requestAnimationFrame);
+    await new Promise(requestAnimationFrame);
+    observer.disconnect();
+    return {reads, historyChanges, short:document.querySelector('[data-entry-id="short"] .agent-message-text').textContent.trimEnd()};
+  });
+  assert.deepEqual(refresh, {reads:[102], historyChanges:0, short:"你好 ✓"});
+  const projection = await page.evaluate(() => {
+    const before = view.render().resources, snapshot = view.snapshot;
+    add("agent.message.delta", {task_id:"recovered", item_id:"next", delta:"A"});
+    view.render();
+    const reused = view.snapshot === snapshot;
+    view.filter.set("*", false);
+    const filtered = view.render().resources;
+    view.filter.set("*", true);
+    add("file.open", {pid:40, process_instance_id:9, path:"/tmp/new", agent:processAgent});
+    return {reused, filtered, added:view.render().resources - before};
+  });
+  assert.deepEqual(projection, {reused:true, filtered:0, added:1});
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({passed:true,ordering:true,stableNodes:true,textSelection:true,toolDetails:true,scrollFollowing:true,stopFeedback:true,draftPreserved:true,completedHierarchy:true,sanitizedMarkdown:true,answerCopyFeedback:true,narrowLayout:true,normalizedMessages:true,genericModelLabels:true}));
 } finally {

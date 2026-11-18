@@ -49,6 +49,7 @@ export class AgentChat {
     Object.assign(this, {root, section, onTool, onMessage, onTask, onModel});
     this.agent = {name:"Agent", avatar:">_"};
     this.records = new Map();
+    this.pendingTasks = new Set();
     this.follow = true;
     this.latest = root.parentElement.querySelector(".agent-latest");
     this.latest.addEventListener("click", () => { this.follow = true; this.scroll(); });
@@ -60,14 +61,16 @@ export class AgentChat {
     new ResizeObserver(() => this.scroll()).observe(root);
   }
   configure(agent) { this.agent = agent; if (this.tasks) this.render(this.tasks); }
-  render(tasks) {
+  render(tasks, changed) {
     this.tasks = tasks;
+    if (changed) this.pendingTasks.add(changed);
+    else for (const task of tasks.values()) this.pendingTasks.add(task);
     if (this.frame) return;
     this.frame = requestAnimationFrame(() => { this.frame = null; this.flush(); });
   }
   flush() {
     this.welcome?.remove();
-    for (const task of this.tasks.values()) {
+    for (const task of this.pendingTasks) {
       let record = this.records.get(task.id);
       if (!record) { record = this.createTask(task); this.records.set(task.id, record); }
       text(record.prompt, task.prompt || "Observed task");
@@ -134,19 +137,27 @@ export class AgentChat {
         const retained = new Set(nodes);
         for (const child of [...parent.children]) if (!retained.has(child)) child.remove();
       }
-      const error = task.errors.at(-1)?.data.error;
-      record.error.hidden = !error;
-      if (error) {
-        const value = typeof error === "string" ? error : JSON.stringify(error, null, 2);
-        text(record.hint, errorHint(value, this.agent)); text(record.errorBody, value);
+      const running = task.state === "running";
+      const current = running ? task.activeDiagnostic : ["failed","rejected"].includes(task.state) ? task.errors.at(-1) : null;
+      const hasDiagnostics = task.errors.length > 0;
+      record.error.hidden = !hasDiagnostics;
+      if (hasDiagnostics) {
+        const displayError = error => typeof error === "string" ? error : JSON.stringify(error, null, 2);
+        record.error.classList.toggle("agent-diagnostic-history", !current);
+        record.error.setAttribute("role", current ? "alert" : "group");
+        record.hint.hidden = !current;
+        if (current) text(record.hint, errorHint(displayError(current.data.error), this.agent));
+        text(record.errorSummary, current ? "Error details" : "Previous diagnostics");
+        text(record.errorBody, task.errors.map(event => displayError(event.data.error)).join("\n\n"));
       }
-      record.pending.hidden = task.state !== "running" || Boolean(error);
-      const expandable = !record.pending.hidden || Boolean(error) || placements.get(record.timeline).length > 0;
+      const runtimeProblem = current?.kind === "agent.task.diagnostic";
+      record.pending.hidden = !running || (runtimeProblem && !task.stopping);
+      const expandable = !record.pending.hidden || hasDiagnostics || placements.get(record.timeline).length > 0;
       record.summary.setAttribute("aria-disabled", String(!expandable));
       record.summary.tabIndex = expandable ? 0 : -1;
       if (!expandable) record.work.open = false;
       const label = {running:"Task in progress",completed:"Task completed",cancelled:"Task stopped",failed:"Task failed",rejected:"Task rejected",interrupted:"Task interrupted"}[task.state] || task.state;
-      text(record.workTitle, task.state === "running" && task.stopping ? "Stopping task" : task.state === "running" && error ? "Retrying connection" : label);
+      text(record.workTitle, running && task.stopping ? "Stopping task" : running && runtimeProblem ? task.phase : label);
       record.indicator.classList.toggle("agent-spinner", task.state === "running");
       record.work.dataset.state = task.state;
       record.reply.dataset.state = task.state;
@@ -164,12 +175,13 @@ export class AgentChat {
         text(record.outcome, "Running");
         record.outcome.dataset.state = "running";
       }
+      this.updateProgress(task);
     }
+    this.pendingTasks.clear();
     if (!this.records.size) {
       this.welcome = el("p", "agent-welcome", `Send a task to ${this.agent.name}. Follow its responses and tool calls here, and inspect the evidence in the trajectory.`);
       this.root.append(this.welcome);
     }
-    this.updateProgress();
     this.scroll();
   }
   inspect(callback) {
@@ -206,13 +218,14 @@ export class AgentChat {
     const hint = el("p", "", "");
     const details = el("details", "agent-error-details");
     const errorBody = el("pre", "agent-content", "");
-    details.append(el("summary", "", "Error details"), errorBody); error.append(hint, details);
+    const errorSummary = el("summary", "", "Error details");
+    details.append(errorSummary, errorBody); error.append(hint, details);
     const pending = el("span", "agent-progress"); pending.setAttribute("role", "status");
     const progress = el("span", "agent-progress-text", ""); pending.append(progress);
     work.append(summary, pending, error, timeline);
     reply.append(heading, answers, work);
     root.append(user.root, reply); this.root.append(root);
-    return {root,user,prompt,reply,agentName,avatar,roundTitle,indicator,work,summary,workTitle,workCount,timeline,answers,error,hint,errorBody,pending,progress,outcome,entries:new Map(),responses:new Map()};
+    return {root,user,prompt,reply,agentName,avatar,roundTitle,indicator,work,summary,workTitle,workCount,timeline,answers,error,hint,errorSummary,errorBody,pending,progress,outcome,entries:new Map(),responses:new Map()};
   }
   bubble(role, content, inspect) {
     const root = el("article", `agent-chat-message agent-${role}`);
@@ -256,10 +269,14 @@ export class AgentChat {
   createMessage() {
     const root = el("article", "agent-answer");
     const body = el("div", "agent-message-text", "");
-    root.append(body);
-    return {root,body};
+    const notice = el("p", "agent-answer-note");
+    notice.hidden = true;
+    root.append(body, notice);
+    return {root,body,notice};
   }
   updateMessage(record, message) {
+    record.notice.hidden = !message.partial;
+    if (message.partial) text(record.notice, message.captureError ? `Partial answer · ${message.captureError}` : "Loading the full answer…");
     if (message.complete) {
       if (record.rendered !== message.text) {
         record.body.replaceChildren(markdownContent(message.text));
@@ -310,19 +327,17 @@ export class AgentChat {
       part.root.firstElementChild.open = open;
     }
   }
-  updateProgress() {
-    for (const task of this.tasks?.values() || []) {
-      const record = this.records.get(task.id);
-      if (!record) continue;
-      if (task.state === "running") {
-        text(record.progress, taskProgress(task));
-        text(record.outcome, duration(Date.now() - (time(task.started) || task.queuedAt)));
-      }
-      for (const node of record.entries.values()) {
-        if (!node.tool) continue;
-        const end = time(node.tool.output) || time(task.finished) || task.endedAt || Date.now();
-        text(node.elapsed, time(node.tool.started) ? duration(end - time(node.tool.started)) : "");
-      }
+  updateProgress(task) {
+    const record = this.records.get(task.id);
+    if (!record) return;
+    if (task.state === "running") {
+      text(record.progress, taskProgress(task));
+      text(record.outcome, duration(Date.now() - (time(task.started) || task.queuedAt)));
+    }
+    for (const node of record.entries.values()) {
+      if (!node.tool) continue;
+      const end = time(node.tool.output) || time(task.finished) || task.endedAt || Date.now();
+      text(node.elapsed, time(node.tool.started) ? duration(end - time(node.tool.started)) : "");
     }
   }
   scroll() {
