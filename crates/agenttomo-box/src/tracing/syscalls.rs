@@ -77,6 +77,7 @@ impl Dispatch {
 
     pub fn forget(&mut self, tid: Pid) {
         self.pending.remove(&tid);
+        self.network.reap();
     }
 
     pub fn resume(&self, tid: Pid, signal: Option<nix::sys::signal::Signal>) -> nix::Result<()> {

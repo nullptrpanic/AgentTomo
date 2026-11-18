@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 struct Datagram {
     bytes: Vec<u8>,
     received: TransferTiming,
+    arrived: Option<std::time::SystemTime>,
 }
 struct Route {
     id: u64,
@@ -122,7 +123,12 @@ async fn serve(
                 }
             }
         };
-        let (size, source, destination) = packet;
+        let socket::Datagram {
+            size,
+            source,
+            destination,
+            arrived,
+        } = packet;
         let timing = TransferTiming::begin("proxy_first_datagram");
         let key = Key {
             transport: Transport::Udp,
@@ -168,6 +174,7 @@ async fn serve(
         if let Err(error) = route.sender.try_send(Datagram {
             bytes: buffer[..size].to_vec(),
             received: timing,
+            arrived,
         }) {
             drop(error);
             emit(&events, event(key, route.flow_id.load(Ordering::Relaxed), None, "network.udp.error", json!({"stage":"queue", "error":"UDP flow queue unavailable; datagram dropped"}))).await?;
@@ -223,12 +230,15 @@ async fn forward(
             biased;
             request = outgoing.recv() => {
                 let Some(request) = request else { break "scope_finished"; };
-                let next = registry.resolve(&key).await;
+                let next = match request.arrived {
+                    Some(at) => registry.resolve(&key, Some(at)).await,
+                    None => None,
+                };
                 if metadata.as_ref().map(|m| m.socket_id) != next.as_ref().map(|m| m.socket_id)
                     && let Some(previous) = timing.take()
                 {
-                    emit(&events, summary(key, id, metadata.as_ref(), &counts, previous, "scope_finished")).await?;
-                    if let Some(metadata) = &metadata { registry.remove(&key, metadata.socket_id); }
+                    let reason = if metadata.is_some() && next.is_some() { "socket_replaced" } else { "attribution_changed" };
+                    emit(&events, summary(key, id, metadata.as_ref(), &counts, previous, reason)).await?;
                     upstream = UdpSocket::bind((ip, 0)).await?;
                     id = ids.fetch_add(1, Ordering::Relaxed);
                     flow_id.store(id, Ordering::Relaxed);
@@ -305,6 +315,7 @@ mod tests {
         Datagram {
             bytes: vec![byte],
             received: TransferTiming::begin("proxy_first_datagram"),
+            arrived: Some(std::time::SystemTime::now()),
         }
     }
 
@@ -328,6 +339,8 @@ mod tests {
                 pid: 1,
                 process_instance_id: 1,
             },
+            std::time::SystemTime::now(),
+            |_| true,
         );
         registry.register(
             second,
@@ -336,6 +349,8 @@ mod tests {
                 pid: 2,
                 process_instance_id: 2,
             },
+            std::time::SystemTime::now(),
+            |_| true,
         );
         let pending = registry.begin_datagram(Some(first.source), &[Some(first.destination)]);
         let (events, mut collected) = mpsc::channel(16);
@@ -416,6 +431,8 @@ mod tests {
                 pid: 1,
                 process_instance_id: 1,
             },
+            std::time::SystemTime::now(),
+            |_| true,
         );
         let (events, mut collected) = mpsc::channel(16);
         let (sender, outgoing) = mpsc::channel(64);
@@ -435,7 +452,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        registry.remove(&key, 1);
         registry.register(
             key,
             2,
@@ -443,6 +459,8 @@ mod tests {
                 pid: 2,
                 process_instance_id: 2,
             },
+            std::time::SystemTime::now(),
+            |_| false,
         );
         sender.send(datagram(2)).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut buffer))
@@ -459,6 +477,7 @@ mod tests {
         }
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0]["pid"], 1);
+        assert_eq!(summaries[0]["status"], "socket_replaced");
         assert_eq!(summaries[1]["pid"], 2);
         assert_ne!(summaries[0]["flow_id"], summaries[1]["flow_id"]);
         assert_eq!(summaries[1]["flow_id"], flow_id.load(Ordering::Relaxed));

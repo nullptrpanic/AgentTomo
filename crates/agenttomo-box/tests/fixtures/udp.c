@@ -92,12 +92,57 @@ int main(int argc,char **argv) {
     if(!strcmp(argv[1],"ipv6"))return ipv6(argv[2]);
     for(int i=0;i<2;i++){peers[i].sin_family=AF_INET;peers[i].sin_port=htons(atoi(argv[i+2]));inet_pton(AF_INET,"127.0.0.1",&peers[i].sin_addr);}
     fd=socket(AF_INET,SOCK_DGRAM,0);check(fd,"socket");
+    int reuse=!strcmp(argv[1],"overlap");
+    if(reuse)check(setsockopt(fd,SOL_SOCKET,SO_REUSEPORT,&reuse,sizeof(reuse)),"reuseport");
     struct sockaddr_in local={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
     check(bind(fd,(void*)&local,sizeof(local)),"bind");socklen_t size=sizeof(local);check(getsockname(fd,(void*)&local,&size),"getsockname");
     printf("PORT=%u\n",ntohs(local.sin_port));fflush(stdout);
     struct timeval timeout={.tv_sec=3};check(setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout)),"timeout");
     const char *mode=argv[1];
     if(!strcmp(mode,"message"))message();
+    else if(!strcmp(mode,"rebind_burst")){
+        for(unsigned char i=0;i<30;i++){
+            if(i){
+                fd=socket(AF_INET,SOCK_DGRAM,0);check(fd,"socket");
+                check(bind(fd,(void*)&local,sizeof(local)),"rebind");
+            }
+            send_one(&i,1,0);
+            if(i==29){
+                check(setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout)),"timeout");
+                unsigned char last;
+                do {
+                    struct sockaddr_in actual;socklen_t len=sizeof(actual);
+                    check(recvfrom(fd,&last,1,0,(void*)&actual,&len),"receive last");
+                    source(&actual,0);
+                } while(last!=i);
+            }
+            close(fd);
+        }
+        puts("UDP_OK");return 0;
+    }
+    else if(!strcmp(mode,"rebind") || reuse){
+        send_one("first",5,0);receive_one("first",5,0);
+        if(!reuse)close(fd);
+        pid_t child=fork();check(child,"fork");
+        if(child==0){
+            int first=fd;
+            fd=socket(AF_INET,SOCK_DGRAM,0);check(fd,"socket");
+            if(reuse)check(setsockopt(fd,SOL_SOCKET,SO_REUSEPORT,&reuse,sizeof(reuse)),"reuseport");
+            check(bind(fd,(void*)&local,sizeof(local)),"rebind");
+            check(setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout)),"timeout");
+            send_one("again",5,0);
+            if(reuse){
+                struct pollfd sockets[2]={{first,POLLIN,0},{fd,POLLIN,0}};
+                if(poll(sockets,2,3000)<=0)_exit(119);
+                if(sockets[0].revents&POLLIN)fd=first;
+            }
+            receive_one("again",5,0);_exit(0);
+        }
+        int status;check(waitpid(child,&status,0),"waitpid");
+        if(!WIFEXITED(status) || WEXITSTATUS(status)!=0)exit(118);
+        if(reuse)close(fd);
+        puts("UDP_OK");return 0;
+    }
     else if(!strcmp(mode,"batch") || !strcmp(mode,"partial"))batch(!strcmp(mode,"partial"));
     else if(!strcmp(mode,"shared")){
         pthread_t threads[2];for(long i=0;i<2;i++)if(pthread_create(&threads[i],0,sender,(void*)i))exit(103);

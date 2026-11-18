@@ -5,6 +5,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    time::{Duration, SystemTime},
 };
 
 fn create(ipv6: bool, kind: i32, protocol: i32) -> io::Result<OwnedFd> {
@@ -62,6 +63,7 @@ pub fn tcp_listener(ipv6: bool, port: u16) -> io::Result<TcpListener> {
 
 pub fn udp_listener(ipv6: bool, port: u16) -> io::Result<UdpSocket> {
     let fd = listener(ipv6, libc::SOCK_DGRAM, port)?;
+    option(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, 1)?;
     option(
         fd.as_raw_fd(),
         if ipv6 {
@@ -101,7 +103,14 @@ pub fn raw_reply(ipv6: bool) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-pub fn datagram(fd: RawFd, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr, SocketAddr)> {
+pub struct Datagram {
+    pub size: usize,
+    pub source: SocketAddr,
+    pub destination: SocketAddr,
+    pub arrived: Option<SystemTime>,
+}
+
+pub fn datagram(fd: RawFd, buffer: &mut [u8]) -> io::Result<Datagram> {
     let mut source = [0u8; 128];
     let mut ancillary = [0usize; 32];
     let mut iov = libc::iovec {
@@ -121,6 +130,7 @@ pub fn datagram(fd: RawFd, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr, 
         return Err(io::Error::other("truncated transparent UDP datagram"));
     }
     let mut destination = None;
+    let mut arrived = None;
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(&header);
         while !cmsg.is_null() {
@@ -131,13 +141,29 @@ pub fn datagram(fd: RawFd, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr, 
                 let len = item.cmsg_len.saturating_sub(libc::CMSG_LEN(0) as usize);
                 destination =
                     address::decode(std::slice::from_raw_parts(libc::CMSG_DATA(cmsg), len));
+            } else if item.cmsg_level == libc::SOL_SOCKET
+                && item.cmsg_type == libc::SCM_TIMESTAMPNS
+                && item.cmsg_len >= libc::CMSG_LEN(size_of::<libc::timespec>() as u32) as usize
+            {
+                let ts = libc::CMSG_DATA(cmsg)
+                    .cast::<libc::timespec>()
+                    .read_unaligned();
+                if ts.tv_sec >= 0 && (0..1_000_000_000).contains(&ts.tv_nsec) {
+                    arrived = SystemTime::UNIX_EPOCH
+                        .checked_add(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
+                }
             }
             cmsg = libc::CMSG_NXTHDR(&header, cmsg);
         }
     }
     let source = address::decode(&source[..header.msg_namelen as usize]);
     match (source, destination) {
-        (Some(source), Some(destination)) => Ok((count, source, destination)),
+        (Some(source), Some(destination)) => Ok(Datagram {
+            size: count,
+            source,
+            destination,
+            arrived,
+        }),
         _ => Err(io::Error::other(
             "UDP original source/destination unavailable",
         )),

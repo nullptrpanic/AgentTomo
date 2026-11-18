@@ -134,6 +134,64 @@ fn exercise_with(mode: &str, first: Echo, second: Echo) -> Vec<Value> {
 }
 
 #[test]
+fn queued_datagrams_keep_the_generation_that_sent_them() {
+    let events = exercise("rebind_burst");
+    let sends: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "network.udp.send")
+        .collect();
+    assert_eq!(sends.len(), 30);
+    for field in ["socket_id", "flow_id"] {
+        let ids: std::collections::HashSet<_> = sends
+            .iter()
+            .filter_map(|e| e["data"][field].as_u64())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            sends.len(),
+            "a queued datagram acquired a later {field}"
+        );
+    }
+}
+
+#[test]
+fn overlapping_reuseport_sockets_remain_participants_in_one_flow() {
+    let events = exercise("overlap");
+    let sends: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "network.udp.send")
+        .map(|e| &e["data"])
+        .collect();
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends[0]["flow_id"], sends[1]["flow_id"]);
+    assert_eq!(sends[1]["participants"].as_array().unwrap().len(), 2);
+    assert_eq!(sends[1]["socket_ids"].as_array().unwrap().len(), 2);
+    assert!(sends[1]["pid"].is_null());
+}
+
+#[test]
+fn reopened_source_port_starts_a_new_flow_with_its_own_process() {
+    let events = exercise("rebind");
+    let sends: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "network.udp.send")
+        .map(|e| &e["data"])
+        .collect();
+    assert_eq!(sends.len(), 2);
+    assert_ne!(sends[0]["flow_id"], sends[1]["flow_id"]);
+    assert_ne!(
+        sends[0]["process_instance_id"],
+        sends[1]["process_instance_id"]
+    );
+    assert!(
+        sends
+            .iter()
+            .all(|data| data["pid"].is_number()
+                && data["participants"].as_array().unwrap().len() == 1)
+    );
+}
+
+#[test]
 fn unconnected_datagrams_to_multiple_peers_are_forwarded_and_sources_restored() {
     exercise("plain");
 }

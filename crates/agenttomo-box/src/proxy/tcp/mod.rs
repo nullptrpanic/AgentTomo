@@ -148,7 +148,7 @@ async fn forward(
         ..
     } = service;
     let key = context.key;
-    let metadata = registry.resolve(&key).await;
+    let metadata = registry.resolve(&key, None).await;
     if let Some(metadata) = &metadata {
         registry.remove(&key, metadata.socket_id);
     }

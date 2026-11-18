@@ -13,6 +13,10 @@
 - `collectors/file/`、`collectors/memory/`：独立解释文件与映射事件。
 - `recording/`：统一分类、序号、时间和落盘；Web 消费同一事件格式。
 
+采集器给 TCP/UDP socket 的内核 inode 加一次性 inotify 关闭监视。新建 socket 或回收跟踪线程时读取通知，最后一个 FD 引用关闭后，一起回收身份和地址缓存。`dup`、`fork` 或传递给其他进程的 FD 会延续同一身份。通知队列溢出时通过内核仍有效的监视记录核对。若内核拒绝建立监视，采集器保留该身份，直到 inode 复用或本次运行结束。
+
+五元组归属表达到 16,384 项时按 120 秒空闲时间判定过期，批量清理最多每 5 秒一次。查找和登记沿用同一过期边界，避免两次清理之间关联到旧的发送者。
+
 ```mermaid
 flowchart LR
     subgraph Inner[新 user / network namespace]

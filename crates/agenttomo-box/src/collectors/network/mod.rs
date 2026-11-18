@@ -10,9 +10,9 @@ use crate::{
 };
 use nix::libc;
 use std::{
-    collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
+    rc::Rc,
 };
 
 pub fn watched_syscalls() -> Vec<i64> {
@@ -27,25 +27,24 @@ pub fn watched_syscalls() -> Vec<i64> {
         libc::SYS_writev,
     ]
 }
+
 pub enum Attempt {
     Socket(Call),
     Operation {
         call: Call,
-        socket: sockets::Socket,
+        socket: Rc<sockets::Socket>,
         destinations: Vec<Option<SocketAddr>>,
         pending: Option<Pending>,
     },
 }
 pub struct Query {
     pub call: Call,
-    socket: sockets::Socket,
+    socket: Rc<sockets::Socket>,
     destinations: Vec<Option<SocketAddr>>,
-    _pending: Option<Pending>,
+    pending: Option<Pending>,
 }
 pub struct Collector {
     sockets: sockets::Registry,
-    peers: HashMap<u64, SocketAddr>,
-    sources: HashMap<u64, SocketAddr>,
     registry: Registry,
     netns: PathBuf,
 }
@@ -68,30 +67,30 @@ impl Collector {
     pub fn new(registry: Registry, netns: PathBuf) -> Self {
         Self {
             sockets: Default::default(),
-            peers: HashMap::new(),
-            sources: HashMap::new(),
             registry,
             netns,
         }
+    }
+    pub fn reap(&mut self) {
+        self.sockets.reap();
     }
     pub fn enter(&mut self, call: Call) -> Option<Attempt> {
         if call.number == libc::SYS_socket {
             return Some(Attempt::Socket(call));
         }
         let socket = self.sockets.lookup(call.tid, call.args[0] as i32)?;
-        if !matches!(socket.transport(), "tcp" | "udp")
-            || std::fs::read_link(format!("/proc/{}/ns/net", call.tid))
-                .ok()
-                .as_ref()
-                != Some(&self.netns)
+        if std::fs::read_link(format!("/proc/{}/ns/net", call.tid))
+            .ok()
+            .as_ref()
+            != Some(&self.netns)
         {
             return None;
         }
-        let peer = self.peers.get(&socket.id).copied();
+        let peer = socket.peer.get();
         let destinations = match call.number {
             libc::SYS_connect => vec![remote(&call, call.args[1], call.args[2])],
             libc::SYS_bind => vec![],
-            _ if socket.transport() != "udp" => return None,
+            _ if socket.transport != Transport::Udp => return None,
             libc::SYS_sendto => vec![remote(&call, call.args[4], call.args[5]).or(peer)],
             libc::SYS_sendmsg => vec![message(&call, call.args[1]).or(peer)],
             libc::SYS_sendmmsg => (0..call.args[2].min(1024))
@@ -108,11 +107,11 @@ impl Collector {
         // The proxy waits for in-flight datagram calls to finish so a failed
         // send cannot become an owner, nor an older writer be reported as sole
         // owner while another writer's metadata is still being resolved.
-        let pending = (socket.transport() == "udp"
+        let pending = (socket.transport == Transport::Udp
             && !matches!(call.number, libc::SYS_connect | libc::SYS_bind))
         .then(|| {
             self.registry
-                .begin_datagram(self.sources.get(&socket.id).copied(), &destinations)
+                .begin_datagram(socket.source.get(), &destinations)
         });
         Some(Attempt::Operation {
             call,
@@ -139,21 +138,16 @@ impl Collector {
         {
             return None;
         }
+        // The call holds the socket identity through its exit stop, even if
+        // another thread has since closed the last FD and the index was reaped.
         if call.number == libc::SYS_bind {
-            self.sources.remove(&socket.id);
+            socket.source.set(None);
             return None;
         }
         if call.number == libc::SYS_connect {
-            self.sources.remove(&socket.id);
-            match destinations[0] {
-                Some(peer) => {
-                    self.peers.insert(socket.id, peer);
-                }
-                None => {
-                    self.peers.remove(&socket.id);
-                    return None;
-                }
-            }
+            socket.source.set(None);
+            socket.peer.set(destinations[0]);
+            destinations[0]?;
         }
         if call.number == libc::SYS_sendmmsg {
             destinations.truncate(result as usize);
@@ -161,15 +155,15 @@ impl Collector {
         if destinations.iter().all(Option::is_none) {
             return None;
         }
-        if let Some(source) = self.sources.get(&socket.id).copied() {
-            self.publish(&call, socket, &destinations, source);
+        if let Some(source) = socket.source.get() {
+            self.publish(&call, &socket, &destinations, source, pending.as_ref());
             return None;
         }
         Some(Query {
             call,
             socket,
             destinations,
-            _pending: pending,
+            pending,
         })
     }
     pub fn queried(&mut self, query: Query, source: Option<SocketAddr>) {
@@ -195,36 +189,112 @@ impl Collector {
                 IpAddr::V6(Ipv6Addr::LOCALHOST)
             });
         }
-        self.sources.insert(query.socket.id, source);
-        if query.socket.transport() != "udp" || query.call.number != libc::SYS_connect {
-            self.publish(&query.call, query.socket, &query.destinations, source);
+        query.socket.source.set(Some(source));
+        if query.socket.transport != Transport::Udp || query.call.number != libc::SYS_connect {
+            self.publish(
+                &query.call,
+                &query.socket,
+                &query.destinations,
+                source,
+                query.pending.as_ref(),
+            );
         }
     }
     fn publish(
         &self,
         call: &Call,
-        socket: sockets::Socket,
+        socket: &sockets::Socket,
         destinations: &[Option<SocketAddr>],
         source: SocketAddr,
+        pending: Option<&Pending>,
     ) {
         let Some(process) = call.process else {
             return;
         };
-        let transport = if socket.transport() == "tcp" {
-            Transport::Tcp
-        } else {
-            Transport::Udp
-        };
         for destination in destinations.iter().flatten() {
             self.registry.register(
                 Key {
-                    transport,
+                    transport: socket.transport,
                     source,
                     destination: *destination,
                 },
                 socket.id,
                 process,
+                pending
+                    .map(|send| send.started)
+                    .unwrap_or_else(std::time::SystemTime::now),
+                |ids| {
+                    self.sockets
+                        .any_udp_bound(call.tid, source.port(), ids)
+                        .unwrap_or(true)
+                },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::Identity;
+    use nix::unistd::Pid;
+    use std::{net::UdpSocket, os::fd::AsRawFd};
+
+    #[tokio::test]
+    async fn a_completed_send_keeps_its_owner_if_the_socket_closes_before_the_exit_stop() {
+        let registry = Registry::default();
+        let mut collector = Collector::new(
+            registry.clone(),
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let source = socket.local_addr().unwrap();
+        let destination = receiver.local_addr().unwrap();
+        let address = address::encode(destination);
+        let fd = socket.as_raw_fd() as u64;
+        let call = |number, args| Call {
+            tid: Pid::this(),
+            process: Some(Identity {
+                pid: 1,
+                process_instance_id: 1,
+            }),
+            number,
+            args,
+        };
+        let create = collector
+            .enter(call(
+                libc::SYS_socket,
+                [libc::AF_INET as u64, libc::SOCK_DGRAM as u64, 0, 0, 0, 0],
+            ))
+            .unwrap();
+        collector.finish(create, fd as i64);
+        let connect = collector
+            .enter(call(
+                libc::SYS_connect,
+                [fd, address.as_ptr() as u64, address.len() as u64, 0, 0, 0],
+            ))
+            .unwrap();
+        socket.connect(destination).unwrap();
+        let query = collector.finish(connect, 0).unwrap();
+        collector.queried(query, Some(source));
+        let write = collector
+            .enter(call(libc::SYS_write, [fd, 0, 1, 0, 0, 0]))
+            .unwrap();
+        let sent = socket.send(b"x").unwrap();
+        drop(socket);
+        collector.reap();
+        collector.finish(write, sent as i64);
+        let flow = Key {
+            transport: Transport::Udp,
+            source,
+            destination,
+        };
+        assert!(
+            registry
+                .resolve(&flow, None)
+                .await
+                .is_some_and(|metadata| metadata.socket_id == 1)
+        );
     }
 }
