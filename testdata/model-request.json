@@ -1,0 +1,19 @@
+{
+  "model": "fixture-model",
+  "messages": [
+    {
+      "role": "system",
+      "content": "用用户使用的语言回答问题。\n\nYou are an agent. Your internal name is \"agentkit\". The description about you is \"A text conversation assistant.\".",
+      "name": null
+    },
+    {
+      "role": "user",
+      "content": "记住代号青竹",
+      "name": null
+    }
+  ],
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  }
+}
