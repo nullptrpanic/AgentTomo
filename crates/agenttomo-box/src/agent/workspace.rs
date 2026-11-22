@@ -19,6 +19,8 @@ pub enum Action {
         prompt: String,
         #[serde(default)]
         sample: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_marker: Option<String>,
     },
     Cancel,
 }
@@ -56,7 +58,7 @@ pub async fn run(browser: bool) -> io::Result<u8> {
             action = read.receive::<Action>() => {
                 match action? {
                     Action::Cancel => { cancelled = true; kill_group(task.as_mut()); },
-                    Action::Start { scope, mut prompt, sample } => {
+                    Action::Start { scope, mut prompt, sample, report_marker } => {
                         if task.is_some() || sample.is_none() && prompt.trim().is_empty() || prompt.len() > 8192 {
                             if let Some(id) = &sample {
                                 protocol::send(&mut write, &json!({"kind":"security.sample.finished","scope":scope,"sample_id":id,"status":"error","error":"Another task is already running, or the request is invalid."})).await?;
@@ -68,17 +70,17 @@ pub async fn run(browser: bool) -> io::Result<u8> {
                         let start = async {
                             if let Some(id) = sample.as_deref() {
                                 protocol::send(&mut write, &json!({"kind":"security.sample.progress","scope":scope,"sample_id":id,"status":"running","phase":"preparing"})).await?;
-                                let run = crate::playground::samples::prepare(id, &scope.task_id).await?;
+                                let mut run = crate::playground::samples::prepare(id, &scope.task_id, report_marker).await?;
                                 protocol::send(&mut write, &json!({"kind":"security.sample.progress","scope":scope,"sample_id":id,"status":"running","phase":"injecting"})).await?;
                                 run.inject().await?;
                                 prompt = run.prompt.clone();
-                                let mut event = run.started();
+                                let mut event = run.verify_injection().await?;
                                 event["kind"] = "security.sample.started".into();
                                 event["scope"] = json!(scope);
                                 protocol::send(&mut write, &event).await?;
                                 sample_run = Some(run);
                             }
-                            let mut child = start(adapter, &scope, if sample.is_some() { None } else { conversation.as_deref() }, &prompt).await?;
+                            let mut child = start(adapter, &scope, if sample.is_some() { None } else { conversation.as_deref() }, &prompt, sample.as_deref() == Some("tool-leak")).await?;
                             let stdout = child.stdout.take().unwrap();
                             let stderr = child.stderr.take().unwrap();
                             let diagnostics = diagnostics.clone();
@@ -146,11 +148,19 @@ pub(super) async fn start(
     scope: &Scope,
     conversation: Option<&str>,
     prompt: &str,
+    observe_report: bool,
 ) -> io::Result<Child> {
     let mut launch = adapter.launch(&super::adapter::LaunchRequest {
         conversation,
         prompt,
     })?;
+    if observe_report {
+        let filter = crate::syscall::prepare(crate::collectors::file::report::EXTRA_SYSCALLS);
+        // The prepared hook is allocation-free between fork and exec.
+        unsafe {
+            launch.command.pre_exec(filter);
+        }
+    }
     let mut child = launch
         .command
         .env("AGENTTOMO_AGENT_ID", &scope.agent_instance_id)
@@ -215,19 +225,28 @@ pub async fn drive(
     mut actions: tokio::sync::mpsc::Receiver<Action>,
     events: tokio::sync::mpsc::Sender<crate::recording::Observation>,
     agents: super::Hub,
+    reports: crate::collectors::file::report::Watch,
 ) -> io::Result<()> {
     let stream = connect().await?;
     let (read, mut write) = stream.into_split();
     let mut read = protocol::Reader::new(BufReader::new(read));
     let mut running = None;
+    let mut started = false;
     let mut cancelled = false;
     loop {
         tokio::select! {
             action = actions.recv() => match action {
-                Some(action) => {
-                    if let Action::Start { scope, .. } = &action && running.is_none() {
+                Some(mut action) => {
+                    if let Action::Start { scope, sample, report_marker, .. } = &mut action && running.is_none() {
                         running = Some(scope.clone());
                         cancelled = false;
+                        if sample.as_deref() == Some("tool-leak") {
+                            // Arm the tracer before sending Start so it can match the first write.
+                            let marker = crate::playground::samples::new_marker();
+                            let root = crate::playground::samples::directory(std::path::Path::new("/home"), &scope.task_id);
+                            reports.arm(scope, root.join("public/report.json"), marker.clone());
+                            *report_marker = Some(marker);
+                        }
                     }
                     if matches!(action, Action::Cancel) { cancelled = true; }
                     if matches!(action, Action::Cancel) && let Some(scope) = &running && let Err(error) = agents.cancel(scope) {
@@ -255,12 +274,21 @@ pub async fn drive(
                 };
                 let scope: Scope = serde_json::from_value(data["scope"].take())?;
                 if kind == "security.sample.finished" && cancelled { data["status"] = "cancelled".into(); }
-                if kind == "agent.task.started" { running = Some(scope.clone()); }
-                if kind == "agent.task.rejected" && running.as_ref() == Some(&scope) {
+                if kind == "security.sample.finished" && data["sample_id"] == "tool-leak"
+                    && data.get("exit_code").is_some() && let Some(evidence) = reports.finish(&scope) {
+                    crate::playground::samples::apply_report_evidence(&mut data,evidence);
+                }
+                if kind == "agent.task.started" {
+                    running = Some(scope.clone());
+                    started = true;
+                }
+                if kind == "agent.task.rejected" && !started && running.as_ref() == Some(&scope) {
                     data["cancelled"] = cancelled.into();
+                    reports.finish(&scope);
                     running = None;
                 }
                 if kind == "agent.task.finished" {
+                    started = false;
                     data["cancelled"] = cancelled.into();
                     if cancelled { data["error"] = Value::Null; }
                     running = None;

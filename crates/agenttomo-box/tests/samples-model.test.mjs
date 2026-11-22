@@ -3,6 +3,51 @@ import {test} from 'node:test';
 import {SamplesModel} from '../src/playground/assets/samples-model.mjs';
 let sequence = 0;
 const event = (kind,task_id,data={}) => ({kind,sequence:++sequence,data:{task_id,...data}});
+test('a completed report finding can open the original write even if the trace arrives after the verdict', () => {
+ const model = new SamplesModel();
+ const start = event('security.sample.started','trial',{sample_id:'tool-leak',status:'running'});
+ const write = event('file.report_marker','trial',{matched:true,pid:42,process_instance_id:7});
+ const cleared = event('file.report_marker','trial',{matched:false,pid:43,process_instance_id:8});
+ const finish = event('security.sample.finished','trial',{sample_id:'tool-leak',status:'reproduced',observed:{diagnostic_token:''},report_evidence:[write.data,cleared.data]});
+ model.add(start);
+ model.add(write);
+ assert.equal(model.findingCount,0);
+ model.add(finish);
+ model.add(cleared);
+ model.add(write);
+ assert.equal(model.findingCount,1);
+ assert.equal(model.reportEvent('trial',true),write);
+ assert.equal(model.reportEvent('trial',false),cleared);
+ assert.equal(model.reportEvent('other',true),undefined);
+});
+test('Findings counts only finished reproduced impacts, once per run on replay', () => {
+ const model = new SamplesModel();
+ const sample = {sample_id:'tool-leak'};
+ const start = event('security.sample.started','protected',{...sample,status:'running',injection:{matches_baseline:false}});
+ const finish = event('security.sample.finished','protected',{...sample,status:'not_reproduced',observed:{diagnostic_token:''}});
+ model.add(start);
+ assert.equal(model.findingCount,0,'injection alone is setup evidence');
+ model.add(finish);
+ model.add(start);
+ model.add(finish);
+ assert.equal(model.findingCount,0,'an empty token is a negative impact verdict');
+ assert.equal(model.runs.get('protected').status,'not_reproduced');
+ const positive = event('security.sample.finished','both',{...sample,status:'reproduced',injection:{matches_baseline:false}});
+ model.add(positive);
+ model.add(positive);
+ assert.equal(model.findingCount,1);
+ model.add(event('security.sample.finished','clean',{...sample,status:'not_reproduced',injection:{matches_baseline:true}}));
+ model.add(event('security.sample.finished','legacy',{...sample,status:'not_reproduced',injection:{before:'trusted',after:'replacement'}}));
+ model.add(event('security.sample.finished','old-positive',{...sample,status:'reproduced'}));
+ model.add(event('security.sample.finished','failed-before-check',{...sample,status:'error'}));
+ for (const status of ['cancelled','error']) {
+  model.add(event('security.sample.finished',status,{...sample,status,injection:{matches_baseline:false}}));
+ }
+ assert.equal(model.findingCount,2);
+ model.add(event('security.sample.started','interrupted',{...sample,status:'running',injection:{matches_baseline:false}}));
+ model.end();
+ assert.equal(model.findingCount,2);
+});
 test('runs stay independent, replay is idempotent and agent completion is not an attack verdict', () => {
  const model=new SamplesModel();
  model.add(event('security.sample.started','first',{sample_id:'tool-leak',status:'running'}));

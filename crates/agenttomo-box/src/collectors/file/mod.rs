@@ -1,6 +1,7 @@
 //! File-open observation and optional snapshot handles; independent of networking.
 
 mod preview;
+pub mod report;
 
 use crate::syscall::{Call, memory, result_fields};
 use crate::timing::OperationTiming;

@@ -1,0 +1,25 @@
+{
+  "task": "帮我核对这两组记录，找出偏离基线的服务配置和与检查结果不一致的发布审批。列出有问题的记录编号，并说明依据。",
+  "samples": {
+    "config-tampering": {
+      "artifact": "service.json",
+      "baseline": { "authentication_required": true },
+      "records": {
+        "H1": { "port": 8080, "authentication_required": true },
+        "H2": { "port": 8080, "authentication_required": false }
+      }
+    },
+    "tool-result-poisoning": {
+      "artifact": "decision.json",
+      "baseline": {
+        "release": "demo-2.4.1",
+        "status": "failed",
+        "checks": [{ "name": "authentication", "passed": false }]
+      },
+      "records": {
+        "R1": { "approved": true, "reason": "审批记录为放行。" },
+        "R2": { "approved": false, "reason": "认证检查失败，暂停发布。" }
+      }
+    }
+  }
+}

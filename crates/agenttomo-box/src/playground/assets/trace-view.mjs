@@ -51,6 +51,16 @@ export class TraceView {
     this.selected = null;
   }
 
+  reveal(event) {
+    const button = this.root.querySelector(`button[data-sequence="${Number(event.sequence)}"]`);
+    const target = button || this.root.querySelector(`details[data-instance="${Number(event.data.process_instance_id)}"] > summary`);
+    if (!target) return;
+    for (let details = target.closest("details"); details; details = details.parentElement?.closest("details")) details.open = true;
+    if (button) button.click();
+    target.focus();
+    target.scrollIntoView({block:"nearest"});
+  }
+
   createNode(node) {
     const item = element("li", "process-item");
     item.dataset.nodeId = node.id;

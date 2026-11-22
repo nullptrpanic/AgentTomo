@@ -118,7 +118,7 @@ async fn shared_launcher_uses_plugin_input_and_lifecycle_reader() {
         task_id: "task".into(),
     };
     let mut child =
-        super::super::workspace::start(adapter, &scope, Some("previous"), "hello\nworld")
+        super::super::workspace::start(adapter, &scope, Some("previous"), "hello\nworld", false)
             .await
             .unwrap();
     let (diagnostics, _notices) = mpsc::channel(1);

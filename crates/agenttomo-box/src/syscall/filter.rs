@@ -4,9 +4,11 @@ use std::io;
 /// A straight equality filter, not a general BPF compiler. Unselected syscalls
 /// retain the outer sandbox's behavior; this cannot relax an existing filter.
 pub fn install(numbers: &[i64]) -> io::Result<()> {
-    if !super::SUPPORTED {
-        return Ok(());
-    }
+    prepare(numbers)()
+}
+
+/// Allocate the filter before fork. The returned pre-exec hook only issues prctl.
+pub fn prepare(numbers: &[i64]) -> impl Fn() -> io::Result<()> + Send + Sync + 'static {
     let statement = |code: u32, k| libc::sock_filter {
         code: code as u16,
         jt: 0,
@@ -31,12 +33,18 @@ pub fn install(numbers: &[i64]) -> io::Result<()> {
         filter.push(ret(libc::SECCOMP_RET_TRACE));
     }
     filter.push(ret(libc::SECCOMP_RET_ALLOW));
-    let program = libc::sock_fprog {
-        len: filter.len() as u16,
-        filter: filter.as_mut_ptr(),
-    };
-    nix::sys::prctl::set_no_new_privs()?;
-    let result = unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) };
-    Errno::result(result)?;
-    Ok(())
+    move || {
+        if !super::SUPPORTED {
+            return Ok(());
+        }
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr().cast_mut(),
+        };
+        nix::sys::prctl::set_no_new_privs()?;
+        let result =
+            unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) };
+        Errno::result(result)?;
+        Ok(())
+    }
 }

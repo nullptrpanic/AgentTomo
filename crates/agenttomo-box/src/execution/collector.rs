@@ -76,15 +76,17 @@ async fn collect(
     let (observations, mut proxy_events) = mpsc::channel(256);
     let agents = crate::agent::Hub::with_runtimes(runtime_executables);
     let (agent_actions, actions) = mpsc::channel(8);
-    let mut agent_task = std::env::var_os("AGENTTOMO_WORKSPACE")
+    let reports = std::env::var_os("AGENTTOMO_WORKSPACE")
         .filter(|_| with_terminal)
-        .map(|_| {
-            tokio::spawn(crate::agent::workspace::drive(
-                actions,
-                observations.clone(),
-                agents.clone(),
-            ))
-        });
+        .map(|_| crate::collectors::file::report::Watch::default());
+    let mut agent_task = reports.clone().map(|reports| {
+        tokio::spawn(crate::agent::workspace::drive(
+            actions,
+            observations.clone(),
+            agents.clone(),
+            reports,
+        ))
+    });
     let inspection =
         crate::proxy::http::Inspection::create(recording.directory(), http, agents.clone()).await?;
     let trust = inspection
@@ -115,6 +117,7 @@ async fn collect(
     let (events_tx, mut events) = mpsc::channel(256);
     let thread = tracing::spawn(
         tracing::Launch {
+            reports,
             command: command.to_owned(),
             with_terminal,
             capture_files,
@@ -276,6 +279,7 @@ async fn record_input(
                                 },
                                 prompt,
                                 sample,
+                                report_marker: None,
                             })
                             .await
                             .map_err(io::Error::other)?;

@@ -7,7 +7,7 @@ pub mod query;
 use nix::{errno::Errno, libc, unistd::Pid};
 use std::io;
 
-pub use filter::install;
+pub use filter::{install, prepare};
 pub const SUPPORTED: bool = cfg!(target_arch = "x86_64");
 pub const NATIVE_ARCH: u32 = 0xc000003e;
 

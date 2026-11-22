@@ -1,6 +1,8 @@
 //! Linux process ownership. Every ptrace/wait operation stays on this OS thread.
 
 mod processes;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod report_tests;
 mod syscalls;
 
 use std::collections::HashSet;
@@ -47,6 +49,7 @@ fn emit(sender: &mpsc::Sender<Event>, event: Event) -> io::Result<()> {
 }
 
 pub struct Launch {
+    pub reports: Option<crate::collectors::file::report::Watch>,
     pub command: OsString,
     pub with_terminal: bool,
     pub capture_files: bool,
@@ -83,6 +86,7 @@ fn run(
     agents: crate::agent::Hub,
 ) -> io::Result<()> {
     let Launch {
+        reports,
         command,
         with_terminal,
         capture_files,
@@ -260,7 +264,7 @@ fn run(
     let mut known = HashSet::from([root]);
     let mut newborn = HashSet::new();
     let mut root_exited = false;
-    let mut calls = syscalls::Dispatch::new(registry, netns, capture_files);
+    let mut calls = syscalls::Dispatch::new(registry, netns, capture_files, reports);
     let mut processes = processes::Registry::default();
     processes.child(root);
     loop {
@@ -319,7 +323,7 @@ fn run(
                 }
                 match event {
                     nix::libc::PTRACE_EVENT_SECCOMP => {
-                        if let Err(error) = calls.enter(pid, processes.observe(pid)) {
+                        if let Err(error) = calls.enter(pid, processes.observe(pid), &agents) {
                             if error.raw_os_error() != Some(nix::libc::ESRCH) {
                                 return Err(error);
                             }
@@ -401,7 +405,15 @@ fn run(
                 resume(&calls, pid, None)?;
             }
             WaitStatus::PtraceSyscall(pid) => {
-                match calls.exit(pid) {
+                match calls.exit(pid, &agents, |data| {
+                    emit(
+                        sender,
+                        Event::Process {
+                            kind: "file.report_marker",
+                            data,
+                        },
+                    )
+                }) {
                     Ok(Some(event)) => emit(sender, event)?,
                     Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => {
                         calls.forget(pid)

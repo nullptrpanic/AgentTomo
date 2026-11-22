@@ -140,11 +140,15 @@ Traffic 列表以 request ID 缓存和复用 DOM 行，一次 HTTP 交换始终�
 
 左侧工作区增加 Security tests，展示三个受控样本卡片。查看详情后点击 Run，
 通过现有 workspace 控制连接启动真实 Agent；每次使用新对话和独立样本目录。
+Agent 收到卡片上展示的日常任务，自主调用工具，并在第三张卡中写下发布决定。
 Chat、Task trajectory 保持普通任务视图，不插入攻击判定。
 
-右侧 Findings 单独消费 security.sample.started / finished 事件，展示注入内容、
-预期、实际产物和原始证据；独立监控页面通过原有记录流同步。退出成功不是攻击
-成功：检查实际产物后才标记 Reproduced，取消、运行失败、未复现分别展示。
+右侧 Findings 通过 security.sample.started / finished 展示两项证据。沙箱在启动
+Agent 前读回工具文件，与可信基线逐字节比对，结果列在注入证据中。
+报告卡按本次任务写入或原子替换公开报告时的标记观测、以及结束时的报告判定实际影响。
+首次命中和随后观测到的清除都带有进程和时间，可在 Findings 中定位到对应事件。
+配置和发布卡在 Agent 退出后检查最终产物。只有检查结果为 Reproduced 的运行
+才计入角标，每次运行计一次。独立监控页面通过原有记录流同步结果。
 样本文件沿用沙箱隔离，--overlay-root 开启时位于 /home 的 upper，结束后销毁。
 详细语义见 [内置安全样本](builtin-security-samples.md)。
 

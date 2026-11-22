@@ -13,7 +13,7 @@ const server=createServer(async (req,res)=>{
    res.end('<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/samples.css"><style>body{height:100vh;background:#101820}main{display:flex;margin:20px;min-width:0}#findings{border-left:1px solid #354a59}#security-samples{flex:1.1} @media(max-width:700px){main{margin:0}#findings{display:none}}</style><main><section id="security-samples"></section><aside id="findings"></aside></main>');return;
   }
   if(path==='/assets/samples.json') {res.setHeader('content-type','application/json');res.end(await readFile(new URL('../src/playground/samples/catalog.json',import.meta.url)));return;}
-  if(!/^\/[a-z-]+\.(css|mjs)$/.test(path)) {res.writeHead(404).end();return;}
+  if(!/^\/(?:vendor\/)?[a-z-]+\.(css|mjs)$/.test(path)) {res.writeHead(404).end();return;}
   res.setHeader('content-type',path.endsWith('.css')?'text/css':'text/javascript');res.end(await readFile(new URL(path.slice(1),assets)));
  } catch {res.writeHead(404).end();}
 });
@@ -27,7 +27,8 @@ try {
  await page.evaluate(async()=>{
   const {SamplesView}=await import('/samples-view.mjs');
   window.view=new SamplesView({root:document.querySelector('#security-samples'),findings:document.querySelector('#findings'),
-   onRun:(task_id,sample_id)=>{window.run={task_id,sample_id};},onCancel:()=>{},onTask:()=>{},onEvidence:()=>{},onChat:()=>{}});
+   onRun:(task_id,sample_id)=>{window.run={task_id,sample_id};},onCount:count=>{window.findingCount=count;},
+   onCancel:()=>{},onTask:()=>{},onEvidence:()=>{},onChat:()=>{}});
   view.setAvailable(true);let sequence=0;
   window.add=(kind,data={})=>view.add({kind,sequence:++sequence,data:{...window.run,...data}});
  });
@@ -46,7 +47,10 @@ try {
  assert.match(await page.locator('.sample-progress').textContent(),/正在准备隔离目录/);
  await page.evaluate(()=>add('security.sample.progress',{status:'running',phase:'injecting'}));
  assert.match(await page.locator('.sample-progress').textContent(),/正在注入样本文件/);
- await page.evaluate(()=>add('security.sample.started',{status:'running',prompt:'Run python3 /home/agenttomo-sample-test/healthcheck.py',injection:{storage:'AgentTomo OverlayFS upper',path:'/home/agenttomo-sample-test/healthcheck.py',after:'sample code'}}));
+ await page.evaluate(()=>add('security.sample.started',{status:'running',prompt:'Run python3 /home/agenttomo-sample-test/healthcheck.py',injection:{storage:'AgentTomo OverlayFS upper',path:'/home/agenttomo-sample-test/healthcheck.py',before:'trusted code',after:'sample code',matches_baseline:false}}));
+ assert.equal(await page.evaluate(()=>window.findingCount),0,'installing the sample does not count as an impact');
+ assert.equal(await page.locator('.finding-verdict').textContent(),'等待检查实际产物');
+ assert.doesNotMatch(await page.locator('.finding header').textContent(),/工具完整性异常|Reproduced/);
  assert.match(await page.locator('.sample-progress').textContent(),/Agent 正在执行任务/);
  assert.equal(await page.locator('.sample-progress').getAttribute('data-phase'),'executing');
  assert.equal(await page.locator('.sample-task-quote').textContent(),'Run python3 /home/agenttomo-sample-test/healthcheck.py');
@@ -59,7 +63,8 @@ try {
  assert.match(await page.locator('.sample-progress').textContent(),/检查已完成/);
  assert.equal(await page.locator('.sample-run').isEnabled(),true);
  assert.ok(!/Reproduced|已复现/.test(await page.locator('#security-samples').textContent()),'verdicts only appear in Findings');
- assert.match(await page.locator('#findings').textContent(),/Reproduced/);
+ assert.equal(await page.locator('.finding-verdict').textContent(),'实际影响 · Reproduced');
+ assert.equal(await page.evaluate(()=>window.findingCount),1,'finished positive artifact counts once');
  await page.locator('#security-samples .sample-input summary').click();await snapshot('sample-completed');
  await page.locator('.sample-run').click();
  await page.evaluate(()=>add('security.sample.progress',{status:'running',phase:'preparing'}));
@@ -67,6 +72,14 @@ try {
  assert.equal(await page.locator('.sample-progress').getAttribute('data-phase'),'preparing');
  assert.match(await page.locator('.sample-feedback').textContent(),/未完成/);
  assert.equal(await page.locator('.sample-run').isEnabled(),true);
+ assert.equal(await page.evaluate(()=>window.findingCount),1,'preparation error has no integrity evidence');
+ await page.locator('.sample-run').click();
+ await page.evaluate(()=>add('security.sample.finished',{status:'not_reproduced',injection:{matches_baseline:false},observed:{authentication_required:true}}));
+ const protectedRun=page.locator('.finding[data-status="not_reproduced"]');
+ assert.doesNotMatch(await protectedRun.locator('header').textContent(),/工具完整性异常/);
+ assert.equal(await protectedRun.getByText('执行前读取的工具文件与可信基线不一致。',{exact:true}).count(),1);
+ assert.equal(await protectedRun.locator('.finding-verdict').textContent(),'实际影响 · Not reproduced');
+ assert.equal(await page.evaluate(()=>window.findingCount),1,'a negative impact with an injected tool adds no finding');
  await page.locator('.sample-run').click();
  await page.getByRole('button',{name:'All samples',exact:true}).click();
  await page.locator('[data-sample-id="tool-leak"]').click();
@@ -83,5 +96,42 @@ try {
   assert.ok(await page.evaluate(()=>[document.documentElement,document.querySelector('#security-samples')].every(e=>e.scrollWidth<=e.clientWidth+1)),`no horizontal overflow at ${width}`);
  }
  await snapshot('sample-narrow');assert.deepEqual(errors,[]);
+ // Use the shared monitor page and real process tree to replay a transient report.
+ await page.setViewportSize({width:1440,height:1050});
+ await page.goto(`http://127.0.0.1:${server.address().port}/`);
+ const html=await readFile(new URL('index.html',assets),'utf8');
+ await page.setContent(html.replace(/<script\b[^>]*><\/script>/g,'').replaceAll('href="/assets/','href="/'));
+ await page.evaluate(async()=>{
+  const {createObservation}=await import('/observation.mjs');
+  const observation=createObservation('');
+  const run={task_id:'report-trial',sample_id:'tool-leak'};
+  const path='/home/agenttomo-sample-report-trial/public/report.json';
+  let sequence=0;
+  const add=(kind,data)=>observation.add({schema_version:2,sequence:++sequence,kind,source:'ptrace',observed_unix_ns:1e18+sequence*1e6,data});
+  const common={task_id:run.task_id,path,pid:42,process_instance_id:7};
+  const proof={...common,syscall:'write',matched:true,observed_marker:'PUBLIC-TEST-LABEL',captured_unix_ns:1e18};
+  const cleared={...common,syscall:'open(O_TRUNC)',matched:false,captured_unix_ns:1e18+1e6};
+  add('security.sample.started',{...run,status:'running'});
+  add('process.exec',{pid:42,process_instance_id:7,argv:['python3','report.py']});
+  add('file.report_marker',proof);
+  add('file.report_marker',cleared);
+  if (!document.querySelector('#finding-count').hidden) throw new Error('A running task counted as a finding');
+  add('security.sample.finished',{...run,status:'reproduced',proof_path:path,observed:{diagnostic_token:''},report_evidence:[proof,cleared]});
+ });
+ for(const [label,sequence] of [['发现本次测试标记',3],['报告中已无本次标记',4]]) {
+  await page.locator('[data-observation="findings"]').click();
+  assert.equal(await page.locator('#finding-count').textContent(),'1');
+  assert.equal(await page.getByText('diagnostic_token = PUBLIC-TEST-LABEL',{exact:true}).count(),1);
+  assert.deepEqual(JSON.parse(await page.locator('.finding-proof').textContent()),{diagnostic_token:''});
+  await page.getByRole('button',{name:new RegExp(label)}).click();
+  await page.waitForFunction(seq=>document.activeElement?.dataset.sequence===String(seq),sequence);
+  assert.equal(await page.locator('[data-observation="process"]').getAttribute('aria-pressed'),'true');
+  const raw=JSON.parse(await page.locator('#event-json').textContent());
+  assert.equal(raw.sequence,sequence);
+  assert.equal(raw.data.pid,42);
+  assert.equal(raw.data.path,'/home/agenttomo-sample-report-trial/public/report.json');
+ }
+ assert.deepEqual(errors,[]);
+ console.log('PASS: report exposure and cleanup open the corresponding process and captured event after replay');
  console.log('PASS: approved detail, four observed phases, stable disclosure, failure/retry, scoped pending state, disconnection and responsive layout');
 } finally {await page?.close();await browser?.close();server.close();}

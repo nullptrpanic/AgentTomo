@@ -6,36 +6,56 @@ use crate::{
     syscall::{Call, Stop, query},
 };
 use nix::{sys::ptrace, unistd::Pid};
+use serde_json::Value;
 use std::{collections::HashMap, io, path::PathBuf};
 
 pub struct Dispatch {
     pending: HashMap<Pid, Pending>,
     network: network::Collector,
     capture_files: bool,
+    reports: Option<file::report::Watch>,
 }
 
 enum Pending {
-    File(file::Attempt),
+    File(file::Attempt, Call),
+    Report(file::report::Mutation),
     Memory(memory::Attempt),
     Network(Box<network::Attempt>),
     Query(Box<(query::Query, network::Query)>),
 }
 
 impl Dispatch {
-    pub fn new(registry: Registry, netns: PathBuf, capture_files: bool) -> Self {
+    pub fn new(
+        registry: Registry,
+        netns: PathBuf,
+        capture_files: bool,
+        reports: Option<file::report::Watch>,
+    ) -> Self {
         Self {
             pending: HashMap::new(),
             network: network::Collector::new(registry, netns),
             capture_files,
+            reports,
         }
     }
 
-    pub fn enter(&mut self, tid: Pid, process: Option<crate::process::Identity>) -> io::Result<()> {
+    pub fn enter(
+        &mut self,
+        tid: Pid,
+        process: Option<crate::process::Identity>,
+        agents: &crate::agent::Hub,
+    ) -> io::Result<()> {
         let call = Call::read(tid, process)?;
         if let Some(attempt) = file::enter(&call) {
-            self.pending.insert(tid, Pending::File(attempt));
+            self.pending.insert(tid, Pending::File(attempt, call));
         } else if let Some(attempt) = memory::enter(&call) {
             self.pending.insert(tid, Pending::Memory(attempt));
+        } else if let Some(change) = self
+            .reports
+            .as_ref()
+            .and_then(|reports| reports.enter(&call, agents))
+        {
+            self.pending.insert(tid, Pending::Report(change));
         } else if let Some(attempt) = self.network.enter(call) {
             self.pending
                 .insert(tid, Pending::Network(Box::new(attempt)));
@@ -43,15 +63,34 @@ impl Dispatch {
         Ok(())
     }
 
-    pub fn exit(&mut self, tid: Pid) -> io::Result<Option<super::Event>> {
+    pub fn exit(
+        &mut self,
+        tid: Pid,
+        agents: &crate::agent::Hub,
+        mut report_event: impl FnMut(Value) -> io::Result<()>,
+    ) -> io::Result<Option<super::Event>> {
         let stop = Stop::read(tid)?;
         if stop.op != 2 {
             return Ok(None);
         }
         match self.pending.remove(&tid) {
-            Some(Pending::File(attempt)) => Ok(Some(super::Event::FileOpen(
-                attempt.finish(stop.result(), self.capture_files),
-            ))),
+            Some(Pending::File(attempt, call)) => {
+                let opened = attempt.finish(stop.result(), self.capture_files);
+                if let Some(data) = self
+                    .reports
+                    .as_ref()
+                    .and_then(|reports| reports.opened(&call, agents, &opened.data))
+                {
+                    report_event(data)?;
+                }
+                Ok(Some(super::Event::FileOpen(opened)))
+            }
+            Some(Pending::Report(change)) => {
+                if let Some(data) = change.finish(stop.result()) {
+                    report_event(data)?;
+                }
+                Ok(None)
+            }
             Some(Pending::Memory(attempt)) => Ok(Some(super::Event::Process {
                 kind: "memory.mmap",
                 data: attempt.finish(stop.result()),

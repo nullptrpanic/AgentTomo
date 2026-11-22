@@ -1,5 +1,5 @@
-//! Pin the actual opened inode while the target is stopped. Content reads belong
-//! to recording, never to the ptrace thread or a later browser pathname lookup.
+//! Pin the actual opened inode while the target is stopped. General file
+//! previews use an independent handle on the recording worker.
 
 use nix::{libc, unistd::Pid};
 use serde_json::{Value, json};
@@ -49,6 +49,10 @@ fn open(pid: Pid, fd: i64, preview: &mut Value) -> io::Result<File> {
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
         .open(format!("/proc/{pid}/fd/{fd}"))?;
+    read_handle(&pin, preview)
+}
+
+pub(super) fn read_handle(pin: &File, preview: &mut Value) -> io::Result<File> {
     let metadata = pin.metadata()?;
     if !metadata.is_file() {
         preview["reason"] = "not_regular".into();

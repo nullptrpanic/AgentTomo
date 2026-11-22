@@ -2,6 +2,7 @@ const valid = value => Number.isFinite(value) && value >= 0;
 
 // New summaries have a real proxy start; old events keep their recorded time.
 export function eventTime(event) {
+  if (event.kind === "file.report_marker" && valid(event.data?.captured_unix_ns)) return event.data.captured_unix_ns;
   if (valid(event.data?.started_unix_ns)) return event.data.started_unix_ns;
   return valid(event.observed_unix_ns) ? event.observed_unix_ns : null;
 }

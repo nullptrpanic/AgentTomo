@@ -100,7 +100,13 @@ export function createObservation(token) {
       $("event-detail").open = true;
     }
   }
-  function inspectEvidence(event) { selectRaw(event); files.close(); $("event-detail").open = true; }
+  function inspectEvidence(event) {
+    if (event.kind === "file.report_marker") {
+      observationView("process");
+      requestAnimationFrame(() => trace.reveal(event));
+    }
+    selectRaw(event); files.close(); $("event-detail").open = true;
+  }
   const trace = new TraceView({
     root: $("process-tree"), scroll: $("trace-scroll"), empty: $("empty-trace"), onSelect: selectEvent, onInspect: inspectEvidence,
   });

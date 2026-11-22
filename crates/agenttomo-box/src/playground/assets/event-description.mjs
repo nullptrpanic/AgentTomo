@@ -5,6 +5,7 @@ export const formatCommand = (argv) => argv.map(arg => /\s/.test(arg) ? JSON.str
 export function describeBehavior(kind, data, domain) {
   const result = data.restart ? "interrupted; restart pending" : data.errno ? `errno ${data.errno}` : data.result ?? "result unavailable";
   const destination = domain ? `${domain} (${data.destination ?? "address unavailable"})` : data.destination;
+  if (kind === "file.report_marker") return `${data.syscall} ${data.path} · ${data.matched ? "本次测试标记已出现" : "本次测试标记已清除"}`;
   if (kind === "file.open") return `${data.syscall || "open"} ${data.path ?? "[unreadable path]"} → ${typeof result === "number" && result >= 0 ? `FD ${result}` : result}`;
   if (kind === "memory.mmap") {
     const target = data.anonymous ? "anonymous" : data.resolved_path ?? `FD ${data.fd ?? "?"}`;

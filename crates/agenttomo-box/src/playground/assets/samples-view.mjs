@@ -14,7 +14,7 @@ const button = (label, action, style = "sample-button", markup) => {
   if (markup) node.prepend(icon(markup, "sample-control-icon"));
   node.addEventListener("click", action); return node;
 };
-const verdicts = {running:"Running",reproduced:"Reproduced",not_reproduced:"Not reproduced",cancelled:"Cancelled",error:"Run error",interrupted:"Interrupted"};
+const verdicts = {running:"等待检查实际产物",reproduced:"Reproduced",not_reproduced:"Not reproduced",cancelled:"Cancelled",error:"Run error",interrupted:"Interrupted"};
 const phases = [
   ["preparing", "准备环境", "正在准备隔离目录"],
   ["injecting", "注入文件", "正在注入样本文件"],
@@ -127,7 +127,7 @@ export class SamplesView {
       this.updateStatus(); this.updateControls(); return;
     }
     if (!this.model.add(event)) return;
-    if (event.data.task_id === this.request?.task_id) { this.pending = null; this.request = null; }
+    if (event.kind.startsWith("security.sample.") && event.data.task_id === this.request?.task_id) { this.pending = null; this.request = null; }
     this.updateStatus(); this.updateControls(); this.renderFindings();
   }
   end() {
@@ -163,26 +163,48 @@ export class SamplesView {
   }
   renderFindings() {
     const runs = [...this.model.runs.values()].reverse();
-    this.onCount?.(runs.filter(run => run.status === "reproduced").length);
-    this.findings.replaceChildren(el("h3", "", "Findings"), el("p", "samples-note", "攻击判定与证据独立展示。任务完成不代表攻击成功；只依据实际观察到的产物判断。"));
+    this.onCount?.(this.model.findingCount);
+    this.findings.replaceChildren(el("h3", "", "Findings"), el("p", "samples-note", "运行中或结束时观测到实际影响，每次完成的运行计一次。"));
     if (!runs.length) this.findings.append(el("p", "samples-empty", "Run a security test from the workspace to inspect its findings here."));
     for (const run of runs) {
       const card = el("article", "sample-card finding"); card.dataset.taskId = run.task_id; card.dataset.status = run.status;
       const head = el("header", "sample-heading");
-      head.append(el("span", "finding-verdict", verdicts[run.status] || run.status), el("h4", "", run.title || run.sample_id));
+      const verdict = verdicts[run.status] || run.status;
+      const hasImpactVerdict = run.status === "reproduced" || run.status === "not_reproduced";
+      head.append(el("span", "finding-verdict", hasImpactVerdict ? `实际影响 · ${verdict}` : verdict), el("h4", "", run.title || run.sample_id));
       const body = el("div", "sample-body");
-      body.append(el("p", "", run.explanation || (run.status === "running" ? "Waiting for this task's observed evidence." : "The task could not be prepared.")));
-      if (run.expected) body.append(el("h4", "", "Expected"), el("p", "", run.expected));
-      if (run.status === "not_reproduced") body.append(el("p", "samples-note", "本次未观察到预设影响。这不表示 Agent 已通过全面安全验证。"));
-      if (run.error) body.append(el("p", "finding-error", run.error));
-      if (run.injection) {
-        const injection = el("details", "sample-input");
-        injection.append(el("summary", "", "Injection evidence"), el("p", "", run.injection.storage), el("code", "sample-path", run.injection.path), el("pre", "", run.injection.after));
-        body.append(injection);
+      if (run.report_evidence?.length) {
+        body.append(el("h4", "", "运行中观测到的公开报告"));
+        for (const observation of run.report_evidence) {
+          const raw = this.model.reportEvent(run.task_id, observation.matched);
+          const time = new Date(observation.captured_unix_ns / 1e6).toLocaleTimeString(undefined, {hour12:false, fractionalSecondDigits:3, hour:"2-digit",minute:"2-digit",second:"2-digit"});
+          const label = observation.matched ? "发现本次测试标记" : "报告中已无本次标记";
+          body.append(button(`${time} · PID ${observation.pid} · ${observation.syscall} · ${label}`, () => this.onEvidence(raw || run.event)));
+          if (observation.observed_marker) body.append(el("code", "sample-path", `diagnostic_token = ${observation.observed_marker}`));
+        }
+        body.append(el("code", "sample-path", run.proof_path));
       }
       if (run.observed !== undefined) {
-        body.append(el("h4", "", "Observed artifact"), el("code", "sample-path", run.proof_path), el("pre", "finding-proof", JSON.stringify(run.observed,null,2)));
-        const baseline = el("details", "sample-input"); baseline.append(el("summary", "", "Baseline facts"), el("pre", "", JSON.stringify(run.baseline,null,2))); body.append(baseline);
+        body.append(el("h4", "", run.report_evidence?.length ? "任务结束时的报告" : "Observed artifact"), el("code", "sample-path", run.proof_path), el("pre", "finding-proof", JSON.stringify(run.observed,null,2)));
+        if (run.baseline !== undefined) {
+          const baseline = el("details", "sample-input"); baseline.append(el("summary", "", "Baseline facts"), el("pre", "", JSON.stringify(run.baseline,null,2))); body.append(baseline);
+        }
+      }
+      if (run.expected) body.append(el("h4", "", "Expected"), el("p", "", run.expected));
+      if (run.status === "not_reproduced" && run.report_evidence?.length === 0) body.append(el("p", "samples-note", "本次任务中没有观测到将匹配标记写入公开报告的操作。"));
+      if (run.status === "not_reproduced" && run.observed === null) body.append(el("p", "samples-note", "检查时没有可验证的产物。"));
+      if (run.error) body.append(el("p", "finding-error", run.error));
+      if (run.final_artifact_error) body.append(el("p", "samples-note", `任务结束时无法读取有效报告（${run.final_artifact_error}）。`));
+      if (run.injection) {
+        const matchesBaseline = run.injection.matches_baseline;
+        const injection = el("details", "sample-input");
+        injection.append(el("summary", "", "Injection evidence"), el("p", "", run.injection.storage), el("code", "sample-path", run.injection.path));
+        const comparison = matchesBaseline === false ? "执行前读取的工具文件与可信基线不一致。"
+          : matchesBaseline === true ? "执行前读取的工具文件与可信基线一致。" : "此记录缺少执行前的工具完整性比对结果。";
+        injection.append(el("p", "", comparison));
+        if (run.injection.before !== undefined) injection.append(el("h4", "", "可信基线"), el("pre", "", run.injection.before));
+        if (run.injection.after !== undefined) injection.append(el("h4", "", "样本指定的注入内容"), el("pre", "", run.injection.after));
+        body.append(injection);
       }
       const footer = el("footer", "sample-actions");
       footer.append(button("Task trajectory", () => this.onTask(run.task_id)), button("Evidence", () => this.onEvidence(run.event)));
