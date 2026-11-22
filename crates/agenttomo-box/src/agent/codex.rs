@@ -12,6 +12,9 @@ use super::adapter::{
 use futures_util::future::BoxFuture;
 use std::sync::Arc;
 
+const MODEL: &str = "gpt-6-sol";
+const REASONING_EFFORT: &str = "high";
+
 pub struct Codex;
 
 impl AgentAdapter for Codex {
@@ -201,7 +204,20 @@ impl Installation {
                 );
             }
         }
-        credentials::prepare(&self.home, files, std::env::vars().collect())
+        let mut prepared = credentials::prepare(&self.home, files, std::env::vars().collect())?;
+        // Pin session-local defaults, including named profiles, independently of host choices.
+        for (name, contents) in &mut prepared.files {
+            if !name.ends_with(".toml") {
+                continue;
+            }
+            let mut config: toml::Table = toml::from_str(contents)
+                .map_err(|_| io::Error::other("invalid sanitized Codex configuration"))?;
+            config.insert("model".into(), MODEL.into());
+            config.insert("model_reasoning_effort".into(), REASONING_EFFORT.into());
+            *contents = toml::to_string(&config)
+                .map_err(|_| io::Error::other("cannot serialize sandbox Codex configuration"))?;
+        }
+        Ok(prepared)
     }
 }
 
@@ -242,12 +258,15 @@ fn command(thread: Option<&str>) -> io::Result<tokio::process::Command> {
     if let Some(thread) = thread {
         command.arg("resume").arg(thread);
     }
-    command.args([
-        "--skip-git-repo-check",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--json",
-        "-",
-    ]);
+    command
+        .args(["--model", MODEL, "--config"])
+        .arg(format!("model_reasoning_effort=\"{REASONING_EFFORT}\""))
+        .args([
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--json",
+            "-",
+        ]);
     Ok(command)
 }
 
@@ -363,7 +382,8 @@ mod tests {
         let mut snapshot = installation.snapshot().await.unwrap().files;
         assert!(!snapshot["auth.json"].contains("local-fixture"));
         let config: toml::Value = toml::from_str(&snapshot["config.toml"]).unwrap();
-        assert_eq!(config["model"].as_str(), Some("example"));
+        assert_eq!(config["model"].as_str(), Some("gpt-6-sol"));
+        assert_eq!(config["model_reasoning_effort"].as_str(), Some("high"));
         snapshot.insert("auth.json".into(), "private change".into());
         assert_eq!(
             tokio::fs::read(installation.home.join("auth.json"))
@@ -377,6 +397,59 @@ mod tests {
         );
         assert!(!session.exists(), "a snapshot must not stage on the host");
         tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_pins_sandbox_model_across_host_changes_and_named_profiles() {
+        let home = std::env::temp_dir().join(format!("agenttomo-model-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir(&home).await.unwrap();
+        let installation = Installation {
+            distribution: PathBuf::new(),
+            home: home.clone(),
+        };
+        let snapshot = installation.snapshot().await.unwrap().files;
+        let config: toml::Value = toml::from_str(&snapshot["config.toml"]).unwrap();
+        assert_eq!(
+            config.get("model").and_then(toml::Value::as_str),
+            Some("gpt-6-sol")
+        );
+        assert_eq!(config["model_reasoning_effort"].as_str(), Some("high"));
+        assert!(!home.join("config.toml").exists());
+
+        for (model, effort) in [("host-first", "low"), ("host-second", "xhigh")] {
+            let base = format!(
+                "model = '{model}'\nmodel_reasoning_effort = '{effort}'\nsandbox_mode = 'read-only'\n"
+            );
+            let profile = format!(
+                "model = '{model}-profile'\nmodel_reasoning_effort = 'medium'\nsandbox_mode = 'workspace-write'\n"
+            );
+            for (name, source) in [("config.toml", &base), ("alternate.config.toml", &profile)] {
+                tokio::fs::write(home.join(name), source).await.unwrap();
+            }
+            let snapshot = installation.snapshot().await.unwrap().files;
+            for (name, source, sandbox_mode) in [
+                ("config.toml", &base, "read-only"),
+                ("alternate.config.toml", &profile, "workspace-write"),
+            ] {
+                let config: toml::Value = toml::from_str(&snapshot[name]).unwrap();
+                assert_eq!(config["model"].as_str(), Some("gpt-6-sol"), "{name}");
+                assert_eq!(
+                    config["model_reasoning_effort"].as_str(),
+                    Some("high"),
+                    "{name}"
+                );
+                assert_eq!(
+                    config["sandbox_mode"].as_str(),
+                    Some(sandbox_mode),
+                    "{name}"
+                );
+                assert_eq!(
+                    tokio::fs::read_to_string(home.join(name)).await.unwrap(),
+                    *source
+                );
+            }
+        }
+        tokio::fs::remove_dir_all(home).await.unwrap();
     }
 
     #[test]

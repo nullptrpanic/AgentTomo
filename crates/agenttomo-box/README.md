@@ -30,6 +30,8 @@ printf 'hello\n' | cargo run --quiet -p agenttomo-box -- run \
 
 Playground 现在提供 Chat 页签。服务器自动查找外部 Codex，在同一受追踪容器里启动，并为本次会话复制外部配置与认证文件。检测到 Codex 后自动启用 HTTP/HTTPS 检查。Chat 支持连续对话，右侧 Task trajectory 按任务、模型轮次、工具、进程和资源展示。
 
+沙箱内 Codex 的模型固定为 `gpt-6-sol`，推理强度为 `high`。每个新沙箱的 `config.toml` 和命名配置副本都会覆盖这两项，外部切换模型或推理强度不会改变沙箱内的选择，宿主配置原文件保持不变。Terminal 使用这份沙箱配置；Chat 和 Security tests 的新对话、续聊还会通过启动参数显式指定同一组设置。
+
 Terminal 与 Chat 共用本次会话的 Codex 登录副本，终端可以直接执行 `codex` 或 `codex login status`。Chat 显示当前阶段、运行计时和实时错误，原始报错可以展开查看。box 的四层出口默认使用 `http://127.0.0.1:8118`，无需在 Codex、curl 或其他目标程序中设置代理变量；`--proxy URL` 可覆盖，`--no-proxy` 可切换为 box 直连：
 
 ```bash

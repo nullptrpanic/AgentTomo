@@ -4,6 +4,8 @@
 
 The Playground offers Chat alongside Terminal and Browser. Chat launches the externally installed Codex executable inside the existing traced sandbox. Each conversation permits one active foreground task and supports subsequent turns through `codex exec resume`.
 
+Each session pins `model = "gpt-6-sol"` and `model_reasoning_effort = "high"` in its sanitized `config.toml` and named `.config.toml` copies. Host model or effort changes do not change these sandbox settings, and the source files remain untouched. Terminal Codex uses the session configuration. The adapter also explicitly passes these settings for Chat and Security tests, including resumed turns, so continuation does not restore a different model.
+
 Model semantics come from observed Responses HTTP requests, JSON responses, and SSE or WebSocket messages. The collector reads allowlisted correlation environment variables at successful exec. Codex session and rollout files are excluded from file-content previews. The launcher uses the CLI stdout `thread.started` control notification to retain the conversation ID.
 
 Model and tool records are grouped using transport request IDs and Responses IDs, including successive responses on one WebSocket connection. Process attribution retains its separate inferred provenance.
