@@ -17,6 +17,78 @@ function notice(message) {
   $("notice").textContent = message;
 }
 
+async function selectWorkspaceAgent() {
+  const picker = $("workspace-agent");
+  const trigger = picker.querySelector("summary");
+  const choices = picker.querySelector(".agent-options");
+  const template = choices.querySelector("template");
+  const url = new URL("/api/agents", location.href);
+  url.searchParams.set("token", token);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Cannot load workspace agents (HTTP ${response.status}).`);
+  const available = await response.json();
+  const requested = params.get("agent");
+  const current = requested ?? available[0] ?? "";
+  const valid = requested === null || available.includes(requested);
+  const ids = new Set(["codex", "agentkit", ...available]);
+  if (!available.length) ids.add("");
+  let selected;
+  for (const id of ids) {
+    const row = template.content.firstElementChild.cloneNode(true);
+    const input = row.querySelector("input");
+    const name = id === "codex" ? "Codex" : id || "Terminal only";
+    row.querySelector("span").textContent = name;
+    input.value = id;
+    input.disabled = Boolean(id) && !available.includes(id);
+    if (input.disabled && id === "agentkit") row.title = "Pending integration";
+    if (valid && id === current) {
+      input.checked = true;
+      selected = input;
+      trigger.querySelector("span").textContent = name;
+    }
+    choices.append(row);
+  }
+  trigger.setAttribute("aria-label", `Workspace agent, ${trigger.textContent}`);
+  picker.hidden = false;
+  function closeMenu() {
+    picker.open = false;
+    trigger.focus();
+  }
+  picker.addEventListener("toggle", () => {
+    if (picker.open) (selected ?? choices.querySelector("input:enabled")).focus({ preventScroll: true });
+  });
+  picker.addEventListener("keydown", event => {
+    if (event.key === "Escape" && picker.open) {
+      event.preventDefault();
+      closeMenu();
+    } else if (event.target === trigger && ["ArrowDown", "ArrowUp"].includes(event.key)) {
+      event.preventDefault();
+      picker.open = true;
+    } else if (event.key === "Enter" && event.target instanceof HTMLInputElement) {
+      event.preventDefault();
+      event.target.click();
+    }
+  });
+  document.addEventListener("pointerdown", event => { if (!picker.contains(event.target)) picker.open = false; });
+  picker.addEventListener("focusout", event => { if (!picker.contains(event.relatedTarget)) picker.open = false; });
+  choices.addEventListener("click", event => { if (event.target === selected) closeMenu(); });
+  choices.addEventListener("change", ({ target }) => {
+    target.checked = false;
+    if (selected) selected.checked = true;
+    closeMenu();
+    if (!finalStatus && $("status").dataset.state !== "error" &&
+        !window.confirm("Switch agents? This closes the current sandbox and deletes its temporary files.")) return;
+    const next = new URL(location.href);
+    if (target.value) next.searchParams.set("agent", target.value);
+    else next.searchParams.delete("agent");
+    location.assign(next);
+  });
+  if (!valid) {
+    throw new Error("The requested agent is unavailable. Choose an available option to open a workspace.");
+  }
+  return current;
+}
+
 const toggle = $("toggle-monitor");
 const open = $("open-monitor");
 toggle.innerHTML = panelCloseIcon;
@@ -94,7 +166,8 @@ try {
     followMonitor({ id, token, onMessage });
   } else {
     const { startWorkspace } = await import("./workspace.mjs");
-    observation.control(startWorkspace({ token, onMessage, notice, onView:name => { if (name === "chat") observation.view("agent"); } }));
+    const agent = await selectWorkspaceAgent();
+    observation.control(startWorkspace({ token, agent, onMessage, notice, onView:name => { if (name === "chat") observation.view("agent"); } }));
   }
 } catch (error) {
   onMessage({ type: "error", message: error.message });

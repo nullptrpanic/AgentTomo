@@ -2,7 +2,7 @@ import { BrowserView } from "./browser-view.mjs";
 import { resizePanels } from "./panel-resize.mjs";
 
 // Only this entry point may create and own a Docker session.
-export function startWorkspace({ token, onMessage, notice, onView }) {
+export function startWorkspace({ token, agent, onMessage, notice, onView }) {
   const $ = (id) => document.getElementById(id);
   resizePanels(document.querySelector("main"), $("panel-resizer"));
   const terminal = new Terminal({
@@ -25,6 +25,7 @@ export function startWorkspace({ token, onMessage, notice, onView }) {
   const url = new URL("/ws", location.href);
   url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
   url.searchParams.set("token", token);
+  if (agent) url.searchParams.set("agent", agent);
   const socket = new WebSocket(url);
   socket.binaryType = "arraybuffer";
   let acceptingInput = false;

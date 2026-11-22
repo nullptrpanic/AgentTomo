@@ -227,7 +227,7 @@ pub async fn serve(id: &str) -> io::Result<()> {
             file_preview: Default::default(),
             http: Default::default(),
             rootfs: Default::default(),
-            agent: None,
+            agents: Vec::new(),
             proxy: None,
             credential_gateway: None,
         }),

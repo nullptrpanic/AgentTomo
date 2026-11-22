@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{Query, State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Response},
@@ -43,7 +43,7 @@ struct Settings {
     file_preview: crate::recording::file_preview::Limits,
     http: crate::proxy::http::Options,
     rootfs: crate::execution::rootfs::Options,
-    agent: Option<Arc<dyn crate::agent::Installation>>,
+    agents: Vec<Arc<dyn crate::agent::Installation>>,
     proxy: Option<crate::proxy::outbound::Proxy>,
     credential_gateway: Option<Arc<crate::proxy::credentials::gateway::Gateway>>,
 }
@@ -65,6 +65,13 @@ struct Access {
     token: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct WorkspaceAccess {
+    #[serde(flatten)]
+    access: Access,
+    agent: Option<String>,
+}
+
 impl Access {
     fn authorized(&self, app: &App) -> bool {
         self.token.as_deref() == Some(app.settings.token.as_str())
@@ -76,10 +83,9 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
     let browser = docker::supports_browser(&image_id).await?;
     let shutdown = CancellationToken::new();
     let proxy_peers = agent_egress::Peers::default();
-    let agent = crate::agent::discover();
-    let credential_gateway = agent
-        .as_ref()
-        .map(|_| crate::proxy::credentials::gateway::Gateway::new().map(Arc::new))
+    let agents = crate::agent::discover();
+    let credential_gateway = (!agents.is_empty())
+        .then(|| crate::proxy::credentials::gateway::Gateway::new().map(Arc::new))
         .transpose()?;
     let proxy = agent_egress::configure(
         options.proxy,
@@ -90,7 +96,7 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
     )
     .await?;
     let mut http = options.http.options();
-    if agent.is_some() {
+    if !agents.is_empty() {
         http.enabled = true;
     }
     let app = App {
@@ -105,7 +111,7 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
             file_preview: options.file_preview.limits(),
             http,
             rootfs: options.rootfs.options(),
-            agent,
+            agents,
             proxy,
             credential_gateway,
         }),
@@ -145,6 +151,7 @@ fn router(app: App) -> Router {
             bridge::forward,
         ))
         .route("/", get(index))
+        .route("/api/agents", get(available_agents))
         .route("/ws", get(websocket))
         .route("/api/sessions/{session}/desktop", get(desktop::websocket))
         .route("/assets/{*path}", get(assets::get))
@@ -189,13 +196,26 @@ async fn index(State(app): State<App>, Query(access): Query<Access>) -> Response
     ], Html(include_str!("assets/index.html"))).into_response()
 }
 
+async fn available_agents(State(app): State<App>, Query(access): Query<Access>) -> Response {
+    if !access.authorized(&app) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let ids: Vec<_> = app
+        .settings
+        .agents
+        .iter()
+        .map(|agent| agent.adapter().metadata().id)
+        .collect();
+    ([(header::CACHE_CONTROL, "no-store")], Json(ids)).into_response()
+}
+
 async fn websocket(
     State(app): State<App>,
-    Query(access): Query<Access>,
+    Query(request): Query<WorkspaceAccess>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    if !access.authorized(&app) {
+    if !request.access.authorized(&app) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     // Browser clients must originate from this HTTP server. Non-browser clients
@@ -206,6 +226,19 @@ async fn websocket(
     if app.shutdown.is_cancelled() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    let agents = &app.settings.agents;
+    let installation = if let Some(id) = request.agent {
+        let Some(agent) = agents
+            .iter()
+            .find(|agent| agent.adapter().metadata().id == id)
+        else {
+            return (StatusCode::BAD_REQUEST, "Requested agent is unavailable.").into_response();
+        };
+        Some(agent)
+    } else {
+        agents.first()
+    }
+    .cloned();
     // Reserve before upgrade so server shutdown waits for sessions that are
     // still completing their WebSocket handshake as well as active containers.
     let tracked = app.sessions.token();
@@ -214,7 +247,7 @@ async fn websocket(
         .max_frame_size(64 * 1024)
         .on_upgrade(move |socket| async move {
             let _tracked = tracked;
-            session::serve(socket, app).await;
+            session::serve(socket, app, installation).await;
         })
 }
 
@@ -282,7 +315,7 @@ mod tests {
                 file_preview: Default::default(),
                 http: Default::default(),
                 rootfs: Default::default(),
-                agent: None,
+                agents: Vec::new(),
                 proxy: None,
                 credential_gateway: None,
             }),
@@ -390,7 +423,7 @@ mod tests {
                 file_preview: Default::default(),
                 http: Default::default(),
                 rootfs: Default::default(),
-                agent: None,
+                agents: Vec::new(),
                 proxy: None,
                 credential_gateway: None,
             }),
@@ -561,7 +594,7 @@ mod tests {
                 file_preview: Default::default(),
                 http: Default::default(),
                 rootfs: Default::default(),
-                agent: None,
+                agents: Vec::new(),
                 proxy: None,
                 credential_gateway: None,
             }),
@@ -577,6 +610,9 @@ mod tests {
             ("/", StatusCode::UNAUTHORIZED),
             ("/?token=wrong", StatusCode::UNAUTHORIZED),
             ("/?token=test-token", StatusCode::OK),
+            ("/api/agents", StatusCode::UNAUTHORIZED),
+            ("/api/agents?token=wrong", StatusCode::UNAUTHORIZED),
+            ("/api/agents?token=test-token", StatusCode::OK),
             ("/assets/vendor/xterm.js", StatusCode::OK),
             ("/assets/vendor/novnc.mjs", StatusCode::OK),
             ("/assets/browser-view.mjs", StatusCode::OK),
@@ -601,6 +637,16 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), expected, "{path}");
+            if path == "/api/agents?token=test-token" {
+                let body = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+                assert!(
+                    serde_json::from_slice::<Vec<String>>(&body)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
         }
     }
 }

@@ -22,6 +22,12 @@
     <div class="brand"><span class="brand-mark" aria-hidden="true">a<span>t</span></span><strong>AgentTomo</strong><span class="divider">/</span><span id="page-name">Playground</span></div>
     <div class="topbar-actions">
       <span id="status" class="status" data-state="starting" role="status">Starting</span>
+      <details id="workspace-agent" class="agent-picker" hidden>
+        <summary title="Workspace agent"><span>Select agent</span></summary>
+        <div class="agent-options" role="radiogroup" aria-label="Workspace agent">
+          <template><label><input type="radio" name="workspace-agent"><span></span></label></template>
+        </div>
+      </details>
       <button id="toggle-monitor" class="monitor-control" type="button" aria-label="Hide monitor" title="Hide monitor" aria-expanded="true" aria-controls="monitor-panel"></button>
       <a id="open-monitor" class="monitor-control" aria-label="Open monitor in new tab" title="Open monitor in new tab" aria-disabled="true" tabindex="-1" target="_blank" rel="noopener noreferrer"></a>
     </div>

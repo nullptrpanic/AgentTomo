@@ -128,8 +128,11 @@ impl<'de> Deserialize<'de> for Adapter {
     }
 }
 
-pub fn discover() -> Option<Arc<dyn Installation>> {
-    ADAPTERS.iter().find_map(|adapter| adapter.discover())
+pub fn discover() -> Vec<Arc<dyn Installation>> {
+    ADAPTERS
+        .iter()
+        .filter_map(|adapter| adapter.discover())
+        .collect()
 }
 
 pub fn observation_rules(selected: Option<Adapter>) -> ObservationRules {

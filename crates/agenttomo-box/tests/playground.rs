@@ -531,6 +531,12 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
     assert!(
         matches!(unauthorized, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 401)
     );
+    let unavailable = connect_async(format!("{ws_url}&agent=unregistered"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(unavailable, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 400)
+    );
     let mut foreign = ws_url.into_client_request().unwrap();
     foreign
         .headers_mut()

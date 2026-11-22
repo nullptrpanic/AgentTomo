@@ -76,7 +76,8 @@ try {
     observed.set(page, []);
     page.on("pageerror", error => pageErrors.push(String(error)));
     page.on("websocket", socket => {
-      sockets.push({ page, path: new URL(socket.url()).pathname });
+      const socketUrl = new URL(socket.url());
+      sockets.push({ page, path: socketUrl.pathname, agent: socketUrl.searchParams.get("agent") });
       socket.on("framereceived", ({ payload }) => {
         if (typeof payload !== "string" || !payload.startsWith("{")) return;
         const frame = JSON.parse(payload);
@@ -94,6 +95,27 @@ try {
   await until(async () => await owner.locator("#status").textContent() === "Connected", "workspace ready");
   assert.equal(await owner.locator('[data-observation="findings"]').count(), 1, "the live monitor exposes Findings");
   const session = sessions[0];
+  const picker = owner.locator("#workspace-agent");
+  const trigger = picker.locator("summary");
+  assert.equal(await trigger.count(), 1, "the agent picker has an in-page disclosure");
+  await trigger.click();
+  const choices = picker.getByRole("radiogroup", { name: "Workspace agent" });
+  assert.deepEqual((await choices.locator("label span").allTextContents()).slice(0, 2), ["Codex", "agentkit"]);
+  assert.equal(await choices.getByRole("radio", { name: "agentkit" }).isDisabled(), true);
+  assert.equal(await choices.locator(":checked").inputValue(), session.agent?.id ?? "");
+  const surface = element => getComputedStyle(element).backgroundColor;
+  assert.equal(await choices.evaluate(surface), await owner.locator(".filter-menu").evaluate(surface));
+  await owner.keyboard.press("Escape");
+  assert.equal(await choices.isVisible(), false);
+  assert.equal(await trigger.evaluate(element => element === document.activeElement), true);
+  await trigger.press("Enter");
+  await choices.locator(":checked").click();
+  assert.equal(await choices.isVisible(), false);
+  await trigger.click();
+  await owner.locator(".brand").click();
+  assert.equal(await choices.isVisible(), false);
+  assert.equal(sessions.length, 1, "inspecting the picker preserves the active workspace");
+  assert.equal(sockets.find(socket => socket.page === owner && socket.path === "/ws").agent, session.agent?.id ?? null);
   const initialWidth = (await owner.locator("#workspace-panel").boundingBox()).width;
   monitor = await openMonitor(owner);
   second = await openMonitor(monitor);
@@ -101,6 +123,7 @@ try {
   assert.equal(new URL(second.url()).searchParams.get("monitor"), session.id);
   assert.equal(await monitor.evaluate(() => window.opener), null, "new tabs must be independent");
   assert.equal(await monitor.locator("#workspace-panel").isVisible(), false);
+  assert.equal(await monitor.locator("#workspace-agent").isVisible(), false);
   assert.equal(await monitor.locator("#toggle-monitor").isVisible(), false);
   assert.equal((await owner.locator("#workspace-panel").boundingBox()).width, initialWidth);
   assert.equal(sessions.length, 1, "opening monitors must not create sessions");
