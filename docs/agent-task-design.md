@@ -2,11 +2,11 @@
 
 ## First implementation
 
-The Playground offers Chat alongside Terminal and Browser. Chat launches the externally installed Codex executable inside the existing traced sandbox. Each conversation permits one active foreground task and supports subsequent turns through `codex exec resume`.
+The Playground offers Chat alongside Terminal and Browser. Chat launches the selected external executable inside the traced sandbox and permits one foreground task at a time. Codex continues conversations through `codex exec resume`. AgentKit keeps one Go process with an in-memory conversation per sandbox.
 
-Each session pins `model = "gpt-6-sol"` and `model_reasoning_effort = "high"` in its sanitized `config.toml` and named `.config.toml` copies. Host model or effort changes do not change these sandbox settings, and the source files remain untouched. Terminal Codex uses the session configuration. The adapter also explicitly passes these settings for Chat and Security tests, including resumed turns, so continuation does not restore a different model.
+Each Codex session pins `model = "gpt-6-sol"` and `model_reasoning_effort = "high"` in its sanitized `config.toml` and named `.config.toml` copies. Terminal Codex uses the session configuration. The adapter also explicitly passes these settings for Chat and Security tests, including resumed turns.
 
-Model semantics come from observed Responses HTTP requests, JSON responses, and SSE or WebSocket messages. The collector reads allowlisted correlation environment variables at successful exec. Codex session and rollout files are excluded from file-content previews. The launcher uses the CLI stdout `thread.started` control notification to retain the conversation ID.
+Codex model semantics come from observed Responses HTTP requests, JSON responses, and SSE or WebSocket messages. The collector reads allowlisted correlation environment variables at successful exec. Codex session and rollout files are excluded from file-content previews. The launcher uses the CLI stdout `thread.started` control notification to retain the conversation ID.
 
 Model and tool records are grouped using transport request IDs and Responses IDs, including successive responses on one WebSocket connection. Process attribution retains its separate inferred provenance.
 
@@ -17,13 +17,16 @@ flowchart LR
     Collector --> Workspace[Traced workspace parent]
     Workspace --> Shell[Terminal / Chrome session]
     Workspace --> Codex[External Codex]
+    Workspace --> AgentKit[External AgentKit]
+    AgentKit --> Proxy
+    AgentKit --> Tools
     Codex --> Tools[Tool subprocesses]
     Codex --> Proxy[Built-in HTTP / TLS proxy]
     Tools --> Proxy
     Proxy --> Egress[Host egress and credential injection]
     Egress --> Model[Model endpoint]
     Egress --> Resources[Other HTTP resources]
-    Proxy --> Semantic[Responses parser]
+    Proxy --> Semantic[Responses or Chat Completions parser]
     Semantic --> Payloads[Complete semantic payload store]
     Semantic --> Journal[Shared event journal]
     Tools --> Tracer[Process and file collectors]
@@ -65,19 +68,19 @@ CLI stdout supplies thread lifecycle and immediate runtime diagnostics, includin
 
 Shared launch, tracing, recording, forwarding and UI code consume built-in trait implementations. `agent/adapter.rs` registers `AgentAdapter` implementations by ID. Each adapter supplies display metadata, configuration rules, launch arguments and stdin encoding, runtime rules and lifecycle output parsing. Its host-side `Installation` owns discovery results, the list of read-only runtime mounts and sanitized configuration preparation. Codex flags, filenames, environment setup and control-record parsing remain in `agent/codex.rs`. The registry serializes only the registered ID (`"codex"` remains unchanged); unknown IDs fail instead of silently selecting another adapter.
 
-`agent/workspace.rs` owns process creation, AgentTomo correlation environment variables, cancellation, pipe draining and conversation continuation. The current launch contract is one CLI invocation per turn with bounded prompt input followed by stdin EOF; persistent RPC agents need a separate design. The adapter supplies the invocation and interprets only lifecycle output. Model and tool evidence still comes from traffic.
+`agent/workspace.rs` owns process creation, correlation and cancellation. Codex receives one prompt and stdin EOF per invocation. AgentKit runs the official Go HTTP application on sandbox loopback. The workspace creates an SDK session and posts each prompt to `/run_sse` with streaming enabled. A final visible model event followed by a clean end to the AgentKit stream completes the turn. Chat displays the text captured from the outbound model stream. Stop terminates the server and the next prompt starts a new session.
 
 At the executable boundary, the selected adapter supplies runtime executable names to the correlation hub. The collector receives these rules without selecting or depending on Codex. With no adapter selected, ordinary `run` has no implicit Codex runtime classification. Registered adapters' private preview paths remain excluded even in that mode, preserving sensitive-file protection while retaining file-open events. `run` does not discover a host login, snapshot configuration or activate the host credential gateway. Playground assembles those optional integration pieces.
 
 `proxy/credentials` owns the existing host-only gateway, placeholder matching, exact origin/method/path enforcement, session revocation and static or reloadable header sources. `agent/codex/credentials` supplies the allowed operations and interprets Codex login/config formats. Host login reload still checks account consistency and token expiry. Credential sources and policies are never serialized; bootstrap sends only sanitized files. The gateway continues to reuse the common HTTP transport, TLS authority and outbound CONNECT implementation.
 
-`agent/protocol.rs` registers `ModelProtocol` implementations and selects one from HTTP request metadata. Each creates its own mutable `ModelDecoder`, which receives decompressed HTTP bodies, the response status, and framed SSE/WebSocket payloads, then emits normalized events. JSON parsing and the `[DONE]` sentinel belong to the Responses implementation in `agent/responses.rs`; this parser is shared by any agent speaking that protocol. `agent/wire.rs` retains compression, size limits, completion checks and correlation, while the existing proxy retains framing and forwarding. Decoder state is never shared between streams. Agent adapters and model protocol adapters are independent: adding an agent that speaks Responses does not require another Responses parser.
+`agent/protocol.rs` selects a model protocol using the HTTP method and path. Each request has its own decoder. Responses supports its existing HTTP and WebSocket formats. Streamed Chat Completions captures visible text and function calls, assembles argument fragments by choice and tool index, and closes the model round on `[DONE]`. A round that ends with `finish_reason: "tool_calls"` can complete with no text. The proxy snapshots the foreground turn when each request starts, including requests on a reused connection. Late response fragments keep their original task ID. `agent/wire.rs` applies the shared capture limits and writes normalized events for both protocols.
 
 Adding a built-in adapter requires implementing these contracts and registering it, rather than adding Agent-specific branches to the collector, workspace or UI. This is compile-time integration, without dynamic library loading or a separate plugin framework. Tests exercise the common launcher with a non-Codex input format and exercise separate decoders with non-JSON payloads.
 
 Session metadata now includes `agent.id`, `agent.name`, `agent.avatar` and `agent.authentication_hint`, alongside the existing `agent_available` flag. Owner and monitor pages use the same metadata. UI code retains existing cards, evidence links and disclosure state, with a generic Agent fallback when metadata is absent.
 
-The production registry still contains one agent adapter (Codex) and one model protocol (Responses). This refactor does not add another agent or claim exact attribution of concurrent/background tools. The existing inferred timing association, event formats, sandbox paths and credential-isolation guarantees remain in place.
+AgentKit's host adapter mounts only its Go executable. Its session configuration carries the model name, base URL and a random credential placeholder. The host gateway injects the selected Ark credential after sandbox capture, scoped to the configured origin and chat endpoint. The Go example registers a local command function through ADK, with tool calls and returns captured by the Chat Completions decoder. Available agents share the sample preparation and artifact verification path. Each AgentKit sample starts a separate process and SDK session, while ordinary Chat retains its server and conversation. The report sample applies the same syscall filter used by the command-line launcher. See the [AgentKit configuration](../crates/agenttomo-box/README.md#配置火山引擎-agentkit).
 
 ## Events and retained contents
 
@@ -90,14 +93,14 @@ For compatibility, the frontend converts old events without `message_kind` once 
 | Logical record | Raw updates | Evidence |
 | --- | --- | --- |
 | Task | `agent.task.started`, `agent.task.diagnostic`, `agent.task.finished`, `agent.task.rejected` | Submitted prompt, live runtime diagnostics and execution outcome |
-| Model call | `agent.model.request`, `agent.model.started`, `agent.model.complete` | Full decoded request and final response object, response ID, usage and status |
+| Model call | `agent.model.request`, `agent.model.started`, `agent.model.complete` | Decoded request, response ID, usage and status. Responses retains the final object. Chat Completions stores the visible choices assembled from the stream and identifies the source in the saved payload. |
 | Tool call | `agent.tool.started`, `agent.tool.call`, `agent.tool.result` | Complete model-visible parameters and returned content |
 | Assistant message | `agent.message.delta`, `agent.message` | Streaming text, refusals and complete final message |
 | Capture issue | `agent.capture.error` | Unsupported, malformed, incomplete or oversized protocol data |
 
 `agent-payloads.bin` stores complete JSON-encoded semantic values. Journal records reference byte ranges. The authenticated `agent-payload` endpoint applies the same session-directory and no-symlink checks as existing payload endpoints. The network preview prefix and stream sliding window do not determine semantic retention. Explicit JSON responses retain their HTTP body and model outcome, including error responses. A successful Responses exchange without a content type retains the existing SSE fallback. Forwarding preserves the original bodies.
 
-Responses custom tools include Code Mode source text. Function tools retain their complete argument string. Outputs found in later model requests are joined using the model call ID, with duplicates from repeated conversation history removed. Native or provider-side tool records are retained when present in Responses output. Returned fields are shown when the protocol exposes them.
+Responses custom tools include Code Mode source text. Function tools retain the argument string as sent by the model. A truncated Chat Completions choice keeps its partial arguments in the model detail and has an incomplete status. In later Chat Completions requests, tool messages following the latest user message supply the model-visible return value. Both protocols join returned content to the call by ID and deduplicate repeated results across requests. Native or provider-side tool records are retained when present in Responses output. Returned fields are shown when the protocol exposes them.
 
 Code Mode can call multiple inner tools and choose which values to return to the model. The outer call's observed input and output are available. Inner outputs omitted from the model protocol remain unavailable. A missing return is explicitly shown in the tool inspector.
 
@@ -160,12 +163,17 @@ Payload limits produce an explicit unavailable status. Complete resource events 
 
 The deterministic browser integration uses the real external Codex with a local Responses server. It exercises multiple tool rounds, a resumed turn, request decoding, parameter and output details, process/file/HTTP association, independent monitors and container cleanup. It makes no remote model requests.
 
+The AgentKit browser test runs the independent Go executable with a local HTTPS model fixture. It checks that text appears while the response is still open, two turns share history and have separate traces, Stop clears history, and a rejected credential reaches Chat. It scans sandbox state for the fixture credential. The test uses OpenSSL to issue its temporary certificates.
+
 ```bash
 cargo test -p agenttomo-box --bin agenttomo-box
 cargo test -p agenttomo-box --test http_capture
 node --test crates/agenttomo-box/tests/agent-model.test.mjs
 AGENTTOMO_PLAYWRIGHT_MODULE=/path/to/playwright-core/index.mjs \
   node crates/agenttomo-box/tests/agent-chat.browser.mjs
+AGENTTOMO_PLAYWRIGHT_MODULE=/path/to/playwright-core/index.mjs \
+  AGENTTOMO_AGENTKIT_BIN="$PWD/example/agent/agentkit/dist/agenttomo-agentkit" \
+  node crates/agenttomo-box/tests/agentkit-chat.browser.mjs
 ```
 
 The browser integration expects the tools image, Docker access and a Chromium CDP endpoint at `http://127.0.0.1:19222`, configurable through `AGENTTOMO_CDP`.

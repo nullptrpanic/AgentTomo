@@ -70,7 +70,7 @@ export class AgentModel {
     const task = this.task(d.task_id);
     task.activity = Math.max(task.activity, event.sequence || 0);
     if (event.kind === "agent.task.started") { task.prompt = d.prompt; task.started = event; task.state = "running"; this.runningTasks.add(task); progress(task, "Connecting to model"); }
-    if (event.kind === "agent.task.finished") { task.state = d.cancelled ? "cancelled" : d.exit_code === 0 ? "completed" : "failed"; task.finished = event; }
+    if (event.kind === "agent.task.finished") { task.state = d.cancelled || d.status === "cancelled" ? "cancelled" : d.status === "completed" || d.exit_code === 0 ? "completed" : "failed"; task.finished = event; }
     if (event.kind === "agent.task.rejected") { task.state = d.cancelled ? "cancelled" : "rejected"; task.finished = event; }
     if (task.state !== "running") this.runningTasks.delete(task);
     if (d.error && !d.cancelled && ["agent.task.diagnostic", "agent.task.finished", "agent.task.rejected", "agent.capture.error"].includes(event.kind) && task.errors.at(-1)?.data.error !== d.error) {

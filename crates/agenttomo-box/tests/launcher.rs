@@ -59,6 +59,30 @@ fn public_help_describes_run_and_playground() {
     assert!(!help.contains("--browser"));
 }
 
+#[test]
+fn playground_config_flag_reads_config_json_from_the_working_directory() {
+    let dir = TestDir::new();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_agenttomo-box"))
+            .args(["playground", "-c"])
+            .current_dir(&dir.0)
+            .output()
+            .unwrap()
+    };
+    let missing = run();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("config.json"));
+
+    fs::write(
+        dir.0.join("config.json"),
+        r#"{"listen":"broken","agents":[]}"#,
+    )
+    .unwrap();
+    let invalid = run();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("listen"));
+}
+
 impl TestDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);

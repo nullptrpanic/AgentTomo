@@ -10,14 +10,15 @@ static EXAMPLE: Example = Example;
 impl AgentAdapter for Example {
     fn metadata(&self) -> Metadata {
         Metadata {
+            supports_security_tests: false,
             id: "example",
             name: "Example Agent",
             avatar: "E",
             authentication_hint: "Example login",
         }
     }
-    fn discover(&self) -> Option<Arc<dyn Installation>> {
-        None
+    fn discover(&self, _config: Option<&AgentConfig>) -> io::Result<Arc<dyn Installation>> {
+        Err(io::Error::other("example is not installed"))
     }
     fn observation_rules(&self) -> ObservationRules {
         ObservationRules {

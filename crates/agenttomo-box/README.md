@@ -28,9 +28,63 @@ printf 'hello\n' | cargo run --quiet -p agenttomo-box -- run \
 
 ## playground：Docker 终端与实时 trace
 
-Playground 现在提供 Chat 页签。服务器自动查找外部 Codex，在同一受追踪容器里启动，并为本次会话复制外部配置与认证文件。检测到 Codex 后自动启用 HTTP/HTTPS 检查。Chat 支持连续对话，右侧 Task trajectory 按任务、模型轮次、工具、进程和资源展示。
+在工作区右上角选择 `Codex` 或 `agentkit`，然后打开 Chat。Playground 启用已在宿主配置好的 Agent，把选中的程序只读挂载到受追踪的容器，并自动启用 HTTP/HTTPS 检查。右侧 Task trajectory 按轮展示模型调用和对应的进程活动。
 
 沙箱内 Codex 的模型固定为 `gpt-6-sol`，推理强度为 `high`。每个新沙箱的 `config.toml` 和命名配置副本都会覆盖这两项，外部切换模型或推理强度不会改变沙箱内的选择，宿主配置原文件保持不变。Terminal 使用这份沙箱配置；Chat 和 Security tests 的新对话、续聊还会通过启动参数显式指定同一组设置。
+
+### 从配置文件启动
+
+在仓库根目录创建仅宿主用户可读写的 `config.json`（权限 `0600`）。Git 已忽略这个文件。
+
+```json
+{
+  "listen": "0.0.0.0:18889",
+  "image": "",
+  "capture_http": true,
+  "agents": [
+    { "name": "codex" },
+    {
+      "name": "agentkit",
+      "path": "example/agent/agentkit/dist/agenttomo-agentkit",
+      "apikey": "<方舟 API Key>",
+      "endpoint": "<模型接入点 ID>"
+    }
+  ]
+}
+```
+
+从仓库根目录启动。脚本会通过 Cargo 构建并启动 Playground。
+
+```bash
+./playground -c
+```
+
+已将脚本放在 PATH 时可直接运行 `playground -c`。使用现有二进制时运行 `target/debug/agenttomo-box playground -c`。单独的 `-c` 读取当前目录的 `config.json`，`-c FILE` 可指定其他文件。Agent 的相对路径从配置文件所在目录解析。
+
+按 `agents` 的顺序显示下拉选项。Codex 的 `path` 省略或留空时自动查找本机安装。AgentKit 的 `endpoint` 填模型接入点 ID，文件模式使用北京方舟地址 `https://ark.cn-beijing.volces.com/api/v3`。`apikey` 由宿主读取，沙箱内只收到会话占位凭据。
+
+`listen` 和 `image` 留空时分别使用 `127.0.0.1:8080` 和 `agenttomo-playground-chrome:24.04`。显式的 `--listen`、`--image` 或 `--capture-http` 优先。Chat 需要 HTTP 采集，配置了 Agent 时省略 `capture_http` 会自动开启。纯终端可设置 `"agents": []` 和 `"capture_http": false`。省略 `agents` 时沿用宿主环境自动发现。
+
+### 配置火山引擎 AgentKit
+
+Go 示例位于本仓库的 `example/agent/agentkit`。项目用火山官方 `agentkit init --template basic_go` 生成，使用 VeADK Go 的 AgentKit Server App 提供流式对话。构建示例后可采用上面的配置文件。使用环境变量启动时，为 Playground 宿主进程设置下表中的变量。[Go 示例与构建命令](../../example/agent/agentkit/README.md#构建与测试) · [火山官方模板](https://github.com/volcengine/agentkit-sdk-python/blob/v0.9.2/agentkit/toolkit/resources/samples/veadk_go_basic/main.go)
+
+从旧版 stdin/JSONL 接入升级时，请一起更新 Playground 和 `AGENTTOMO_AGENTKIT_BIN` 指向的 Go 程序，两端使用同一套 HTTP 接口。
+
+| 变量 | 填写内容 |
+| --- | --- |
+| `AGENTTOMO_AGENTKIT_BIN` | 从仓库根目录运行 `export AGENTTOMO_AGENTKIT_BIN="$PWD/example/agent/agentkit/dist/agenttomo-agentkit"`。已将 `agenttomo-agentkit` 放在服务 PATH 时可省略。 |
+| `MODEL_AGENT_NAME` | 可调用的方舟推理接入点 ID 或预置模型名。 |
+| `MODEL_AGENT_API_BASE` | 方舟基础地址，例如 `https://ark.cn-beijing.volces.com/api/v3`。SDK 会追加 `/chat/completions`。 |
+
+凭据可选以下一种。
+
+- **AK/SK**。在宿主设置 `VOLCENGINE_ACCESS_KEY`、`VOLCENGINE_SECRET_KEY`、`VOLCENGINE_REGION`，并提供支持 `--body` 的官方 `ve` 命令。可用 `AGENTTOMO_VOLCENGINE_CLI` 指定其路径。使用预置模型时还需设置 `VOLCENGINE_PROJECT_NAME`。宿主按选定资源兑换临时 API Key，接近到期时续期。[方舟 GetApiKey](https://docs.volcengine.com/docs/ark/get-api-key-api?lang=zh) · [官方 CLI](https://github.com/volcengine/volcengine-cli/blob/master/docs/4-Usage.md)
+- **已有方舟 API Key**。设置 `MODEL_AGENT_API_KEY` 后，宿主优先使用该值，可以省去 `ve` 和兑换步骤。
+
+每个沙箱在首次普通对话时启动一个监听内部回环地址的 Go 服务。Playground 创建 SDK 会话，通过 `POST /run_sse` 发送每一轮提示。模型客户端使用本会话的占位凭据，宿主网关在流量采集之后为配置地址下的 `POST chat/completions` 替换认证头。Chat 和 Trace 从这次出站模型调用逐段显示文字及工具调用。AgentKit 通过官方函数工具接口执行沙箱命令，单次命令最长运行 60 秒。Security tests 与 Codex 共用三个样例及产物判定，每次 Run 使用独立进程和会话。停止样例后恢复普通 Chat；停止普通 Chat 后，下一条消息创建新会话。
+
+### Codex 与出站代理
 
 Terminal 与 Chat 共用本次会话的 Codex 登录副本，终端可以直接执行 `codex` 或 `codex login status`。Chat 显示当前阶段、运行计时和实时错误，原始报错可以展开查看。box 的四层出口默认使用 `http://127.0.0.1:8118`，无需在 Codex、curl 或其他目标程序中设置代理变量；`--proxy URL` 可覆盖，`--no-proxy` 可切换为 box 直连：
 

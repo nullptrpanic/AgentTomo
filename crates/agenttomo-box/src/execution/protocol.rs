@@ -66,16 +66,21 @@ pub async fn receive<T: serde::de::DeserializeOwned>(
 pub struct Reader<R> {
     input: R,
     pending: Vec<u8>,
+    limit: usize,
 }
 impl<R: AsyncBufRead + Unpin> Reader<R> {
     pub fn new(input: R) -> Self {
+        Self::with_limit(input, 64 * 1024)
+    }
+    pub fn with_limit(input: R, limit: usize) -> Self {
         Self {
             input,
             pending: Vec::new(),
+            limit,
         }
     }
     pub async fn receive<T: serde::de::DeserializeOwned>(&mut self) -> io::Result<T> {
-        let remaining = (64 * 1024usize).saturating_sub(self.pending.len());
+        let remaining = self.limit.saturating_sub(self.pending.len());
         let count = (&mut self.input)
             .take(remaining as u64)
             .read_until(b'\n', &mut self.pending)

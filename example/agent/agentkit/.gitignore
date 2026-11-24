@@ -1,0 +1,4 @@
+!/.dockerignore
+/dist/
+/.agentkit/
+/.agentkit-state/

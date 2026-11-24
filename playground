@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+repo=$(dirname "$(realpath "$0")")
+exec cargo run --quiet --manifest-path "$repo/Cargo.toml" -p agenttomo-box -- playground "$@"

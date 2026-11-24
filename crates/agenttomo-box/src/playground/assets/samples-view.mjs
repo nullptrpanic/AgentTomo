@@ -40,13 +40,13 @@ export class SamplesView {
       this.root.replaceChildren(el("p", "samples-note", `Cannot load samples: ${error.message}`), button("Retry", () => this.load()));
     }
   }
-  setAvailable(available, busy = false) { this.available = available; this.busy = busy; this.updateControls(); }
+  setAvailable(available, busy = false, reason = "") { this.available = available; this.busy = busy; this.unavailableReason = reason; this.updateControls(); }
   updateControls() {
     const running = [...this.model.runs.values()].some(run => run.status === "running");
     const busy = this.busy || running || Boolean(this.pending);
     for (const node of this.root.querySelectorAll(".sample-run")) {
       node.disabled = !this.available || busy;
-      node.title = !this.available ? "Connect a workspace with an available Agent" : busy ? "Wait for the current task to finish" : "Run with the current real Agent";
+      node.title = !this.available ? this.unavailableReason || "Connect a workspace with an available Agent" : busy ? "Wait for the current task to finish" : "Run with the current real Agent";
     }
     if (this.stop) {
       this.stop.hidden = !["waiting","running"].includes(this.currentRun()?.status);

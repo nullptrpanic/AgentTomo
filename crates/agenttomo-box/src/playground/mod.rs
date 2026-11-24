@@ -3,6 +3,7 @@
 mod agent_egress;
 mod assets;
 pub(crate) mod bridge;
+mod config;
 mod desktop;
 mod docker;
 mod monitor;
@@ -79,12 +80,12 @@ impl Access {
 }
 
 pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
-    let image_id = docker::check(&options.image).await?;
+    let config = config::Config::load(&options)?;
+    let image_id = docker::check(&config.image).await?;
     let browser = docker::supports_browser(&image_id).await?;
     let shutdown = CancellationToken::new();
     let proxy_peers = agent_egress::Peers::default();
-    let agents = crate::agent::discover();
-    let credential_gateway = (!agents.is_empty())
+    let credential_gateway = (!config.agents.is_empty())
         .then(|| crate::proxy::credentials::gateway::Gateway::new().map(Arc::new))
         .transpose()?;
     let proxy = agent_egress::configure(
@@ -96,13 +97,11 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
     )
     .await?;
     let mut http = options.http.options();
-    if !agents.is_empty() {
-        http.enabled = true;
-    }
+    http.enabled = config.capture_http;
     let app = App {
         settings: Arc::new(Settings {
             browser,
-            image: options.image,
+            image: config.image,
             image_id,
             binary: std::fs::canonicalize(std::env::current_exe()?)?,
             output_dir: options.output_dir,
@@ -111,7 +110,7 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
             file_preview: options.file_preview.limits(),
             http,
             rootfs: options.rootfs.options(),
-            agents,
+            agents: config.agents,
             proxy,
             credential_gateway,
         }),
@@ -122,7 +121,7 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
         proxy_peers,
         bridges: Some(Default::default()),
     };
-    let listener = tokio::net::TcpListener::bind(options.listen).await?;
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let address = listener.local_addr()?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;

@@ -1,5 +1,5 @@
 //! Built-in agent adapters. Only IDs and sanitized files cross the sandbox boundary.
-use super::codex;
+use super::{agentkit, codex};
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
@@ -14,7 +14,20 @@ use tokio::{io::AsyncRead, process::Command, sync::mpsc};
 #[cfg(test)]
 mod tests;
 
-const ADAPTERS: &[Adapter] = &[Adapter::new(&codex::Codex)];
+const ADAPTERS: &[Adapter] = &[
+    Adapter::new(&codex::Codex),
+    Adapter::new(&agentkit::AgentKit),
+];
+
+/// Host-only settings from the Playground configuration file.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    pub name: Adapter,
+    pub path: Option<PathBuf>,
+    pub apikey: Option<String>,
+    pub endpoint: Option<String>,
+}
 
 #[derive(Serialize)]
 pub struct Metadata {
@@ -22,6 +35,7 @@ pub struct Metadata {
     pub name: &'static str,
     pub avatar: &'static str,
     pub authentication_hint: &'static str,
+    pub supports_security_tests: bool,
 }
 
 // Intentionally not serializable: the policy contains host-only credential sources.
@@ -57,8 +71,11 @@ pub struct Launch {
 }
 
 pub trait AgentAdapter: Send + Sync {
+    fn conversation_server(&self) -> bool {
+        false
+    }
     fn metadata(&self) -> Metadata;
-    fn discover(&self) -> Option<Arc<dyn Installation>>;
+    fn discover(&self, config: Option<&AgentConfig>) -> io::Result<Arc<dyn Installation>>;
     fn observation_rules(&self) -> ObservationRules;
     fn home(&self) -> &'static Path;
     fn configuration_file(&self, name: &str) -> bool;
@@ -66,9 +83,14 @@ pub trait AgentAdapter: Send + Sync {
     fn launch(&self, request: &LaunchRequest<'_>) -> io::Result<Launch>;
     fn read_output(
         &self,
-        input: RuntimeReader,
-        diagnostics: mpsc::Sender<String>,
-    ) -> BoxFuture<'_, io::Result<RuntimeOutput>>;
+        mut input: RuntimeReader,
+        _diagnostics: mpsc::Sender<String>,
+    ) -> BoxFuture<'_, io::Result<RuntimeOutput>> {
+        Box::pin(async move {
+            tokio::io::copy(&mut input, &mut tokio::io::sink()).await?;
+            Ok(RuntimeOutput::default())
+        })
+    }
 }
 
 /// Installation-specific host paths and credential preparation stay with the plugin.
@@ -128,10 +150,28 @@ impl<'de> Deserialize<'de> for Adapter {
     }
 }
 
-pub fn discover() -> Vec<Arc<dyn Installation>> {
-    ADAPTERS
+pub fn discover(config: Option<&[AgentConfig]>) -> io::Result<Vec<Arc<dyn Installation>>> {
+    let Some(entries) = config else {
+        return Ok(ADAPTERS
+            .iter()
+            .filter_map(|a| a.discover(None).ok())
+            .collect());
+    };
+    let mut seen = BTreeSet::new();
+    entries
         .iter()
-        .filter_map(|adapter| adapter.discover())
+        .map(|entry| {
+            let id = entry.name.metadata().id;
+            if !seen.insert(id) {
+                return Err(io::Error::other(format!(
+                    "duplicate agent in configuration: {id}"
+                )));
+            }
+            entry
+                .name
+                .discover(Some(entry))
+                .map_err(|error| io::Error::other(format!("{id}: {error}")))
+        })
         .collect()
 }
 

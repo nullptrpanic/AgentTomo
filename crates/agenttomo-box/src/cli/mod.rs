@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+pub const DEFAULT_PLAYGROUND_IMAGE: &str = "agenttomo-playground-chrome:24.04";
+
 #[derive(Parser)]
 #[command(about = "Run and inspect programs with AgentTomo")]
 pub struct Cli {
@@ -92,18 +94,20 @@ pub struct RunArgs {
 
 #[derive(Args)]
 pub struct PlaygroundArgs {
+    /// Read host settings from FILE (config.json in the working directory when omitted)
+    #[arg(short = 'c', long = "config", value_name = "FILE", num_args = 0..=1, default_missing_value = "config.json")]
+    pub config: Option<PathBuf>,
     /// HTTP CONNECT upstream (fallback: http://127.0.0.1:8118; host loopback is bridged)
     #[arg(long, value_name = "URL", overrides_with = "no_proxy")]
     pub proxy: Option<crate::proxy::outbound::Proxy>,
     /// Disable box's upstream proxy, including inherited and local settings
     #[arg(long, overrides_with = "proxy")]
     pub no_proxy: bool,
-    /// HTTP address; use 0.0.0.0:8080 to accept connections from other hosts
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    pub listen: SocketAddr,
-    /// Local Docker image; compatible images open Chrome automatically
-    #[arg(long, default_value = "agenttomo-playground-chrome:24.04")]
-    pub image: String,
+    /// HTTP address (default: 127.0.0.1:8080)
+    #[arg(long)]
+    pub listen: Option<SocketAddr>,
+    #[arg(long, help = format!("Local Docker image (default: {DEFAULT_PLAYGROUND_IMAGE})"))]
+    pub image: Option<String>,
     /// Legacy compatibility option; Playground data now stays in container tmpfs
     #[arg(long, default_value = ".agenttomo/playground")]
     pub output_dir: PathBuf,

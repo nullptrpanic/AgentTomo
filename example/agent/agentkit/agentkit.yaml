@@ -1,0 +1,14 @@
+common:
+  agent_name: agentkit
+  entry_point: build.sh
+  description: AgentKit project agentkit - Basic Go Agent App
+  language: Golang
+  language_version: '1.24'
+  agent_type: Basic App
+  dependencies_file: go.mod
+  launch_type: local
+launch_types:
+  local: {}
+docker_build:
+  base_image:
+    builder: golang:1.26.5

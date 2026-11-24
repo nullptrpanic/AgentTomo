@@ -51,13 +51,13 @@ flowchart LR
 
 ## 会话与终端
 
-工作区右上角的 Agent 下拉框按服务发现的安装启用选项。当前第一项为 `Codex`，第二项 `agentkit` 待接入。工作区通过 `/ws` 的 `agent` 参数指定本次沙箱使用的 Agent。服务在创建容器前校验该选择。旧客户端省略参数时仍使用首个可用 Agent，未安装 Agent 的工作区仍可使用终端。独立监控页只跟随已有会话。
+工作区右上角的 Agent 下拉框按服务发现的安装启用选项。第一项为 `Codex`，第二项 `agentkit` 使用独立构建的 Go 对话程序。服务在创建容器前校验 `/ws` 的 `agent` 参数，并将选定 Agent 的只读运行文件挂进容器。旧客户端省略参数时使用首个可用 Agent，未安装 Agent 的工作区仍可使用终端。独立监控页跟随已有会话。AgentKit 的凭据、流式对话和停止行为见 [Playground 配置](../crates/agenttomo-box/README.md#配置火山引擎-agentkit)。
 
 默认每个工作区主页面建立一个独立临时容器。记录与配置直接写入容器的 `/records` tmpfs，主页面断开、采集完成或服务正常停止时删除容器，随之销毁 tmpfs 和容器可写层。Docker 先 create，再 attach/start，以便连接失败时也能准确清理自己的容器。只删除当前会话创建的容器，不执行全局 prune；单次 Chat 任务结束不结束沙箱。
 
 Docker CLI 子进程使用独立进程组，宿主终端的 Ctrl-C 由 Playground 处理，连续按键不会打断创建、attach 或清理命令；网页终端中的 Ctrl-C 仍通过 PTY 作用于目标前台任务。控制命令保留 30 秒超时。`docker rm` 失败或超时时，再查询该名称的容器：只有查询成功且确认不存在才把清理记为成功；容器仍存在或无法查询时，记录原命令的退出码/信号或 I/O 错误，以及复核结果，不把 Docker 权限/连接错误视为容器已删除。
 
-默认使用本地 `agenttomo-playground-chrome:24.04` 并自动启动 Chrome，镜像包含 Ubuntu 24.04 工具集和桌面组件。构建方法见[镜像说明](../docker/playground-chrome/README.md)。可由 `--image` 指定其他兼容镜像，不自动拉取或构建。宿主机只提供只读的 box 二进制及可选 Codex 程序目录；不提供可写 bind mount，不挂载项目、宿主根目录或 Docker socket。容器使用 `--log-driver=none`，防止终端协议内容被 Docker 日志驱动另存到宿主机。
+默认使用本地 `agenttomo-playground-chrome:24.04` 并自动启动 Chrome，镜像包含 Ubuntu 24.04 工具集和桌面组件。构建方法见[镜像说明](../docker/playground-chrome/README.md)。可由 `--image` 指定其他兼容镜像，不自动拉取或构建。宿主机只提供只读的 box 二进制及所选 Agent 的运行文件；不提供可写 bind mount，不挂载项目、宿主根目录或 Docker socket。容器使用 `--log-driver=none`，防止终端协议内容被 Docker 日志驱动另存到宿主机。
 
 可通过 `--overlay-root` 开启[一级目录及 SSL OverlayFS](root-overlay-design.md)，所有私有层
 共用默认 512 MiB 的容量上限，可配置豁免路径；不增加 Docker capabilities。只覆盖能整目录

@@ -1,0 +1,80 @@
+// Copyright (c) 2025 Beijing Volcano Engine Technology Co., Ltd. and/or its affiliates.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"context"
+	"os/exec"
+	"time"
+
+	veagent "github.com/volcengine/veadk-go/v2/agent/llmagent"
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/agent/llmagent"
+	"google.golang.org/adk/v2/tool"
+	"google.golang.org/adk/v2/tool/functiontool"
+)
+
+func buildSampleAgent() (agent.Agent, error) {
+	command, err := functiontool.New(functiontool.Config{
+		Name:        "exec_command",
+		Description: "Run a shell command in the current sandbox. Use it to execute programs and read or write files. Returns output and exit_code.",
+	}, runCommand)
+	if err != nil {
+		return nil, err
+	}
+	agentName := "agentkit"
+	var description string
+	description = `A task assistant with a sandbox command tool.`
+
+	var instruction string
+	instruction = `用用户使用的语言回答问题。`
+
+	cfg := &veagent.Config{
+		Config: llmagent.Config{
+			Name:        agentName,
+			Description: description,
+			Instruction: instruction,
+			Tools:       []tool.Tool{command},
+		},
+		ModelExtraConfig: map[string]any{
+			"extra_body": map[string]any{
+				"thinking": map[string]string{
+					"type": "disabled",
+				},
+			},
+		},
+	}
+	return veagent.New(cfg)
+}
+
+type commandArgs struct {
+	Command string `json:"command" jsonschema:"Shell command to execute in the current sandbox."`
+}
+
+func runCommand(ctx agent.Context, args commandArgs) (map[string]any, error) {
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctxWithTimeout, "/bin/bash", "-c", args.Command)
+	cmd.WaitDelay = time.Second
+	output, err := cmd.CombinedOutput()
+	result := map[string]any{"output": string(output), "exit_code": -1}
+	if cmd.ProcessState != nil {
+		result["exit_code"] = cmd.ProcessState.ExitCode()
+	}
+	if err != nil {
+		result["error"] = err.Error()
+	}
+	return result, nil
+}

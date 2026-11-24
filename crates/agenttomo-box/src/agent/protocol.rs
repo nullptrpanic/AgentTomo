@@ -1,10 +1,13 @@
 //! Model protocols normalize wire data without knowing which agent sent it.
-use super::responses;
+use super::{chat_completions, responses};
 use axum::http::{Method, Uri};
 use serde_json::Value;
 use std::io;
 
-const PROTOCOLS: &[Protocol] = &[Protocol::new(&responses::Responses)];
+const PROTOCOLS: &[Protocol] = &[
+    Protocol::new(&responses::Responses),
+    Protocol::new(&chat_completions::ChatCompletions),
+];
 
 pub struct Event {
     pub kind: &'static str,
@@ -187,5 +190,78 @@ mod tests {
             assert!(Protocol::detect(&Method::POST, &path.parse().unwrap()).is_none());
         }
         assert!(Protocol::detect(&Method::DELETE, &"/v1/responses".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn chat_completions_streams_visible_text_and_completes_once() {
+        let protocol =
+            Protocol::detect(&Method::POST, &"/api/v3/chat/completions".parse().unwrap())
+                .expect("registered Chat Completions protocol");
+        let mut wire = observer(protocol);
+        wire.feed_body(br#"{"model":"fixture","messages":[],"stream":true}"#);
+        assert_eq!(
+            wire.finish_body("", true, None)[0].kind,
+            "agent.model.request"
+        );
+        let first = wire.event(r#"{"id":"chat1","model":"fixture","choices":[{"index":0,"delta":{"content":"hello","reasoning_content":"internal"}}]}"#);
+        assert_eq!(first[0].kind, "agent.model.started");
+        assert_eq!(first[1].data["delta"], "hello");
+        assert!(!first[1].data.to_string().contains("internal"));
+        wire.event(r#"{"id":"chat1","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}"#);
+        wire.event(r#"{"id":"chat1","choices":[],"usage":{"total_tokens":7}}"#);
+        let end = wire.event("[DONE]");
+        assert_eq!(end[0].kind, "agent.message");
+        assert_eq!(end[0].content, Some(json!("hello world")));
+        assert_eq!(first[1].data["item_id"], end[0].data["item_id"]);
+        assert_eq!(end[1].kind, "agent.model.complete");
+        assert_eq!(end[1].data["usage"]["total_tokens"], 7);
+        let detail = end[1]
+            .content
+            .as_ref()
+            .expect("model detail for a streamed response");
+        assert_eq!(detail["choices"][0]["message"]["content"], "hello world");
+        assert_eq!(detail["choices"][0]["finish_reason"], "stop");
+        assert_eq!(detail["usage"]["total_tokens"], 7);
+        assert!(wire.event("[DONE]").is_empty());
+        assert!(wire.finish_response(true).is_empty());
+        let mut interrupted = observer(protocol);
+        interrupted
+            .event(r#"{"id":"chat2","choices":[{"index":0,"delta":{"content":"partial"}}]}"#);
+        assert_eq!(
+            interrupted.finish_response(true)[0].kind,
+            "agent.capture.error"
+        );
+    }
+
+    #[test]
+    fn damaged_chat_stream_cannot_be_marked_completed_by_a_later_sentinel() {
+        let protocol =
+            Protocol::detect(&Method::POST, &"/v1/chat/completions".parse().unwrap()).unwrap();
+        let mut wire = observer(protocol);
+        wire.event(r#"{"id":"c1","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":"stop"}]}"#);
+        let invalid = wire.event(r#"{"id":"different","choices":[]}"#);
+        assert!(
+            invalid
+                .iter()
+                .any(|event| event.kind == "agent.capture.error")
+        );
+        assert!(wire.event("[DONE]").is_empty());
+        assert!(
+            !invalid
+                .iter()
+                .any(|event| event.data["status"] == "completed")
+        );
+
+        let mut denied = observer(protocol);
+        denied.feed_body(br#"{"error":{"message":"private upstream diagnostics"}}"#);
+        let events =
+            denied.finish_body("identity", true, Some(axum::http::StatusCode::UNAUTHORIZED));
+        assert!(events.iter().any(|event| event.data["status"] == "failed"));
+        assert!(events.iter().all(|event| {
+            !event
+                .data
+                .to_string()
+                .contains("private upstream diagnostics")
+        }));
     }
 }

@@ -270,6 +270,7 @@ async fn drive(
                         }
                     }
                     Control::AgentCancel if agent_available => Input::AgentCancel,
+                    Control::SampleRun { .. } if !agent_available => continue,
                     Control::Resize { rows, cols }
                         if (1..=1000).contains(&rows) && (1..=1000).contains(&cols) =>
                     {

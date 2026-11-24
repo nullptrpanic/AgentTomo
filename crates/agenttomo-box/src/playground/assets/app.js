@@ -30,7 +30,7 @@ async function selectWorkspaceAgent() {
   const requested = params.get("agent");
   const current = requested ?? available[0] ?? "";
   const valid = requested === null || available.includes(requested);
-  const ids = new Set(["codex", "agentkit", ...available]);
+  const ids = new Set([...available, "codex", "agentkit"]);
   if (!available.length) ids.add("");
   let selected;
   for (const id of ids) {
@@ -40,7 +40,7 @@ async function selectWorkspaceAgent() {
     row.querySelector("span").textContent = name;
     input.value = id;
     input.disabled = Boolean(id) && !available.includes(id);
-    if (input.disabled && id === "agentkit") row.title = "Pending integration";
+    if (input.disabled && id === "agentkit") row.title = "Configure the AgentKit executable, model and credentials on the server.";
     if (valid && id === current) {
       input.checked = true;
       selected = input;

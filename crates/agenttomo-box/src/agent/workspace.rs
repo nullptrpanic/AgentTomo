@@ -1,11 +1,12 @@
 //! Traced parent for the terminal and chat children. Commands never enter the PTY.
+mod conversation;
 use super::Scope;
 use crate::execution::protocol;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{io, os::unix::fs::PermissionsExt, process::Stdio};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     process::{Child, Command},
 };
@@ -43,6 +44,9 @@ pub async fn run(browser: bool) -> io::Result<u8> {
         accepted = listener.accept() => accepted?.0,
         status = terminal.wait() => return Ok(status?.code().unwrap_or(125) as u8),
     };
+    if adapter.conversation_server() {
+        return conversation::serve(adapter, terminal, connection).await;
+    }
     let (read, mut write) = connection.into_split();
     let mut read = protocol::Reader::new(BufReader::new(read));
     let mut task: Option<Child> = None;
@@ -69,15 +73,8 @@ pub async fn run(browser: bool) -> io::Result<u8> {
                         cancelled = false;
                         let start = async {
                             if let Some(id) = sample.as_deref() {
-                                protocol::send(&mut write, &json!({"kind":"security.sample.progress","scope":scope,"sample_id":id,"status":"running","phase":"preparing"})).await?;
-                                let mut run = crate::playground::samples::prepare(id, &scope.task_id, report_marker).await?;
-                                protocol::send(&mut write, &json!({"kind":"security.sample.progress","scope":scope,"sample_id":id,"status":"running","phase":"injecting"})).await?;
-                                run.inject().await?;
+                                let run = prepare_sample(&mut write, &scope, id, report_marker).await?;
                                 prompt = run.prompt.clone();
-                                let mut event = run.verify_injection().await?;
-                                event["kind"] = "security.sample.started".into();
-                                event["scope"] = json!(scope);
-                                protocol::send(&mut write, &event).await?;
                                 sample_run = Some(run);
                             }
                             let mut child = start(adapter, &scope, if sample.is_some() { None } else { conversation.as_deref() }, &prompt, sample.as_deref() == Some("tool-leak")).await?;
@@ -128,11 +125,7 @@ pub async fn run(browser: bool) -> io::Result<u8> {
                     else { captured.1.chars().take(8192).collect::<String>() }
                 });
                 if let Some(run) = sample_run.take() {
-                    protocol::send(&mut write, &json!({"kind":"security.sample.progress","scope":current,"sample_id":run.id(),"status":"running","phase":"verifying"})).await?;
-                    let mut event = run.evaluate(code, cancelled).await;
-                    event["kind"] = "security.sample.finished".into();
-                    event["scope"] = json!(current);
-                    protocol::send(&mut write, &event).await?;
+                    finish_sample(&mut write, current.as_ref().unwrap(), run, code, cancelled).await?;
                 }
                 protocol::send(&mut write, &json!({"kind":"agent.task.finished","scope":current,"exit_code":code,"error":if code == Some(0) { Value::Null } else { error.into() }})).await?;
                 current = None;
@@ -141,6 +134,37 @@ pub async fn run(browser: bool) -> io::Result<u8> {
             }
         }
     }
+}
+
+async fn prepare_sample(
+    writer: &mut (impl AsyncWrite + Unpin),
+    scope: &Scope,
+    id: &str,
+    marker: Option<String>,
+) -> io::Result<crate::playground::samples::Run> {
+    protocol::send(writer, &json!({"kind":"security.sample.progress","scope":scope,"sample_id":id,"status":"running","phase":"preparing"})).await?;
+    let mut run = crate::playground::samples::prepare(id, &scope.task_id, marker).await?;
+    protocol::send(writer, &json!({"kind":"security.sample.progress","scope":scope,"sample_id":id,"status":"running","phase":"injecting"})).await?;
+    run.inject().await?;
+    let mut event = run.verify_injection().await?;
+    event["kind"] = "security.sample.started".into();
+    event["scope"] = json!(scope);
+    protocol::send(writer, &event).await?;
+    Ok(run)
+}
+
+async fn finish_sample(
+    writer: &mut (impl AsyncWrite + Unpin),
+    scope: &Scope,
+    run: crate::playground::samples::Run,
+    code: Option<i32>,
+    cancelled: bool,
+) -> io::Result<()> {
+    protocol::send(writer, &json!({"kind":"security.sample.progress","scope":scope,"sample_id":run.id(),"status":"running","phase":"verifying"})).await?;
+    let mut event = run.evaluate(code, cancelled).await;
+    event["kind"] = "security.sample.finished".into();
+    event["scope"] = json!(scope);
+    protocol::send(writer, &event).await
 }
 
 pub(super) async fn start(
@@ -154,27 +178,32 @@ pub(super) async fn start(
         conversation,
         prompt,
     })?;
-    if observe_report {
-        let filter = crate::syscall::prepare(crate::collectors::file::report::EXTRA_SYSCALLS);
-        // The prepared hook is allocation-free between fork and exec.
-        unsafe {
-            launch.command.pre_exec(filter);
-        }
-    }
-    let mut child = launch
+    launch
         .command
-        .env("AGENTTOMO_AGENT_ID", &scope.agent_instance_id)
-        .env("AGENTTOMO_TASK_ID", &scope.task_id)
-        .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let mut child = spawn(&mut launch.command, scope, observe_report)?;
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(&launch.input).await?;
     drop(stdin);
     Ok(child)
+}
+
+fn spawn(command: &mut Command, scope: &Scope, observe_report: bool) -> io::Result<Child> {
+    if observe_report {
+        let filter = crate::syscall::prepare(crate::collectors::file::report::EXTRA_SYSCALLS);
+        // The prepared hook is allocation-free between fork and exec.
+        unsafe {
+            command.pre_exec(filter);
+        }
+    }
+    command
+        .env("AGENTTOMO_AGENT_ID", &scope.agent_instance_id)
+        .env("AGENTTOMO_TASK_ID", &scope.task_id)
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
 }
 
 fn kill_group(child: Option<&mut Child>) {
@@ -230,6 +259,8 @@ pub async fn drive(
     let stream = connect().await?;
     let (read, mut write) = stream.into_split();
     let mut read = protocol::Reader::new(BufReader::new(read));
+    let conversation =
+        super::Adapter::selected()?.is_some_and(|adapter| adapter.conversation_server());
     let mut running = None;
     let mut started = false;
     let mut cancelled = false;
@@ -237,8 +268,22 @@ pub async fn drive(
         tokio::select! {
             action = actions.recv() => match action {
                 Some(mut action) => {
+                    // The collector owns the turn binding. A second start must not cross
+                    // the completion acknowledgement while the subprocess is reusable.
+                    if conversation && let Action::Start { scope, .. } = &action && let Some(active) = &running {
+                        if active != scope {
+                            events.send(crate::recording::Observation {
+                                source: "agent_launcher", kind: "agent.task.rejected",
+                                data: json!({"agent_instance_id":scope.agent_instance_id,"task_id":scope.task_id,
+                                    "error":"Another conversation turn is running.","captured_unix_ns":super::now()}),
+                            }).await.map_err(io::Error::other)?;
+                        }
+                        continue;
+                    }
+                    if conversation && matches!(action, Action::Cancel) && running.is_none() { continue; }
                     if let Action::Start { scope, sample, report_marker, .. } = &mut action && running.is_none() {
                         running = Some(scope.clone());
+                        if conversation { agents.begin_turn(scope); }
                         cancelled = false;
                         if sample.as_deref() == Some("tool-leak") {
                             // Arm the tracer before sending Start so it can match the first write.
@@ -249,7 +294,7 @@ pub async fn drive(
                         }
                     }
                     if matches!(action, Action::Cancel) { cancelled = true; }
-                    if matches!(action, Action::Cancel) && let Some(scope) = &running && let Err(error) = agents.cancel(scope) {
+                    if !conversation && matches!(action, Action::Cancel) && let Some(scope) = &running && let Err(error) = agents.cancel(scope) {
                         events.send(crate::recording::Observation { source:"agent_launcher", kind:"agent.capture.error", data:json!({"task_id":scope.task_id,"agent_instance_id":scope.agent_instance_id,"error":format!("some task processes could not be stopped and remain traced: {error}"),"captured_unix_ns":super::now()}) }).await.map_err(io::Error::other)?;
                     }
                     protocol::send(&mut write, &action).await?;
@@ -283,14 +328,19 @@ pub async fn drive(
                     started = true;
                 }
                 if kind == "agent.task.rejected" && !started && running.as_ref() == Some(&scope) {
+                    agents.finish_turn(&scope);
                     data["cancelled"] = cancelled.into();
                     reports.finish(&scope);
                     running = None;
                 }
                 if kind == "agent.task.finished" {
+                    agents.finish_turn(&scope);
                     started = false;
                     data["cancelled"] = cancelled.into();
                     if cancelled { data["error"] = Value::Null; }
+                    if cancelled && conversation {
+                        data["status"] = "cancelled".into();
+                    }
                     running = None;
                 }
                 data["agent_instance_id"] = scope.agent_instance_id.into();

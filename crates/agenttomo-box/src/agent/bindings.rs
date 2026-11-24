@@ -21,12 +21,30 @@ pub struct Binding {
 }
 #[derive(Default)]
 struct State {
+    foreground: Option<Scope>,
+    conversation_runtime: Option<u64>,
     processes: HashMap<u64, Binding>,
     active: HashMap<String, (String, String)>,
     calls: HashMap<(String, String), (String, Scope)>,
     results: std::collections::HashSet<(String, String)>,
     live: HashMap<u64, OwnedFd>,
     cancelled: std::collections::HashSet<(String, String)>,
+}
+impl State {
+    fn binding(&self, instance: u64) -> Option<Binding> {
+        let mut binding = self.processes.get(&instance)?.clone();
+        if binding.association == "conversation_runtime" {
+            if self.conversation_runtime != Some(instance) {
+                return None;
+            }
+            binding.scope = self
+                .foreground
+                .as_ref()
+                .filter(|scope| scope.agent_instance_id == binding.scope.agent_instance_id)?
+                .clone();
+        }
+        Some(binding)
+    }
 }
 #[derive(Clone, Default)]
 pub struct Hub {
@@ -35,6 +53,15 @@ pub struct Hub {
 }
 
 impl Hub {
+    pub fn begin_turn(&self, scope: &Scope) {
+        self.state.lock().unwrap().foreground = Some(scope.clone());
+    }
+    pub fn finish_turn(&self, scope: &Scope) {
+        let mut state = self.state.lock().unwrap();
+        if state.foreground.as_ref() == Some(scope) {
+            state.foreground = None;
+        }
+    }
     pub fn with_runtimes(runtimes: Vec<String>) -> Self {
         Self {
             runtimes: runtimes.into(),
@@ -50,7 +77,7 @@ impl Hub {
     }
     pub fn track(&self, identity: crate::process::Identity) -> std::io::Result<()> {
         let mut state = self.state.lock().unwrap();
-        let Some(binding) = state.processes.get(&identity.process_instance_id) else {
+        let Some(binding) = state.binding(identity.process_instance_id) else {
             return Ok(());
         };
         let cancelled = state.cancelled.contains(&(
@@ -77,11 +104,17 @@ impl Hub {
         Ok(())
     }
     pub fn exited(&self, identity: crate::process::Identity) {
-        self.state
-            .lock()
-            .unwrap()
-            .live
-            .remove(&identity.process_instance_id);
+        let mut state = self.state.lock().unwrap();
+        let instance = identity.process_instance_id;
+        state.live.remove(&instance);
+        if state.conversation_runtime == Some(instance) {
+            // Late events from a stopped process keep its last active turn.
+            if let Some(mut binding) = state.binding(instance) {
+                binding.association = "agent_runtime";
+                state.processes.insert(instance, binding);
+            }
+            state.conversation_runtime = None;
+        }
     }
     pub fn cancel(&self, scope: &Scope) -> std::io::Result<()> {
         let mut state = self.state.lock().unwrap();
@@ -91,8 +124,7 @@ impl Hub {
         let mut failure = None;
         for (instance, fd) in &state.live {
             if state
-                .processes
-                .get(instance)
+                .binding(*instance)
                 .is_some_and(|binding| &binding.scope == scope)
                 && let Err(error) = kill(fd)
             {
@@ -147,12 +179,20 @@ impl Hub {
             explicit.clone().or(active)
         };
         let inferred = tool.is_some();
+        let conversation = runtime
+            && env["AGENTTOMO_CONVERSATION_ID"].as_str() == Some(scope.task_id.as_str())
+            && state.foreground.as_ref() == Some(&scope);
+        if conversation {
+            state.conversation_runtime = Some(instance);
+        }
         state.processes.insert(
             instance,
             Binding {
                 scope,
                 agenttomo_toolcall_id: tool,
-                association: if explicit.is_some() {
+                association: if conversation {
+                    "conversation_runtime"
+                } else if explicit.is_some() {
                     "explicit_environment"
                 } else if inferred {
                     "inferred_active_call"
@@ -164,7 +204,10 @@ impl Hub {
     }
     pub fn fork(&self, parent: u64, child: u64) {
         let mut state = self.state.lock().unwrap();
-        if let Some(mut binding) = state.processes.get(&parent).cloned() {
+        if let Some(mut binding) = state.binding(parent) {
+            if binding.association == "conversation_runtime" {
+                binding.association = "agent_runtime";
+            }
             if binding.agenttomo_toolcall_id.is_some() {
                 binding.association = if matches!(
                     binding.association,
@@ -184,7 +227,7 @@ impl Hub {
         }
     }
     pub fn binding(&self, instance: u64) -> Option<Binding> {
-        self.state.lock().unwrap().processes.get(&instance).cloned()
+        self.state.lock().unwrap().binding(instance)
     }
     pub fn fields(&self, data: &mut Value) {
         if let Some(binding) = data["process_instance_id"]
@@ -256,6 +299,37 @@ fn kill(fd: &OwnedFd) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn conversation_socket_owner_tracks_each_turn_and_never_steals_terminal_traffic() {
+        let hub = Hub::with_runtimes(vec!["agenttomo-agentkit".into()]);
+        let first = Scope {
+            agent_instance_id: "a".into(),
+            task_id: "one".into(),
+        };
+        let second = Scope {
+            agent_instance_id: "a".into(),
+            task_id: "two".into(),
+        };
+        let env = json!({"AGENTTOMO_AGENT_ID":"a","AGENTTOMO_TASK_ID":"one","AGENTTOMO_CONVERSATION_ID":"one"});
+        hub.begin_turn(&first);
+        hub.observe_exec(11, &env, &json!(["/opt/agenttomo-agentkit"]));
+        let captured = hub.binding(11).unwrap().scope;
+        hub.finish_turn(&first);
+        assert!(hub.binding(11).is_none());
+        hub.begin_turn(&second);
+        hub.observe_exec(12, &json!({}), &json!(["/opt/agenttomo-agentkit"]));
+        assert!(hub.binding(12).is_none());
+        assert_eq!(hub.binding(11).unwrap().scope, second);
+        assert_eq!(captured, first);
+        hub.exited(crate::process::Identity {
+            pid: 42,
+            process_instance_id: 11,
+        });
+        hub.finish_turn(&second);
+        hub.begin_turn(&first);
+        assert_eq!(hub.binding(11).unwrap().scope, second);
+    }
 
     #[test]
     fn tracking_a_process_that_already_exited_keeps_its_historical_binding() {

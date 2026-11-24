@@ -169,10 +169,10 @@ export class AgentChat {
       }
       if (task.state !== "running") {
         const elapsed = (time(task.finished) || task.endedAt || Date.now()) - (time(task.started) || task.queuedAt);
-        text(record.outcome, duration(elapsed));
+        text(record.outcome, task.finished?.data.context_reset ? "Next prompt starts a new conversation" : duration(elapsed));
         record.outcome.dataset.state = task.state;
       } else {
-        text(record.outcome, "Running");
+        text(record.outcome, task.started?.data.context_reset ? "Running in a new conversation" : "Running");
         record.outcome.dataset.state = "running";
       }
       this.updateProgress(task);

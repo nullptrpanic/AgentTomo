@@ -20,6 +20,7 @@ pub struct Codex;
 impl AgentAdapter for Codex {
     fn metadata(&self) -> Metadata {
         Metadata {
+            supports_security_tests: true,
             id: "codex",
             name: "Codex",
             avatar: ">_",
@@ -37,9 +38,18 @@ impl AgentAdapter for Codex {
         }
     }
 
-    fn discover(&self) -> Option<Arc<dyn adapter::Installation>> {
-        Installation::discover()
+    fn discover(
+        &self,
+        config: Option<&adapter::AgentConfig>,
+    ) -> io::Result<Arc<dyn adapter::Installation>> {
+        if config.is_some_and(|entry| entry.apikey.is_some() || entry.endpoint.is_some()) {
+            return Err(io::Error::other(
+                "Codex uses the host login; only path is configurable",
+            ));
+        }
+        Installation::discover(config.and_then(|entry| entry.path.as_deref()))
             .map(|installation| Arc::new(installation) as Arc<dyn adapter::Installation>)
+            .ok_or_else(|| io::Error::other("cannot locate Codex; check the executable path"))
     }
     fn home(&self) -> &'static Path {
         Path::new(HOME)
@@ -124,26 +134,36 @@ impl adapter::Installation for Installation {
 }
 
 impl Installation {
-    pub fn discover() -> Option<Self> {
+    fn discover(path: Option<&Path>) -> Option<Self> {
         let home = std::env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
-        let mut candidates = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|directory| directory.join("codex"))
-            .collect::<Vec<_>>();
-        if let Ok(versions) = std::fs::read_dir("/opt/nvm/versions/node") {
-            candidates.extend(
-                versions
-                    .flatten()
-                    .map(|entry| entry.path().join("bin/codex")),
-            );
-        }
+        let candidates = if let Some(path) = path {
+            vec![path.to_owned()]
+        } else {
+            let mut found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|directory| directory.join("codex"))
+                .collect::<Vec<_>>();
+            if let Ok(versions) = std::fs::read_dir("/opt/nvm/versions/node") {
+                found.extend(
+                    versions
+                        .flatten()
+                        .map(|entry| entry.path().join("bin/codex")),
+                );
+            }
+            found
+        };
         for candidate in candidates {
             let Ok(candidate) = candidate.canonicalize() else {
                 continue;
             };
+            if !candidate.is_file() {
+                continue;
+            }
             if let Some(root) = candidate.parent().and_then(Path::parent) {
-                if root.join("bin/codex-code-mode-host").is_file() {
+                if candidate == root.join("bin/codex")
+                    && root.join("bin/codex-code-mode-host").is_file()
+                {
                     return Some(Self {
                         distribution: root.into(),
                         home,

@@ -4,6 +4,7 @@
 !.cargo/config.toml
 !.gitignore
 Cargo.lock
+/config.json
 
 # Local agent instructions and implementation plans.
 /AGENTS.md

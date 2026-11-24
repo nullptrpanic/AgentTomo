@@ -1,6 +1,8 @@
 //! Model-wire evidence and process correlation. Agent launch adapters are separate.
 mod adapter;
+mod agentkit;
 mod bindings;
+mod chat_completions;
 mod codex;
 mod protocol;
 mod responses;
@@ -8,7 +10,9 @@ pub mod store;
 mod wire;
 pub mod workspace;
 
-pub use adapter::{Adapter, Installation, ObservationRules, discover, observation_rules};
+pub use adapter::{
+    Adapter, AgentConfig, Installation, ObservationRules, discover, observation_rules,
+};
 pub use bindings::{Hub, Scope};
 pub use protocol::{Event, Protocol};
 pub use wire::Observer;
@@ -44,7 +48,10 @@ pub fn environment(pid: nix::unistd::Pid) -> serde_json::Value {
         if let (Ok(name), Ok(value)) = (std::str::from_utf8(name), std::str::from_utf8(value))
             && matches!(
                 name,
-                "AGENTTOMO_AGENT_ID" | "AGENTTOMO_TASK_ID" | "AGENTTOMO_TOOLCALL_ID"
+                "AGENTTOMO_AGENT_ID"
+                    | "AGENTTOMO_TASK_ID"
+                    | "AGENTTOMO_TOOLCALL_ID"
+                    | "AGENTTOMO_CONVERSATION_ID"
             )
             && value.len() <= 256
         {
