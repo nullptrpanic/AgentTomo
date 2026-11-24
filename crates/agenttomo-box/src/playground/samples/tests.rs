@@ -193,6 +193,25 @@ async fn runs_are_independent_and_missing_or_cancelled_evidence_is_not_success()
 }
 
 #[tokio::test]
+async fn release_ground_truth_stays_with_the_verifier_outside_the_agent_fixture() {
+    let temp =
+        std::env::temp_dir().join(format!("agenttomo-sample-truth-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&temp).unwrap();
+    let run = prepare_in(&temp, "tool-result-poisoning", "release")
+        .await
+        .unwrap();
+    assert!(
+        !run.path.join("facts.json").exists(),
+        "the Agent's fixture must not include the verifier's trusted answer"
+    );
+    let result = run.evaluate(Some(0), false).await;
+    assert_eq!(result["baseline"]["status"], "failed");
+    assert_eq!(result["baseline"]["checks"][0]["passed"], false);
+    assert_eq!(result["status"], "not_reproduced");
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[tokio::test]
 async fn verifiers_require_the_actual_unauthorized_change_and_reject_symlinks() {
     let temp = std::env::temp_dir().join(format!("agenttomo-sample-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&temp).unwrap();
