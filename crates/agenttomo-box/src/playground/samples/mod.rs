@@ -190,11 +190,38 @@ impl Run {
 }
 
 async fn open_evidence(path: &Path) -> io::Result<tokio::fs::File> {
-    let file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)
-        .await?;
+    let path = path.to_owned();
+    let file = tokio::task::spawn_blocking(move || -> io::Result<std::fs::File> {
+        use nix::fcntl::{OFlag, openat};
+        use nix::sys::stat::Mode;
+        let base = if path.is_absolute() { "/" } else { "." };
+        let mut file = std::fs::File::open(base)?;
+        let mut parts = path
+            .strip_prefix("/")
+            .unwrap_or(&path)
+            .components()
+            .peekable();
+        while let Some(part) = parts.next() {
+            let Component::Normal(name) = part else {
+                return Err(io::Error::other("invalid evidence path"));
+            };
+            let flags = if parts.peek().is_some() {
+                OFlag::O_PATH | OFlag::O_DIRECTORY
+            } else {
+                OFlag::O_RDONLY | OFlag::O_NONBLOCK
+            };
+            file = openat(
+                &file,
+                Path::new(name),
+                flags | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )?
+            .into();
+        }
+        Ok(file)
+    })
+    .await??;
+    let file = tokio::fs::File::from_std(file);
     if !file.metadata().await?.is_file() {
         return Err(io::Error::other("evidence must be a regular file"));
     }

@@ -145,7 +145,7 @@ impl Layout {
     }
 }
 
-fn escape(path: &Path) -> io::Result<String> {
+pub(crate) fn escape(path: &Path) -> io::Result<String> {
     let path = path
         .to_str()
         .ok_or_else(|| io::Error::other("OverlayFS paths must be UTF-8"))?;
@@ -183,7 +183,19 @@ fn parse_mounts(input: &[u8]) -> io::Result<BTreeMap<PathBuf, libc::c_ulong>> {
         if fields.len() < 10 {
             return Err(io::Error::other("invalid /proc/self/mountinfo"));
         }
-        let mut flags = 0;
+        let super_options = fields
+            .iter()
+            .position(|field| *field == b"-")
+            .and_then(|index| fields.get(index + 3))
+            .ok_or_else(|| io::Error::other("missing mountinfo superblock options"))?;
+        let mut flags = if super_options
+            .split(|b| *b == b',')
+            .any(|option| option == b"ro")
+        {
+            libc::MS_RDONLY
+        } else {
+            0
+        };
         for option in fields[5].split(|b| *b == b',') {
             flags |= match option {
                 b"ro" => libc::MS_RDONLY,

@@ -123,7 +123,7 @@ async fn collect(
             capture_files,
             clear_proxy_environment,
             trust_overlay: trust.as_ref().map(super::trust::Overlay::handoff),
-            root_overlay: root.map(|root| (root, rootfs)),
+            root_overlay: root.as_ref().map(|root| (root.path().to_owned(), rootfs)),
         },
         events_tx,
         registry,

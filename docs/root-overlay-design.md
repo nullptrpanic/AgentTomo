@@ -55,7 +55,8 @@ lower 文件内容不提供一致性快照，外层并发修改仍可影响任�
 
 `--overlay-root-size-mib` 默认 512 MiB，是所有 upper/work 共用的 tmpfs 容量上限，
 按需占用。启动不再提前复制 `/etc`、`/usr/sbin` 等边界文件。普通文件由内核按需
-copy-up；upper 根目录继承原目录的权限、所有者、时间和可读取的扩展属性/ACL。
+copy-up。upper 根目录保留原目录的权限、所有者、时间、普通扩展属性和 ACL。
+OverlayFS 自身的 opaque、redirect 等内部标记只属于原来的层，复制时会跳过。
 运行时容量耗尽返回 `ENOSPC`。不持久化 upper/work。
 
 ## CA、生命周期与兼容性
@@ -71,12 +72,14 @@ copy-up；upper 根目录继承原目录的权限、所有者、时间和可读�
 跨 OverlayFS 挂载点的 rename/硬链接可能返回 `EXDEV`，挂载点本身的删除或重命名可能
 返回 `EBUSY`。依赖现有 Linux user/mount namespace、OverlayFS、`open_tree`、
 `move_mount` 和 `pivot_root` 支持；外层安全策略不允许时明确报错。
-Playground 沿用现有 root 引导与完整 UID/GID 映射；普通 `run` 仍取决于所在环境是否
-允许读取候选目录并保留其所有者和元数据，任意单 UID 映射环境不保证可用。
+Playground 沿用现有 root 引导与完整 UID/GID 映射。普通用户使用 `run --overlay-root`
+时，命名空间需要能表示待覆盖目录的属主和属组。若只映射调用者的 UID/GID，遇到未映射的
+宿主目录属主时，启动器会在运行目标命令前报错，指出目录、所有者以及需要检查的 ID 映射。
 
 ## 验证
 
 `tests/root_overlay.rs` 使用真实 Docker 验证选中目录 CoW、未选中区域写回、只读子挂载
-保留、CA 不写入原系统、不提前复制大文件、存储隐藏、后代存活和容量上限。
+保留、CA 不写入原系统、不提前复制大文件、存储隐藏、后代存活和容量上限。还验证普通
+扩展属性、OverlayFS 私有标记，以及单 UID 映射下的目录所有权检查。
 `AGENTTOMO_TEST_ROOT_OVERLAY=1` 运行 `tests/browser-smoke.mjs` 检查 Chrome、HTTPS
 解密、文件预览和 UI。浏览器模式下 `/tmp` 保留原视图，私有写入断言使用 `/root`。

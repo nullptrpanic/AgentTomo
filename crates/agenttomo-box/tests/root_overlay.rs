@@ -35,6 +35,12 @@ async fn root_overlay_rejects_invalid_layouts_before_user_code() {
 
 #[tokio::test]
 #[ignore = "requires Docker and the local agenttomo-playground:24.04 image"]
+async fn single_id_overlay_preserves_ownership_or_reports_the_mapping_error() {
+    run_fixture("root_overlay_single_id.sh", "ROOT_OVERLAY_SINGLE_ID_OK").await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker and the local agenttomo-playground:24.04 image"]
 async fn root_overlay_lasts_until_descendants_finish_and_bounds_writes() {
     run_fixture("root_overlay_lifetime.sh", "ROOT_OVERLAY_LIFETIME_OK").await;
 }

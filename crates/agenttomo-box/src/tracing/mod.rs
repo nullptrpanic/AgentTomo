@@ -55,10 +55,7 @@ pub struct Launch {
     pub capture_files: bool,
     pub clear_proxy_environment: bool,
     pub trust_overlay: Option<(std::path::PathBuf, String)>,
-    pub root_overlay: Option<(
-        crate::execution::rootfs::Root,
-        crate::execution::rootfs::Options,
-    )>,
+    pub root_overlay: Option<(std::path::PathBuf, crate::execution::rootfs::Options)>,
 }
 
 pub fn spawn(
@@ -123,7 +120,7 @@ fn run(
     if let Some((root, options)) = &root_overlay {
         launch
             .arg("--root-overlay-directory")
-            .arg(root.path())
+            .arg(root)
             .args(options.arguments());
     }
     let master = if with_terminal {

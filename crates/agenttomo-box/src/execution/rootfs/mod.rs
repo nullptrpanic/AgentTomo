@@ -2,6 +2,7 @@
 //! changes mounts; the collector keeps the original root and owns cleanup.
 
 mod layout;
+pub(super) use layout::escape;
 mod metadata;
 
 use nix::{errno::Errno, libc};

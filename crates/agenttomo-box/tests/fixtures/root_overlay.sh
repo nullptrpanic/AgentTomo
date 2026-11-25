@@ -1,6 +1,11 @@
 set -x
 mkdir -p /root/overlay-fixture /tmp/overlay-pass /tmp/overlay-dir /records
 chmod 0750 /root
+python3 - <<'PY'
+import os
+os.setxattr("/root", "user.agenttomo-note", b"directory fixture")
+os.setxattr("/root", "user.overlay.opaque", b"y")
+PY
 printf lower >/etc/agenttomo-overlay-fixture
 printf lower >/etc/ssl/agenttomo-overlay-fixture
 printf lower >/usr/sbin/agenttomo-overlay-fixture
@@ -17,6 +22,7 @@ cd /root/overlay-fixture
 set -eux
 test "$PWD" = /root/overlay-fixture
 test "$(stat -c %a /root)" = 750
+python3 -c "import os; assert os.getxattr(\"/root\", \"user.agenttomo-note\") == b\"directory fixture\""
 python3 -c "from pathlib import Path; rows=[r.split() for r in Path(\"/proc/self/mountinfo\").read_text().splitlines()]; overlays={r[4] for r in rows if r[r.index(\"-\")+1]==\"overlay\"}; assert \"/root\" in overlays and \"/etc/ssl\" in overlays, overlays; assert all(p==\"/etc/ssl\" or Path(p).parent==Path(\"/\") for p in overlays), overlays; assert not overlays.intersection({\"/etc\", \"/usr\", \"/tmp\", \"/readonly\"}), overlays"
 test "$(cat modify)" = lower
 printf upper >modify

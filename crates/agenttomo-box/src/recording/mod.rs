@@ -123,8 +123,9 @@ impl Recording {
     }
 
     pub async fn finish(&mut self) -> io::Result<()> {
-        self.flush().await?;
-        self.events.finish().await
+        let output = self.flush().await;
+        let events = self.events.finish().await;
+        output.and(events)
     }
 
     pub async fn root_exit(&mut self, code: u8) -> io::Result<()> {

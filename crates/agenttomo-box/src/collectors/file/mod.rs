@@ -7,7 +7,6 @@ use crate::syscall::{Call, memory, result_fields};
 use crate::timing::OperationTiming;
 use nix::libc;
 use serde_json::{Value, json};
-use std::path::PathBuf;
 
 pub const SYSCALLS: &[(i64, &str)] = &[
     #[cfg(target_arch = "x86_64")]
@@ -86,7 +85,7 @@ pub fn enter(call: &Call) -> Option<Attempt> {
         }
     } else if name == "creat" {
         data["flags"] = (libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC).into();
-        data["mode"] = call.args[1].into();
+        data["mode"] = (call.args[1] as u32).into();
     } else {
         let flags = call.args[1 + usize::from(at)] as i32;
         data["flags"] = flags.into();
@@ -105,12 +104,6 @@ impl Attempt {
     pub fn finish(mut self, result: i64, capture: bool) -> Opened {
         result_fields(&mut self.data, result);
         self.timing.complete(&mut self.data);
-        if result >= 0
-            && let Ok(path) =
-                std::fs::read_link(PathBuf::from(format!("/proc/{}/fd/{result}", self.handle)))
-        {
-            self.data["resolved_path"] = path.to_string_lossy().into_owned().into();
-        }
         let content = preview::pin(self.handle, result, capture, &mut self.data);
         Opened {
             data: self.data,

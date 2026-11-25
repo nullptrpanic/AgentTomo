@@ -39,6 +39,7 @@ pub struct Store {
     file: Option<File>,
     limits: Limits,
     used: u64,
+    last_partial: Option<usize>,
     failed: bool,
     exclude_task_trust: bool,
     excluded_paths: Vec<PathBuf>,
@@ -62,6 +63,7 @@ impl Store {
             },
             limits,
             used: 0,
+            last_partial: None,
             failed: false,
             exclude_task_trust,
             excluded_paths,
@@ -74,7 +76,15 @@ impl Store {
 
     pub async fn capture(&mut self, opened: Opened) -> Value {
         let Opened { mut data, content } = opened;
-        if data["resolved_path"].as_str().is_some_and(|path| {
+        let path = data["resolved_path"]
+            .as_str()
+            .map(|path| path.strip_suffix(" (deleted)").unwrap_or(path));
+        if path.is_none() && content.is_some() {
+            data["preview"] =
+                json!({"status":"unavailable","source":"open_snapshot","reason":"unresolved_path"});
+            return data;
+        }
+        if path.is_some_and(|path| {
             self.excluded_paths
                 .iter()
                 .any(|excluded| Path::new(path).starts_with(excluded))
@@ -82,10 +92,7 @@ impl Store {
             data["preview"] = json!({"status":"unavailable","source":"open_snapshot","reason":"agent_private_state"});
             return data;
         }
-        if self.exclude_task_trust
-            && self.limits.enabled()
-            && data["resolved_path"].as_str().is_some_and(trust_material)
-        {
+        if self.exclude_task_trust && self.limits.enabled() && path.is_some_and(trust_material) {
             data["preview"] = json!({
                 "status": "unavailable", "source": "open_snapshot", "reason": "task_trust_material"
             });
@@ -137,17 +144,30 @@ impl Store {
         };
         let mut truncated = bytes.len() > limit;
         bytes.truncate(limit);
-        let offset = if let Some(offset) = self.snapshots.get(bytes.as_slice()) {
-            preview["reused"] = true.into();
-            offset
-        } else {
-            if remaining == 0 && !bytes.is_empty() {
+        let mut reused = self.snapshots.get(bytes.as_slice());
+        if reused.is_none() && bytes.len() as u64 > remaining {
+            // Once the budget is exhausted the last partial snapshot may still
+            // cover the exact same prefix. Only reuse verified stored bytes.
+            limit = if remaining > 0 {
+                remaining as usize
+            } else {
+                self.last_partial.unwrap_or(0)
+            };
+            if limit > 0 && bytes.len() >= limit {
+                bytes.truncate(limit);
+                reused = self.snapshots.get(bytes.as_slice());
+            }
+            if remaining == 0 && reused.is_none() {
                 preview["reason"] = "budget_exhausted".into();
                 return data;
             }
-            limit = remaining.min(limit as u64) as usize;
-            truncated |= bytes.len() > limit;
-            bytes.truncate(limit);
+            truncated = true;
+        }
+        let captured = bytes.len();
+        let offset = if let Some(offset) = reused {
+            preview["reused"] = true.into();
+            offset
+        } else {
             let file = self.file.as_mut().expect("enabled snapshot store");
             let result = async {
                 file.write_all(&bytes).await?;
@@ -162,12 +182,18 @@ impl Store {
             }
             let offset = self.used;
             self.used += bytes.len() as u64;
-            self.snapshots.insert(bytes.clone(), offset);
+            if truncated
+                && self.used == self.limits.total_bytes
+                && captured < self.limits.max_bytes as usize
+            {
+                self.last_partial = Some(captured);
+            }
+            self.snapshots.insert(bytes, offset);
             offset
         };
         preview["status"] = if truncated { "truncated" } else { "complete" }.into();
         preview["offset"] = offset.into();
-        preview["captured_bytes"] = bytes.len().into();
+        preview["captured_bytes"] = captured.into();
         preview["limit_bytes"] = limit.into();
         preview["captured_unix_ns"] = json!(
             SystemTime::now()
@@ -269,6 +295,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unresolvable_and_deleted_trust_files_do_not_read_content() {
+        let dir = Directory::new();
+        let mut store = Store::create(&dir.0, Limits::default(), true, Vec::new())
+            .await
+            .unwrap();
+        let file = dir.0.join("fixture");
+        std::fs::write(&file, b"test data").unwrap();
+        for (name, reason) in [
+            (Value::Null, "unresolved_path"),
+            (
+                json!("/home/test/.pki/nssdb/cert9.db-journal (deleted)"),
+                "task_trust_material",
+            ),
+        ] {
+            let event = store
+                .capture(Opened {
+                    data: json!({"resolved_path":name}),
+                    content: Some(std::fs::File::open(&file).unwrap()),
+                })
+                .await;
+            assert_eq!(event["preview"]["reason"], reason);
+        }
+        assert_eq!(store.used, 0);
+    }
+
+    #[tokio::test]
     async fn repeated_content_preserves_budget_and_changed_content_gets_a_new_snapshot() {
         let dir = Directory::new();
         let mut store = Store::create(
@@ -323,6 +375,10 @@ mod tests {
         let partial = dir.capture(&mut store, b"efgh").await;
         assert_eq!(partial["captured_bytes"], 2);
         assert_eq!(partial["limit_reason"], "run_budget");
+        let repeated = dir.capture(&mut store, b"efgh").await;
+        assert_eq!(repeated["offset"], partial["offset"]);
+        assert_eq!(repeated["captured_bytes"], 2);
+        assert_eq!(repeated["reused"], true);
         let empty = dir.capture(&mut store, b"").await;
         assert_eq!(empty["status"], "complete");
         assert_eq!(empty["captured_bytes"], 0);

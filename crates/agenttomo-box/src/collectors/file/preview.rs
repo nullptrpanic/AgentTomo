@@ -11,10 +11,27 @@ use std::{
 
 pub fn pin(pid: Pid, fd: i64, enabled: bool, data: &mut Value) -> Option<File> {
     data["preview"] = json!({"status":"unavailable", "source":"open_snapshot"});
+    let pin = (fd >= 0)
+        .then(|| {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+                .open(format!("/proc/{pid}/fd/{fd}"))
+                .ok()
+        })
+        .flatten();
+    let resolved = pin
+        .as_ref()
+        .and_then(|file| std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok());
+    if let Some(path) = &resolved {
+        data["resolved_path"] = path.to_string_lossy().into_owned().into();
+    }
     let reason = if fd < 0 {
         Some("open_failed")
     } else if !enabled {
         Some("disabled")
+    } else if resolved.is_none() {
+        Some("unresolved_path")
     } else if data["flags"].as_i64().is_none() {
         Some("unknown_flags")
     } else if data["flags"].as_i64().unwrap() & i64::from(libc::O_PATH) != 0 {
@@ -30,7 +47,7 @@ pub fn pin(pid: Pid, fd: i64, enabled: bool, data: &mut Value) -> Option<File> {
         data["preview"]["reason"] = reason.into();
         return None;
     }
-    match open(pid, fd, &mut data["preview"]) {
+    match read_handle(pin.as_ref()?, &mut data["preview"]) {
         Ok(file) => Some(file),
         Err(error) => {
             if data["preview"]["reason"].is_null() {
@@ -40,16 +57,6 @@ pub fn pin(pid: Pid, fd: i64, enabled: bool, data: &mut Value) -> Option<File> {
             None
         }
     }
-}
-
-fn open(pid: Pid, fd: i64, preview: &mut Value) -> io::Result<File> {
-    // O_PATH can inspect a FIFO/device without opening it for I/O. Keep the pin
-    // alive until the independent read handle has been opened through our FD.
-    let pin = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-        .open(format!("/proc/{pid}/fd/{fd}"))?;
-    read_handle(&pin, preview)
 }
 
 pub(super) fn read_handle(pin: &File, preview: &mut Value) -> io::Result<File> {
