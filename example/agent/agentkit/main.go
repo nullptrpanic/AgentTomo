@@ -24,7 +24,7 @@ import (
 )
 
 func main() {
-	host := flag.String("host", "0.0.0.0", "HTTP listen host")
+	host := flag.String("host", "127.0.0.1", "HTTP listen host")
 	port := flag.Int("port", 8000, "HTTP listen port")
 	flag.Parse()
 

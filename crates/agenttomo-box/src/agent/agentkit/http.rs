@@ -36,7 +36,7 @@ impl Session {
     }
 
     async fn post(&self, path: &str, body: Bytes) -> io::Result<Response<Incoming>> {
-        let socket = TcpStream::connect(self.address).await?;
+        let socket = timeout(Duration::from_secs(10), TcpStream::connect(self.address)).await??;
         // A server can exit between turns. Verify ownership after connecting,
         // before writing to a socket that the sandbox gateway may have accepted.
         if !self.listening().await? {
@@ -57,7 +57,9 @@ impl Session {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Full::new(body))
             .map_err(io::Error::other)?;
-        let response = tx.send_request(request).await.map_err(io::Error::other)?;
+        let response = timeout(Duration::from_secs(120), tx.send_request(request))
+            .await?
+            .map_err(io::Error::other)?;
         if !response.status().is_success() {
             return Err(io::Error::other(format!(
                 "AgentKit {path} returned HTTP {}",
@@ -110,11 +112,13 @@ impl Session {
         })??;
         let path = format!("/apps/agentkit/users/local/sessions/{}", self.id);
         let response = self.post(&path, Bytes::new()).await?;
-        let bytes = Limited::new(response.into_body(), 64 * 1024)
-            .collect()
-            .await
-            .map_err(io::Error::other)?
-            .to_bytes();
+        let bytes = timeout(
+            Duration::from_secs(20),
+            Limited::new(response.into_body(), 64 * 1024).collect(),
+        )
+        .await?
+        .map_err(io::Error::other)?
+        .to_bytes();
         let session: Value = serde_json::from_slice(&bytes)?;
         if session["id"] != self.id {
             return Err(io::Error::other(
@@ -144,7 +148,7 @@ impl Session {
         let mut body = response.into_body();
         let mut parser = sse_parse::SseParser::new().max_buffer(crate::agent::MAX_CONTENT);
         let mut answered = false;
-        while let Some(frame) = body.frame().await {
+        while let Some(frame) = timeout(Duration::from_secs(120), body.frame()).await? {
             if let Ok(data) = frame.map_err(io::Error::other)?.into_data() {
                 parser.feed(&data);
                 if parser.overflows() > 0 {
@@ -167,7 +171,9 @@ impl Session {
 pub(super) fn final_text(kind: &str, data: &str) -> io::Result<bool> {
     let event: Value = serde_json::from_str(data)?;
     if kind == "error"
-        || event.get("error").is_some()
+        || event
+            .get("error")
+            .is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|s| !s.is_empty()))
         || event["errorCode"].as_str().is_some_and(|v| !v.is_empty())
     {
         // Ark errors may include the upstream body. Only expose the HTTP status.

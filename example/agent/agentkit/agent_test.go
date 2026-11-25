@@ -26,7 +26,7 @@ var modelResponse string
 func TestAgentStreamsOverHTTP(t *testing.T) {
 	if port := os.Getenv("AGENTKIT_TEST_CHILD_PORT"); port != "" {
 		flag.CommandLine = flag.NewFlagSet("agentkit", flag.ExitOnError)
-		os.Args = []string{"agentkit", "-host", "127.0.0.1", "-port", port}
+		os.Args = []string{"agentkit", "-port", port}
 		main()
 		return
 	}
@@ -61,7 +61,7 @@ func TestAgentStreamsOverHTTP(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		last := call.Messages[len(call.Messages)-1]
 		if last.Role != "tool" {
-			args, _ := json.Marshal(map[string]string{"command": "printf sandbox-tool > proof.txt; cat proof.txt"})
+			args, _ := json.Marshal(map[string]string{"command": `sleep 5 & test -z "${MODEL_AGENT_API_KEY+x}${OPENAI_API_KEY+x}${ARK_API_KEY+x}" && printf sandbox-tool > proof.txt && cat proof.txt`})
 			chunk, _ := json.Marshal(map[string]any{
 				"id": "tool-round", "object": "chat.completion.chunk", "model": "fixture-model",
 				"choices": []any{map[string]any{"index": 0, "finish_reason": "tool_calls", "delta": map[string]any{
@@ -75,10 +75,11 @@ func TestAgentStreamsOverHTTP(t *testing.T) {
 		var content string
 		var result struct {
 			Output   string
-			ExitCode int `json:"exit_code"`
+			ExitCode int    `json:"exit_code"`
+			Error    string `json:"error"`
 		}
 		if json.Unmarshal(last.Content, &content) != nil || json.Unmarshal([]byte(content), &result) != nil ||
-			last.ToolCallID != "fixture-exec" || result.Output != "sandbox-tool" || result.ExitCode != 0 {
+			last.ToolCallID != "fixture-exec" || result.Output != "sandbox-tool" || result.ExitCode != 0 || result.Error != "" {
 			t.Errorf("incorrect command return: %s", last.Content)
 		}
 		if proof, err := os.ReadFile(workspace + "/proof.txt"); err != nil || string(proof) != "sandbox-tool" {
@@ -105,6 +106,12 @@ func TestAgentStreamsOverHTTP(t *testing.T) {
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// An independent service can use the same port on another loopback address.
+	other, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.2", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
 	child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAgentStreamsOverHTTP$")
 	child.Dir = workspace
 	child.Env = append(os.Environ(), "AGENTKIT_TEST_CHILD_PORT="+port, "MODEL_AGENT_PROVIDER=ark", "MODEL_AGENT_NAME=fixture-model",
@@ -187,5 +194,14 @@ func TestAgentStreamsOverHTTP(t *testing.T) {
 	}
 	if lines.Err() != nil || partial != "已记住。\n青竹" || final != partial {
 		t.Fatalf("incomplete stream: partial %q, final %q, error %v", partial, final, lines.Err())
+	}
+}
+
+func TestCommandOutputKeepsOnlyBoundedPrefix(t *testing.T) {
+	var dst commandOutput
+	input := bytes.Repeat([]byte("a"), commandOutputLimit+37)
+	n, err := io.Copy(&dst, bytes.NewReader(input))
+	if err != nil || n != int64(len(input)) || !dst.truncated || dst.buffer.Len() != commandOutputLimit {
+		t.Fatalf("copied %d, retained %d, truncated %v, error %v", n, dst.buffer.Len(), dst.truncated, err)
 	}
 }

@@ -1,6 +1,6 @@
 # AgentTomo 的火山 AgentKit Go 服务
 
-项目从火山 AgentKit CLI 0.9.2 的 `basic_go` 模板生成。Go 入口使用 VeADK Go v2 的 `AgentkitServerApp`，由 SDK 管理会话、工具循环和 `POST /run_sse` 流式输出。Agent 通过官方 `functiontool` 注册一个 `exec_command` 工具，用于在当前沙箱执行命令和读写文件，返回输出与退出码。单次命令最长运行 60 秒。Playground 在每个沙箱内启动回环 HTTP 服务，宿主负责转发模型凭据。[官方 Go 模板](https://github.com/volcengine/agentkit-sdk-python/blob/v0.9.2/agentkit/toolkit/resources/samples/veadk_go_basic/main.go) · [官方 Go 服务](https://github.com/volcengine/veadk-go/blob/v2.0.0/examples/apps/agentkit_server_app/main.go)
+项目从火山 AgentKit CLI 0.9.2 的 `basic_go` 模板生成。Go 入口使用 VeADK Go v2 的 `AgentkitServerApp`，由 SDK 管理会话、工具循环和 `POST /run_sse` 流式输出。Agent 通过官方 `functiontool` 注册一个 `exec_command` 工具，用于在当前沙箱执行命令和读写文件，返回输出与退出码。单次命令最长运行 60 秒。工具保留前 1 MiB 合并输出，超出时返回 `output_truncated: true`，命令结束后清理同进程组的后台子进程。Playground 在每个沙箱内启动回环 HTTP 服务，宿主负责转发模型凭据。[官方 Go 模板](https://github.com/volcengine/agentkit-sdk-python/blob/v0.9.2/agentkit/toolkit/resources/samples/veadk_go_basic/main.go) · [官方 Go 服务](https://github.com/volcengine/veadk-go/blob/v2.0.0/examples/apps/agentkit_server_app/main.go)
 
 生成原始模板时，在空目录运行以下命令。项目将模板的服务入口换成了支持 SSE 的官方 v2 入口。`agentkit.yaml` 使用本地模式。CLI 0.9.2 的 `language_version` 只接受 Go 1.24，实际构建镜像通过 `docker_build.base_image.builder` 指定为 Go 1.26.5，与 `go.mod` 的最低版本一致。[CLI 配置定义](https://github.com/volcengine/agentkit-sdk-python/blob/v0.9.2/agentkit/toolkit/config/config.py) · [构建镜像配置](https://volcengine.github.io/agentkit-sdk-python/content/2.agentkit-cli/3.configurations.html#base-image)
 
@@ -25,10 +25,10 @@ export GOPATH=/home/openclaw/code/go
 
 ## 本地调用
 
-准备好模型配置后，在两个终端里分别启动服务和发送请求。
+准备好模型配置后，在两个终端里分别启动服务和发送请求。服务默认监听本机回环地址。需要从其他主机访问时，可用 `-host` 显式指定监听地址。
 
 ```bash
-example/agent/agentkit/dist/agenttomo-agentkit -host 127.0.0.1 -port 8000
+example/agent/agentkit/dist/agenttomo-agentkit -port 8000
 ```
 
 ```bash

@@ -15,9 +15,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"os"
 	"os/exec"
+	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	veagent "github.com/volcengine/veadk-go/v2/agent/llmagent"
 	"google.golang.org/adk/v2/agent"
@@ -63,13 +69,63 @@ type commandArgs struct {
 	Command string `json:"command" jsonschema:"Shell command to execute in the current sandbox."`
 }
 
+const commandOutputLimit = 1 << 20
+
+type commandOutput struct {
+	buffer    bytes.Buffer
+	truncated bool
+}
+
+func (b *commandOutput) Write(data []byte) (int, error) {
+	keep := min(len(data), commandOutputLimit-b.buffer.Len())
+	b.buffer.Write(data[:keep])
+	b.truncated = b.truncated || keep < len(data)
+	return len(data), nil
+}
+
 func runCommand(ctx agent.Context, args commandArgs) (map[string]any, error) {
 	ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctxWithTimeout, "/bin/bash", "-c", args.Command)
+	cmd.SysProcAttr = &unix.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
+		if errors.Is(err, unix.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.Env = []string{}
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		switch name {
+		case "MODEL_AGENT_API_KEY", "OPENAI_API_KEY", "ARK_API_KEY":
+			continue
+		}
+		cmd.Env = append(cmd.Env, entry)
+	}
 	cmd.WaitDelay = time.Second
-	output, err := cmd.CombinedOutput()
-	result := map[string]any{"output": string(output), "exit_code": -1}
+	var output commandOutput
+	cmd.Stdout, cmd.Stderr = &output, &output
+	err := cmd.Start()
+	if err == nil {
+		// Observe exit without reaping the group leader. Its PID cannot be
+		// reused while we stop background children and release their pipes.
+		var info unix.Siginfo
+		var waitErr error
+		for {
+			waitErr = unix.Waitid(unix.P_PID, cmd.Process.Pid, &info, unix.WEXITED|unix.WNOWAIT, nil)
+			if !errors.Is(waitErr, unix.EINTR) {
+				break
+			}
+		}
+		_ = cmd.Cancel()
+		err = errors.Join(waitErr, cmd.Wait())
+	}
+	result := map[string]any{"output": output.buffer.String(), "exit_code": -1}
+	if output.truncated {
+		result["output_truncated"] = true
+	}
 	if cmd.ProcessState != nil {
 		result["exit_code"] = cmd.ProcessState.ExitCode()
 	}

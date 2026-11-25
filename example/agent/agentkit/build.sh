@@ -33,10 +33,10 @@ mkdir -p "${OUTPUT_DIR}"
 if [ -f go.mod ]; then
   echo "Building module-aware: ENTRY='${ENTRY}' BIN='${BIN_NAME}'"
   export GOPROXY=${GOPROXY:-https://goproxy.cn}
-  CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o "${OUTPUT_DIR}/${BIN_NAME}" ${ENTRY}
 else
   echo "No go.mod found, using standard go build: ENTRY='${ENTRY}' BIN='${BIN_NAME}'"
-  CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o "${OUTPUT_DIR}/${BIN_NAME}" ${ENTRY}
 fi
+
+CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o "${OUTPUT_DIR}/${BIN_NAME}" "${ENTRY}"
 
 echo "Built ${OUTPUT_DIR}/${BIN_NAME}"

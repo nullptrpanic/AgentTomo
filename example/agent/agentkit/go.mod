@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/volcengine/veadk-go/v2 v2.0.0
+	golang.org/x/sys v0.45.0
 	google.golang.org/adk/v2 v2.1.0
 )
 
@@ -93,7 +94,6 @@ require (
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	google.golang.org/api v0.279.0 // indirect
 	google.golang.org/genai v1.63.0 // indirect
