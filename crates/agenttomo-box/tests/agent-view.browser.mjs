@@ -96,7 +96,7 @@ try {
     add("file.open",{pid:40,process_instance_id:9,path:"/tmp/first",agent});
     view.render();
   });
-  for (const id of ["task-task","tool","pid-9"]) assert.equal(await page.locator(`[data-agent-node="${id}"] > .agent-card`).evaluate(node=>node.classList.contains("has-activity")),true,`${id} receives descendant activity`);
+  for (const id of ["task-task","tool","pid-9-task-tool"]) assert.equal(await page.locator(`[data-agent-node="${id}"] > .agent-card`).evaluate(node=>node.classList.contains("has-activity")),true,`${id} receives descendant activity`);
   // A live refresh between pointer-down/up must not discard the pressed node.
   const taskToggle = page.locator('[data-agent-node="task-task"] > .agent-card > .agent-fold');
   await page.evaluate(() => document.querySelector('#detail').hidden=true);
@@ -119,7 +119,7 @@ try {
   const round = page.locator('[data-agent-node="round-2"]');
   assert.equal(await round.locator(':scope > .agent-card strong').textContent(),"Model call 1");
   assert.deepEqual(await round.locator(':scope > .agent-children > .agent-branch').evaluateAll(nodes=>nodes.map(node=>node.dataset.agentNode)),["message-before","tool","message-after"],"messages and tools share chronological order");
-  assert.deepEqual(await page.locator('[data-agent-node="task-task"] > .agent-children > .agent-branch').evaluateAll(nodes=>nodes.map(node=>node.dataset.agentNode)),["pid-8","round-2"],"runtime processes are interleaved with model calls by start time");
+  assert.deepEqual(await page.locator('[data-agent-node="task-task"] > .agent-children > .agent-branch').evaluateAll(nodes=>nodes.map(node=>node.dataset.agentNode)),["pid-8-task","round-2"],"runtime processes are interleaved with model calls by start time");
   await round.locator(':scope > .agent-card > .agent-node-inspect').click();
   assert.equal(await page.locator('#detail .agent-content-section').count(),2);
   await page.locator('#detail .agent-content-section > summary').first().click();

@@ -8,6 +8,7 @@ use std::os::unix::process::CommandExt;
 
 pub fn exec(
     command: &OsStr,
+    trust_ca: bool,
     trust_overlay: Option<&std::path::Path>,
     root_session: bool,
     root_overlay: Option<&std::path::Path>,
@@ -22,7 +23,8 @@ pub fn exec(
         let _ = write!(control, "Esetting close-on-exec on control socket: {error}");
         return 125;
     }
-    let ca = if trust_overlay.is_some() {
+    let inject_trust = trust_ca || trust_overlay.is_some();
+    let ca = if inject_trust {
         match super::trust::receive(&mut control) {
             Ok(ca) => ca,
             Err(error) => {
@@ -37,7 +39,7 @@ pub fn exec(
         if rootfs.enabled {
             let directory = root_overlay
                 .ok_or_else(|| std::io::Error::other("root overlay storage is missing"))?;
-            let private_paths = if trust_overlay.is_some() {
+            let private_paths = if inject_trust {
                 super::trust::PRIVATE_PATHS
                     .iter()
                     .map(std::path::Path::new)
@@ -47,10 +49,12 @@ pub fn exec(
             };
             super::rootfs::install(directory, rootfs, &private_paths)?;
         }
-        if let Some(directory) = trust_overlay {
+        if inject_trust {
             if rootfs.enabled {
                 super::trust::inject(std::path::Path::new("/etc/ssl/certs"), &ca)?;
             } else {
+                let directory = trust_overlay
+                    .ok_or_else(|| std::io::Error::other("trust overlay mountpoint is missing"))?;
                 super::trust::install(directory, &ca)?;
             }
         }

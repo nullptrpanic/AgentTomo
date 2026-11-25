@@ -54,3 +54,14 @@ test("exec preserves the process identity and duration without thread concepts",
   assert.equal(nodes[0].exit,'exit 7');
   assert.equal(nodes[0].events[1].description,'before → after');
 });
+
+test("reparenting prunes an empty exited previous parent", () => {
+  const tree = new ProcessTree(2);
+  const add = feed(tree);
+  add("process.fork", { pid: 10, parent_pid: 10, process_instance_id: 1, child_pid: 11, child_process_instance_id: 2 });
+  add("process.exit", { pid: 10, process_instance_id: 1, exit_code: 0 });
+  add("process.exec", { pid: 20, process_instance_id: 3, argv: ["new-parent"] });
+  add("process.fork", { pid: 20, parent_pid: 20, process_instance_id: 3, child_pid: 11, child_process_instance_id: 2 });
+  assert.equal(tree.byInstance.has(1), false);
+  assert.equal(tree.byInstance.get(2).parentId, tree.byInstance.get(3).id);
+});

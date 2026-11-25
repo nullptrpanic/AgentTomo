@@ -351,3 +351,15 @@ test("new descendant behavior marks ancestor activity without reopening or reviv
   assert.ok(tree.byTask.get(1).activity > before);
   assert.equal(tree.byTask.get(1).activity, tree.byTask.get(2).activity);
 });
+
+test("reparenting prevents cycles and prunes abandoned empty ancestors", () => {
+  const tree = new ProcessTree(2);
+  const add = feed(tree);
+  add("process.fork", { pid: 10, parent_tid: 10, child_pid: 11, child_tid: 11, task_id: 1, child_task_id: 2 });
+  add("process.exit", { pid: 10, tid: 10, task_id: 1, exit_code: 0 });
+  add("process.fork", { pid: 11, parent_tid: 11, child_pid: 10, child_tid: 10, task_id: 2, child_task_id: 1 });
+  assert.equal(tree.byTask.get(1).parentId, null, "cycle reparenting must be rejected");
+  add("process.exec", { pid: 20, tid: 20, task_id: 3, argv: ["new-parent"] });
+  add("process.fork", { pid: 20, parent_tid: 20, child_pid: 11, child_tid: 11, task_id: 3, child_task_id: 2 });
+  assert.equal(tree.byTask.has(1), false, "empty exited old parent should be pruned after reparenting");
+});

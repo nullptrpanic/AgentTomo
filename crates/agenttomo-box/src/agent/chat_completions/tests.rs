@@ -179,3 +179,28 @@ fn json_completion_and_usage_only_sse_both_deliver_the_final_message() {
     );
     assert_eq!(events.last().unwrap().data["status"], "completed");
 }
+
+#[test]
+fn empty_trailing_id_and_http_200_error_body_complete_cleanly() {
+    let mut sse = observer(&Hub::default(), "empty-id");
+    for chunk in [
+        json!({"id":"s1","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}),
+        json!({"id":"","choices":null,"usage":{"total_tokens":5}}),
+    ] {
+        assert!(
+            !sse.event(&chunk.to_string())
+                .iter()
+                .any(|e| e.kind == "agent.capture.error")
+        );
+    }
+    let done = sse.event("[DONE]");
+    assert_eq!(done.last().unwrap().data["status"], "completed");
+
+    let mut decoder = ChatCompletions.decoder();
+    let failed = decoder
+        .http_response(StatusCode::OK, br#"{"error":{"message":"rate limit"}}"#)
+        .unwrap();
+    assert_eq!(failed[0].kind, "agent.capture.error");
+    assert_eq!(failed[1].kind, "agent.model.complete");
+    assert_eq!(failed[1].data["status"], "failed");
+}

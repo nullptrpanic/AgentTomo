@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 
-use super::{App, bridge, desktop, docker, sandbox, trace_feed};
+use super::{App, bridge, docker, sandbox, trace_feed};
 use crate::execution::protocol::{self, Input, Message};
 
 pub enum Frame {
@@ -50,7 +50,7 @@ pub async fn serve(
             None => Default::default(),
         };
         let agent = installation.as_ref().map(|installation| installation.adapter());
-        let metadata = json!({"session_id":id,"container":name,"image":app.settings.image,"browser":app.settings.browser,"http_capture":app.settings.http.enabled,"agent_available":agent.is_some(),"agent":agent.map(|adapter| adapter.metadata())});
+        let metadata = json!({"session_id":id,"container":name,"image":app.settings.image,"http_capture":app.settings.http.enabled,"agent_available":agent.is_some(),"agent":agent.map(|adapter| adapter.metadata())});
         let bootstrap = sandbox::Bootstrap {
             metadata,
             agent,
@@ -60,7 +60,7 @@ pub async fn serve(
         };
         socket
             .send(WsMessage::Text(
-                json!({"type":"session","id":id,"container":name,"image":app.settings.image,"http_capture":app.settings.http.enabled,"browser":app.settings.browser,"agent_available":agent.is_some(),"agent":agent.map(|adapter| adapter.metadata())})
+                json!({"type":"session","id":id,"container":name,"image":app.settings.image,"http_capture":app.settings.http.enabled,"agent_available":agent.is_some(),"agent":agent.map(|adapter| adapter.metadata())})
                     .to_string()
                     .into(),
             ))
@@ -79,7 +79,6 @@ pub async fn serve(
             tmpfs_size_mib: app.settings.session_tmpfs_size_mib,
             preview_limits: app.settings.file_preview,
             http: app.settings.http,
-            browser: app.settings.browser,
             rootfs: &app.settings.rootfs,
             agent: installation.as_deref(),
             agent_id: &id,
@@ -92,19 +91,20 @@ pub async fn serve(
     }
     .await;
 
-    if let Some(lifetime) = app.desktops.lock().expect("desktop registry").remove(&id) {
-        lifetime.close();
-    }
     if let Some(gateway) = &app.settings.credential_gateway {
         gateway.remove(&name);
     }
     app.proxy_peers.remove(&name);
-    app.bridges
+    if let Some(client) = app
+        .bridges
         .as_ref()
         .unwrap()
         .lock()
         .expect("read channel registry")
-        .remove(&id);
+        .remove(&id)
+    {
+        app.remember_ended_viewer(id.clone(), client.viewer().to_owned());
+    }
     let cleanup = if create_attempted {
         docker::remove(&name).await
     } else {
@@ -188,18 +188,8 @@ async fn drive(
     let source = async {
         let worker = async {
             let mut connected = Some(connected);
-            let mut desktop: Option<tokio::process::Child> = None;
             loop {
-                let result = tokio::select! {
-                    result = protocol::receive(&mut output) => result,
-                    status = async {
-                        match &mut desktop {
-                            Some(child) => child.wait().await,
-                            None => std::future::pending().await,
-                        }
-                    } => return Err(io::Error::other(format!("desktop exited unexpectedly: {}", status?))),
-                };
-                let message = match result {
+                let message = match protocol::receive(&mut output).await {
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                     result => result?,
                 };
@@ -224,13 +214,6 @@ async fn drive(
                             .lock()
                             .expect("session registry")
                             .insert(id.to_owned(), Some(pid));
-                        if app.settings.browser {
-                            desktop = Some(desktop::start(name).await?);
-                            app.desktops.lock().expect("desktop registry").insert(
-                                id.to_owned(),
-                                desktop::Display::new(app.shutdown.child_token()),
-                            );
-                        }
                         Frame::Json(json!({"type":"ready","pid":pid,"monitor_token":viewer}))
                     }
                     Message::Stdout(bytes) | Message::Stderr(bytes) => Frame::Bytes(bytes),

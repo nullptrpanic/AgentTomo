@@ -77,8 +77,8 @@ pub fn new_marker() -> String {
 
 pub async fn prepare(id: &str, task_id: &str, marker: Option<String>) -> io::Result<Run> {
     let mut run = prepare_in(Path::new("/home"), id, task_id, marker).await?;
-    // /home is an existing whole-directory overlay, unlike /tmp which may be
-    // exempted for Chrome. Never add mounts or privileges just for an example.
+    // /home is an existing whole-directory overlay. Never add mounts or
+    // privileges just for an example.
     let mounts = tokio::fs::read_to_string("/proc/self/mountinfo").await?;
     run.overlay = mounts.lines().any(|line| {
         line.split_whitespace().nth(4) == Some("/home")
@@ -208,7 +208,7 @@ async fn open_evidence(path: &Path) -> io::Result<tokio::fs::File> {
             let flags = if parts.peek().is_some() {
                 OFlag::O_PATH | OFlag::O_DIRECTORY
             } else {
-                OFlag::O_RDONLY | OFlag::O_NONBLOCK
+                OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOCTTY
             };
             file = openat(
                 &file,

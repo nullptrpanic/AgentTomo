@@ -6,7 +6,8 @@ pub(super) fn feed(
     bytes: &[u8],
     emit: &mut impl FnMut(&[u8]),
 ) -> Result<(), String> {
-    let (consumed, _) = chunk(decoder, bytes, emit)?;
+    let mut produced = 0;
+    let (consumed, _) = chunk(decoder, bytes, &mut produced, emit)?;
     if consumed != bytes.len() {
         return Err("unexpected trailing compressed data".into());
     }
@@ -16,12 +17,12 @@ pub(super) fn feed(
 pub(super) fn chunk(
     decoder: &mut Decompress,
     input: &[u8],
+    produced: &mut usize,
     emit: &mut impl FnMut(&[u8]),
 ) -> Result<(usize, bool), String> {
     let mut bytes = input;
     let mut output = [0; 8192];
-    // Bound work for a single input chunk, including a decompression bomb.
-    let mut produced = 0;
+    // Bound work across the entire input chunk, including concatenated members.
     loop {
         let before_in = decoder.total_in();
         let before_out = decoder.total_out();
@@ -30,8 +31,8 @@ pub(super) fn chunk(
             .map_err(|error| error.to_string())?;
         let consumed = (decoder.total_in() - before_in) as usize;
         let count = (decoder.total_out() - before_out) as usize;
-        produced += count;
-        if produced > 8 * 1024 * 1024 {
+        *produced += count;
+        if *produced > 8 * 1024 * 1024 {
             return Err("decompression work limit exceeded; forwarding continues".into());
         }
         emit(&output[..count]);
@@ -83,7 +84,9 @@ impl SseDecoder {
                 *decoder = Decompress::new_gzip(15);
             }
             let (read, complete) = match self {
-                Self::Gzip(decoder) | Self::Deflate(decoder) => chunk(decoder, bytes, &mut emit)?,
+                Self::Gzip(decoder) | Self::Deflate(decoder) => {
+                    chunk(decoder, bytes, &mut produced, &mut emit)?
+                }
                 Self::Zstd(decoder) => {
                     use zstd::stream::raw::Operation;
                     let mut output = [0; 8192];
@@ -149,5 +152,20 @@ mod tests {
             assert!(ended);
             assert_eq!(values, b"data: first\n\ndata: second\n\n");
         }
+    }
+
+    #[test]
+    fn concatenated_gzip_members_share_one_decompression_budget() {
+        let mut out = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        out.write_all(&vec![b'a'; 256 * 1024]).unwrap();
+        let member = out.finish().unwrap();
+        let mut wire = Vec::new();
+        for _ in 0..33 {
+            wire.extend_from_slice(&member);
+        }
+        let mut decoder = SseDecoder::new(ContentEncoding::Gzip).unwrap().unwrap();
+        let mut ended = false;
+        let err = decoder.feed(&wire, &mut ended, |_| {}).unwrap_err();
+        assert!(err.contains("limit"), "{err}");
     }
 }

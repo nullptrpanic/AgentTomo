@@ -67,7 +67,14 @@ export class LegacyProcessTree {
       // waitpid can report a child exec/exit before its parent's creation stop.
       const observed = this.latest.get(data.child_tid);
       const child = isTid(data.child_task_id) ? this.task(data.child_tid, data.child_task_id) : observed && !observed.birth && !observed.root ? observed : this.task(data.child_tid);
-      if (child !== node) {
+      let ancestor = node;
+      while (ancestor && ancestor !== child) ancestor = this.nodes.get(ancestor.parentId);
+      if (!ancestor) {
+        const previousParent = this.nodes.get(child.parentId);
+        if (previousParent && previousParent !== node) {
+          previousParent.children.delete(child.id);
+          this.prune(previousParent);
+        }
         if (isTid(data.child_pid)) child.pid = data.child_pid;
         child.parentId = node.id;
         child.birth = event.kind.replace("process.", "");

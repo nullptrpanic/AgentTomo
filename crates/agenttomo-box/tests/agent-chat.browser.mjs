@@ -101,17 +101,19 @@ try {
   });
   const pageErrors=[]; page.on("pageerror", error => pageErrors.push(String(error)));
   page.on("websocket", socket => socket.on("framereceived", ({payload}) => { if (typeof payload !== "string") { terminalOutput += Buffer.from(payload).toString(); return; } if (!payload.startsWith("{")) return; const frame=JSON.parse(payload); if (frame.type==="session") session=frame; if (frame.type==="trace") observed.push(frame.event); }));
-  await page.goto(output.match(/http:\/\/\S+/)[0]);
+  const accessUrl = output.match(/http:\/\/\S+/)[0];
+  const accessToken = new URL(accessUrl).searchParams.get("token");
+  await page.goto(accessUrl);
   await until(async () => (await page.locator("#status").textContent()) === "Connected");
   assert.equal(session.agent_available,true,"external Codex discovery");
   assert.equal(session.agent.id,"codex");
   assert.equal(session.agent.name,"Codex");
   assert.equal(session.agent.avatar,">_");
-  const sessionMetadata = await page.evaluate(async id => {
+  const sessionMetadata = await page.evaluate(async ([id, token]) => {
     const url = new URL(`/api/sessions/${id}/events`, location.href);
-    url.searchParams.set("token", new URL(location.href).searchParams.get("token"));
+    url.searchParams.set("token", token);
     return (await (await fetch(url)).json()).session;
-  }, session.id);
+  }, [session.id, accessToken]);
   assert.deepEqual(sessionMetadata.agent,session.agent,"owner and independent monitors share adapter metadata");
   await page.locator("#terminal").click();
   await page.keyboard.type('test -z "$HTTP_PROXY$HTTPS_PROXY$ALL_PROXY$http_proxy$https_proxy$all_proxy" && test "$CODEX_HOME" = /records/codex && codex login status && printf "TERMINAL_AUTH_%s\\n" OK');
@@ -173,7 +175,7 @@ try {
   }
   const preview = observed.find(event => event.kind === "file.open" && event.data.path === "/tmp/agenttomo-chat-evidence.txt" && event.data.preview?.captured_bytes > 0).data.preview;
   const previewURL = new URL(`/api/sessions/${session.id}/file-preview`, page.url());
-  previewURL.search = new URLSearchParams({token:new URL(page.url()).searchParams.get("token"),offset:preview.offset,length:preview.captured_bytes});
+  previewURL.search = new URLSearchParams({token:accessToken,offset:preview.offset,length:preview.captured_bytes});
   const previewResponse = await page.request.get(previewURL.href);
   assert.equal(previewResponse.status(),200);
   assert.equal(await previewResponse.text(),"FILE_EVIDENCE","file snapshots read from the container through the persistent channel");

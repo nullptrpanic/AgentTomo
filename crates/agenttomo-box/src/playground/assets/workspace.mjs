@@ -1,4 +1,3 @@
-import { BrowserView } from "./browser-view.mjs";
 import { resizePanels } from "./panel-resize.mjs";
 
 // Only this entry point may create and own a Docker session.
@@ -32,22 +31,16 @@ export function startWorkspace({ token, agent, onMessage, notice, onView }) {
   let queuedBytes = 0;
   const queuedInput = [];
   const encoder = new TextEncoder();
-  let sessionId = null;
-  let browserEnabled = false;
-  const browser = new BrowserView($("browser-screen"), $("browser-status"), $("browser-reconnect"));
   function workspaceView(name) {
     for (const button of document.querySelectorAll("[data-workspace]")) button.setAttribute("aria-pressed", String(button.dataset.workspace === name));
-    const visible = name === "browser";
     const chat = name === "chat";
     const samples = name === "samples";
-    $("terminal").hidden = visible || chat || samples;
+    $("terminal").hidden = chat || samples;
     $("security-samples").hidden = !samples;
-    $("browser").hidden = !visible;
     $("agent-chat").hidden = !chat;
-    $("terminal-title").textContent = samples ? "Security tests" : chat ? "Agent conversation" : visible ? "Container browser" : "Container terminal";
-    $("workspace-hint").textContent = samples ? "Real Agent · Disposable sample files" : chat ? "Enter to send · Shift-Enter for a new line" : visible ? "Mouse and keyboard control Chrome" : "Ctrl-C to interrupt · Ctrl-D to exit";
-    browser.show(visible);
-    if (!visible && !chat && !samples) { resize(); terminal.focus(); }
+    $("terminal-title").textContent = samples ? "Security tests" : chat ? "Agent conversation" : "Container terminal";
+    $("workspace-hint").textContent = samples ? "Real Agent · Disposable sample files" : chat ? "Enter to send · Shift-Enter for a new line" : "Ctrl-C to interrupt · Ctrl-D to exit";
+    if (!chat && !samples) { resize(); terminal.focus(); }
     onView?.(name);
   }
   for (const button of document.querySelectorAll("[data-workspace]")) button.addEventListener("click", () => workspaceView(button.dataset.workspace));
@@ -107,10 +100,6 @@ export function startWorkspace({ token, agent, onMessage, notice, onView }) {
     onMessage(message);
     switch (message.type) {
       case "session":
-        sessionId = message.id;
-        browserEnabled = Boolean(message.browser);
-        $("browser-tab").hidden = !browserEnabled;
-        if (browserEnabled) workspaceView("browser");
         $("image").textContent = message.image;
         $("session-id").textContent = `session ${message.id.slice(0, 8)}`;
         break;
@@ -118,7 +107,6 @@ export function startWorkspace({ token, agent, onMessage, notice, onView }) {
         acceptingInput = true;
         terminal.options.disableStdin = false;
         resize();
-        if (browserEnabled) browser.start(sessionId, url.searchParams.get("token"));
         if (!$("terminal").hidden) terminal.focus();
         break;
       case "input_ack": sending = false; sendNext(); break;
@@ -127,25 +115,21 @@ export function startWorkspace({ token, agent, onMessage, notice, onView }) {
         break;
       case "complete":
         stopInput();
-        browser.stop();
         break;
       case "error":
         stopInput();
-        browser.stop();
         break;
     }
   };
   socket.onerror = () => {
     stopInput();
-    browser.stop();
     onMessage({ type: "error", message: "Cannot connect. Check the server and open its complete access URL." });
   };
   socket.onclose = () => {
     stopInput();
-    browser.stop();
     onMessage({ type: "disconnected" });
   };
-  window.addEventListener("pagehide", () => { browser.stop(); socket.close(); });
+  window.addEventListener("pagehide", () => { socket.close(); });
   return {
     prompt(task_id, prompt) {
       if (!acceptingInput || socket.readyState !== WebSocket.OPEN) throw new Error("Sandbox is not connected");

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { AgentModel, elapsedTime, isFinalMessage } from "../src/playground/assets/agent-model.mjs";
+import { AgentModel, capturedTime, elapsedTime, isFinalMessage } from "../src/playground/assets/agent-model.mjs";
 
 test("live and interrupted durations stay on the server timeline when browser clocks differ", t => {
   let local = 10_000_000;
@@ -194,4 +194,15 @@ test("one WebSocket transport keeps successive response IDs separate", () => {
   add("agent.tool.call",{response_id:"b",agenttomo_toolcall_id:"tool-b",name:"exec"});
   assert.deepEqual([...model.tasks.get("t").rounds[0].tools.keys()],["tool-a"]);
   assert.deepEqual([...model.tasks.get("t").rounds[1].tools.keys()],["tool-b"]);
+});
+test("null timestamps stay unknown and late started events do not revive finished tasks", () => {
+  assert.equal(Number.isNaN(capturedTime({ observed_unix_ns: null, data: { captured_unix_ns: null } })), true);
+  const model = new AgentModel();
+  model.add({ kind: "agent.task.finished", sequence: 2, observed_unix_ns: null, data: { task_id: "t", exit_code: 0 } });
+  model.add({ kind: "agent.task.started", sequence: 1, observed_unix_ns: null, data: { task_id: "t", prompt: "Late start" } });
+  const task = model.task("t");
+  assert.equal(task.state, "completed");
+  assert.equal(task.prompt, "Late start");
+  assert.equal(model.runningTasks.size, 0);
+  assert.equal(task.clockOffset, undefined);
 });

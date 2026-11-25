@@ -10,7 +10,7 @@ import { SamplesView } from "./samples-view.mjs";
 // Shared by the workspace page and independent read-only monitor pages.
 export function createObservation(token) {
   const $ = id => document.getElementById(id);
-  let sessionId = null, activeView = "process", scheduled = false;
+  let sessionId = null, activeView = "process", scheduled = false, panelVisible = true;
   const tree = new ProcessTree(), filter = new EventFilter();
   const filters = new FilterMenu($("event-filter"), filter, schedule);
   async function loadPayload(kind, preview, signal, encoding = "") {
@@ -55,7 +55,7 @@ export function createObservation(token) {
       agent.control.sample(id, sample);
       observationView("agent");
     },
-    onCancel:() => agent.cancel(),
+    onCancel:() => agent.cancel(true),
     onTask:id => { observationView("agent"); agent.focus(`task-${id}`); },
     onChat:id => { $("chat-tab").click(); agent.history.querySelector(`[data-task-id="${CSS.escape(id)}"]`)?.scrollIntoView({block:"nearest"}); },
     onEvidence:inspectEvidence,
@@ -72,7 +72,7 @@ export function createObservation(token) {
     activeView = name;
     for (const button of document.querySelectorAll("[data-observation]")) button.setAttribute("aria-pressed", String(button.dataset.observation === name));
     $("traffic").hidden = name !== "traffic";
-    traffic.visibility(name === "traffic");
+    traffic.visibility(panelVisible && name === "traffic");
     $("trace-scroll").hidden = name !== "process";
     $("agent-trajectory").hidden = name !== "agent";
     $("findings").hidden = name !== "findings";
@@ -140,6 +140,8 @@ export function createObservation(token) {
     start(pid) { tree.start(pid); agent.setReady(true); sampleControls(); schedule(); },
     stop(reason) { traffic.end(); agent.setReady(false, reason); samples.end(); sampleControls(); },
     control(control) { agent.setControl(control); sampleControls(); },
+    controlError(message) { samples.controlError(message); agent.controlError(message); sampleControls(); },
+    visibility(visible) { panelVisible = Boolean(visible); traffic.visibility(panelVisible && activeView === "traffic"); },
     view:observationView,
     add(event) { samples.add(event); if (event.kind.startsWith("security.sample.")) { sampleControls(); return; } agent.add(event); sampleControls(); if (!event.kind.startsWith("agent.")) { filter.observe(event.kind); tree.add(event); traffic.add(event); } schedule(); },
   };

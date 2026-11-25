@@ -15,25 +15,94 @@ pub struct Name {
 
 impl Name {
     pub(super) fn route(self, destination: std::net::IpAddr) -> Option<String> {
-        if self.source == "tls_sni" {
-            return self.domain;
-        }
-        if self.source != "http_host" {
+        if !matches!(self.source, "tls_sni" | "http_host") {
             return None;
         }
         let domain = self.domain?;
         let hostname = domain.trim_matches(['[', ']']).trim_end_matches('.');
-        if let Ok(ip) = hostname.parse::<std::net::IpAddr>() {
+        if let Some(ip) = parse_ip_literal(hostname) {
             if ip.to_canonical() != destination.to_canonical() {
                 return None;
             }
-        } else if (hostname == "localhost" || hostname.ends_with(".localhost"))
-            && !destination.to_canonical().is_loopback()
-        {
+        } else if is_local_hostname(hostname) && !destination.to_canonical().is_loopback() {
             return None;
         }
         Some(domain)
     }
+}
+
+pub(crate) fn parse_ip_literal(host: &str) -> Option<std::net::IpAddr> {
+    let host = host.trim_matches(['[', ']']).trim_end_matches('.');
+    host.parse::<std::net::IpAddr>()
+        .ok()
+        .or_else(|| parse_ipv4_literal(host).map(std::net::IpAddr::V4))
+}
+
+pub(crate) fn parse_ipv4_literal(host: &str) -> Option<std::net::Ipv4Addr> {
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    let mut parts = [0u32; 4];
+    let mut count = 0;
+    for part in host.split('.') {
+        if count == 4 {
+            return None;
+        }
+        parts[count] = parse_ipv4_part(part)?;
+        count += 1;
+    }
+    let addr = match count {
+        1 => parts[0],
+        2 if parts[0] <= 0xff && parts[1] <= 0x00ff_ffff => (parts[0] << 24) | parts[1],
+        3 if parts[0] <= 0xff && parts[1] <= 0xff && parts[2] <= 0x0000_ffff => {
+            (parts[0] << 24) | (parts[1] << 16) | parts[2]
+        }
+        4 if parts.iter().all(|&part| part <= 0xff) => {
+            (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+        }
+        _ => return None,
+    };
+    Some(std::net::Ipv4Addr::from(addr))
+}
+
+fn parse_ipv4_part(part: &str) -> Option<u32> {
+    if part.is_empty() {
+        return None;
+    }
+    if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        if hex.is_empty() || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    if part.len() > 1 && part.starts_with('0') {
+        if !part.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+            return None;
+        }
+        return u32::from_str_radix(part, 8).ok();
+    }
+    if !part.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    part.parse::<u32>().ok()
+}
+
+pub(crate) fn is_local_hostname(hostname: &str) -> bool {
+    let host = hostname
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    host.is_empty()
+        || host == "localhost"
+        || host == "localhost.localdomain"
+        || host == "ip6-localhost"
+        || host == "ip6-loopback"
+        || host.ends_with(".localhost")
+        || host.ends_with(".localhost.localdomain")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.contains('%')
 }
 
 enum State {
@@ -130,7 +199,10 @@ fn tls_name(acceptor: &mut Acceptor, bytes: &mut &[u8]) -> Result<Option<Name>, 
         if let Some(accepted) = acceptor.accept().map_err(|_| ())? {
             return Ok(Some(Name {
                 protocol: "tls",
-                domain: accepted.client_hello().server_name().map(str::to_owned),
+                domain: accepted
+                    .client_hello()
+                    .server_name()
+                    .map(str::to_ascii_lowercase),
                 source: "tls_sni",
             }));
         }
@@ -252,23 +324,36 @@ mod tests {
     #[test]
     fn literal_and_loopback_headers_cannot_change_the_connected_address() {
         let destination = "192.0.2.42".parse().unwrap();
-        for (domain, allowed) in [
-            ("localhost", false),
-            ("127.0.0.1", false),
-            ("[::ffff:127.0.0.1]", false),
-            ("192.0.2.42", true),
-            ("example.test", true),
-        ] {
-            assert_eq!(
-                Name {
-                    protocol: "http",
-                    source: "http_host",
-                    domain: Some(domain.into())
-                }
-                .route(destination)
-                .is_some(),
-                allowed
-            );
+        for (protocol, source) in [("http", "http_host"), ("tls", "tls_sni")] {
+            for (domain, allowed) in [
+                ("localhost", false),
+                ("LOCALHOST", false),
+                ("api.localhost", false),
+                ("localhost.localdomain", false),
+                ("printer.local", false),
+                ("metadata.google.internal", false),
+                ("127.0.0.1", false),
+                ("127.1", false),
+                ("0177.0.0.1", false),
+                ("2130706433", false),
+                ("0x7f000001", false),
+                ("[::ffff:127.0.0.1]", false),
+                ("[fe80::1%eth0]", false),
+                ("192.0.2.42", true),
+                ("example.test", true),
+            ] {
+                assert_eq!(
+                    Name {
+                        protocol,
+                        source,
+                        domain: Some(domain.into())
+                    }
+                    .route(destination)
+                    .is_some(),
+                    allowed,
+                    "{source} {domain}"
+                );
+            }
         }
     }
     #[test]

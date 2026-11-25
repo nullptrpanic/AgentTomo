@@ -222,8 +222,14 @@ impl ModelDecoder for Stream {
         if !status.is_success() {
             return Ok(self.failure(format!("HTTP {status}"), Some(status)));
         }
-        let value: Value = serde_json::from_slice(bytes)?;
-        let mut events = self.update(&value, false)?;
+        let value: Value = match serde_json::from_slice(bytes) {
+            Ok(value) => value,
+            Err(error) => return Ok(self.failure(error.to_string(), Some(status))),
+        };
+        let mut events = match self.update(&value, false) {
+            Ok(events) => events,
+            Err(error) => return Ok(self.failure(error.to_string(), Some(status))),
+        };
         events.extend(self.end());
         if let Some(complete) = events.last_mut() {
             complete.content = Some(value);
@@ -258,7 +264,8 @@ impl Stream {
             return Err(io::Error::other("model stream returned an error"));
         }
         let mut events = Vec::new();
-        match (self.id.as_deref(), chunk["id"].as_str()) {
+        let chunk_id = chunk["id"].as_str().filter(|id| !id.is_empty());
+        match (self.id.as_deref(), chunk_id) {
             (None, Some(id)) => {
                 self.id = Some(id.to_owned());
                 events.push(Event {
@@ -273,7 +280,8 @@ impl Stream {
                 ));
             }
             (Some(_), Some(_)) => {}
-            (Some(_), None) if stream && chunk["id"].is_null() => {}
+            (Some(_), None)
+                if stream && (chunk["id"].is_null() || chunk["id"].as_str() == Some("")) => {}
             _ => return Err(io::Error::other("missing Chat Completions ID")),
         }
         let id = self.id.as_deref().expect("validated response ID");

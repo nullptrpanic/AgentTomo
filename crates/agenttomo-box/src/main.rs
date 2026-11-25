@@ -2,7 +2,6 @@ mod agent;
 mod cli;
 mod collectors;
 mod content_encoding;
-mod credentials;
 mod execution;
 mod network;
 mod playground;
@@ -22,6 +21,7 @@ fn main() -> ExitCode {
     let cli = cli::Cli::parse();
     if let cli::Command::Tracee {
         command,
+        trust_ca,
         trust_overlay,
         root_session,
         root_overlay_directory,
@@ -30,22 +30,12 @@ fn main() -> ExitCode {
     {
         return ExitCode::from(execution::child::exec(
             command,
+            *trust_ca,
             trust_overlay.as_deref(),
             *root_session,
             root_overlay_directory.as_deref(),
             &rootfs.options(),
         ));
-    }
-    if let cli::Command::Collector {
-        record_uid: Some(uid),
-        record_gid: Some(gid),
-        ..
-    } = &cli.command
-    {
-        if let Err(error) = credentials::filesystem_identity(*uid, *gid) {
-            eprintln!("agenttomo-box: {error}");
-            return ExitCode::from(125);
-        }
     }
     let result = Builder::new_current_thread()
         .enable_all()
@@ -66,7 +56,7 @@ fn main() -> ExitCode {
                         .await
                     }
                     cli::Command::Playground(options) => playground::run(options).await.map(|()| 0),
-                    cli::Command::Workspace { browser } => agent::workspace::run(browser).await,
+                    cli::Command::Workspace => agent::workspace::run().await,
                     cli::Command::Records { session } => {
                         playground::bridge::serve(&session).await.map(|()| 0)
                     }
@@ -79,7 +69,6 @@ fn main() -> ExitCode {
                         rootfs,
                         playground_session,
                         proxy,
-                        ..
                     } => {
                         let result = async {
                             let (proxy, adapter) = if let Some(id) = &playground_session {

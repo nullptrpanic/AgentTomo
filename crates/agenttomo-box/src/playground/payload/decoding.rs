@@ -61,10 +61,13 @@ mod tests {
     use std::io::Write;
     #[test]
     fn zstd_preview_decodes_model_requests_and_bounds_expansion() {
-        let original = zstd::stream::encode_all(&b"{\"input\":\"tool result\"}"[..], 1).unwrap();
-        let decoded = decode(original, "zstd");
-        assert_eq!(decoded.status, "complete");
-        assert_eq!(decoded.bytes, b"{\"input\":\"tool result\"}");
+        for level in [0, 1, 3] {
+            let original =
+                zstd::stream::encode_all(&b"{\"input\":\"tool result\"}"[..], level).unwrap();
+            let decoded = decode(original, "zstd");
+            assert_eq!(decoded.status, "complete", "level {level}");
+            assert_eq!(decoded.bytes, b"{\"input\":\"tool result\"}");
+        }
         let large = zstd::stream::encode_all(&vec![b'x'; MAX_DECODED_BYTES + 1000][..], 1).unwrap();
         let decoded = decode(large, "zstd");
         assert_eq!(decoded.status, "output_limit");

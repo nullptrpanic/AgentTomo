@@ -129,7 +129,11 @@ pub(super) async fn serve(
                         active = Some(scope);
                         requests.spawn(async move { session.run(&prompt, first).await });
                     }
-                    Action::Cancel => {
+                    Action::Cancel { scope } => {
+                        if active.is_none() || scope.is_some() && scope.as_ref() != active.as_ref()
+                        {
+                            continue;
+                        }
                         requests.shutdown().await;
                         stop(&mut process).await;
                         let sample = sample_run.take();

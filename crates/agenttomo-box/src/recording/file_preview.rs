@@ -214,19 +214,9 @@ impl Store {
 }
 
 fn trust_material(path: &str) -> bool {
-    if matches!(
+    matches!(
         path,
         "/etc/ssl/certs/ca-certificates.crt" | "/etc/ssl/certs/agenttomo-task-ca.pem"
-    ) {
-        return true;
-    }
-    let Some((directory, filename)) = path.rsplit_once('/') else {
-        return false;
-    };
-    let nss = directory.ends_with("/.pki/nssdb") || directory.ends_with("/.local/share/pki/nssdb");
-    nss && matches!(
-        filename,
-        "cert9.db" | "cert9.db-wal" | "cert9.db-journal" | "cert9.db-shm" | "cert8.db"
     )
 }
 
@@ -305,7 +295,7 @@ mod tests {
         for (name, reason) in [
             (Value::Null, "unresolved_path"),
             (
-                json!("/home/test/.pki/nssdb/cert9.db-journal (deleted)"),
+                json!("/etc/ssl/certs/agenttomo-task-ca.pem (deleted)"),
                 "task_trust_material",
             ),
         ] {

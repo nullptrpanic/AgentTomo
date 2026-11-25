@@ -210,9 +210,10 @@ export class TrafficView {
     const version = ++this.version;
     this.request = null;
     this.detail.querySelector(".traffic-body-copy").disabled = true;
-    if (body?.status === "stream_window" || this.side === "response" && row.stream?.data.protocol === "sse") { status.textContent = "SSE content is retained in the sliding window. Open Messages for live events."; return; }
-    if (!body) { status.textContent = row.error ? "Exchange failed; body capture may be incomplete." : "Streaming. The retained prefix becomes available when this message ends."; return; }
-    if (["unavailable", "disabled"].includes(body.status)) { status.textContent = `Body ${body.status}${body.error ? `: ${body.error}` : ""}.`; return; }
+    const pre = this.detail.querySelector(".traffic-body");
+    if (body?.status === "stream_window" || this.side === "response" && row.stream?.data.protocol === "sse") { pre.textContent = ""; status.textContent = "SSE content is retained in the sliding window. Open Messages for live events."; return; }
+    if (!body) { pre.textContent = ""; status.textContent = row.error ? "Exchange failed; body capture may be incomplete." : "Streaming. The retained prefix becomes available when this message ends."; return; }
+    if (["unavailable", "disabled"].includes(body.status)) { pre.textContent = ""; status.textContent = `Body ${body.status}${body.error ? `: ${body.error}` : ""}.`; return; }
     status.textContent = "Loading saved body…";
     this.request = new AbortController();
     try {
@@ -220,7 +221,6 @@ export class TrafficView {
       const payload = await this.load(body, this.request.signal, raw || body.captured_bytes === 0 ? "" : contentEncoding(header?.data.headers));
       if (version !== this.version) return;
       const content = httpPreview(payload, header?.data.headers, body, raw);
-      const pre = this.detail.querySelector(".traffic-body");
       const text = content.text || (content.partial ? "(no content retained in this preview)" : "(empty body)");
       if (pre.textContent !== text) pre.textContent = text;
       status.textContent = content.status;
@@ -233,7 +233,11 @@ export class TrafficView {
         if (version === this.version) { copyStatus.textContent = message; copyStatus.hidden = false; }
       };
     } catch (error) {
-      if (version === this.version) status.textContent = `Body unavailable: ${error.message}`;
+      if (version === this.version) {
+        this.bodyState = null;
+        pre.textContent = "";
+        status.textContent = `Body unavailable: ${error.message}`;
+      }
     } finally {
       if (version === this.version) this.request = null;
     }

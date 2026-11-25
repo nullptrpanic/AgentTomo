@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-pub const DEFAULT_PLAYGROUND_IMAGE: &str = "agenttomo-playground-chrome:24.04";
+pub const DEFAULT_PLAYGROUND_IMAGE: &str = "agenttomo-playground:24.04";
 
 #[derive(Parser)]
 #[command(about = "Run and inspect programs with AgentTomo")]
@@ -20,10 +20,7 @@ pub enum Command {
     /// Open a Docker terminal and live traces in a web browser
     Playground(PlaygroundArgs),
     #[command(name = "__workspace", hide = true)]
-    Workspace {
-        #[arg(long)]
-        browser: bool,
-    },
+    Workspace,
     #[command(name = "__records", hide = true)]
     Records {
         #[arg(long)]
@@ -37,10 +34,6 @@ pub enum Command {
         output_dir: PathBuf,
         #[arg(long)]
         terminal: bool,
-        #[arg(long, requires = "record_gid")]
-        record_uid: Option<u32>,
-        #[arg(long, requires = "record_uid")]
-        record_gid: Option<u32>,
         #[arg(long)]
         playground_session: Option<String>,
         #[arg(long)]
@@ -56,6 +49,8 @@ pub enum Command {
     Tracee {
         #[arg(short = 'c', allow_hyphen_values = true)]
         command: OsString,
+        #[arg(long)]
+        trust_ca: bool,
         #[arg(long)]
         trust_overlay: Option<PathBuf>,
         #[arg(long)]

@@ -1,4 +1,4 @@
-// The terminal and remote desktop already observe their available dimensions.
+// The terminal already observes its available dimensions.
 export function resizePanels(layout, handle) {
   const narrow = matchMedia("(max-width: 900px)");
   let share = 0.55, pointer = null, grab = 0;

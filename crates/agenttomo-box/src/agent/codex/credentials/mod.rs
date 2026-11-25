@@ -19,6 +19,32 @@ fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
 }
 
+fn validate_auth_record(auth: &Value) -> io::Result<Option<&str>> {
+    if !auth.is_object() {
+        return Err(invalid("invalid host Codex authentication record"));
+    }
+    if [
+        "agent_identity",
+        "personal_access_token",
+        "bedrock_api_key",
+        "bedrock_access_keys",
+    ]
+    .iter()
+    .any(|name| !auth[name].is_null())
+    {
+        return Err(invalid(
+            "Codex credential isolation currently supports ChatGPT login and API keys",
+        ));
+    }
+    match auth.get("auth_mode") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(mode)) if matches!(mode.as_str(), "apikey" | "chatgpt") => {
+            Ok(Some(mode.as_str()))
+        }
+        Some(_) => Err(invalid("unsupported host Codex authentication mode")),
+    }
+}
+
 struct Login {
     path: PathBuf,
     account: Option<String>,
@@ -43,10 +69,10 @@ impl Login {
         }
         let auth: Value =
             serde_json::from_slice(&bytes).map_err(|_| invalid("invalid host Codex login"))?;
-        let mode = auth["auth_mode"].as_str();
+        let mode = validate_auth_record(&auth)?;
         let current_chatgpt =
             mode == Some("chatgpt") || (mode.is_none() && auth["tokens"].is_object());
-        if current_chatgpt != *chatgpt || mode.is_some_and(|s| !matches!(s, "apikey" | "chatgpt")) {
+        if current_chatgpt != *chatgpt {
             return Err(invalid(
                 "host Codex authentication mode changed; open a new Playground session",
             ));
@@ -231,23 +257,9 @@ pub fn prepare(
                 builder.secrets.push(secret.to_owned());
             }
         }
-        if [
-            "agent_identity",
-            "personal_access_token",
-            "bedrock_api_key",
-            "bedrock_access_keys",
-        ]
-        .iter()
-        .any(|name| !auth[name].is_null())
-        {
-            return Err(invalid(
-                "Codex credential isolation currently supports ChatGPT login and API keys",
-            ));
-        }
+        let mode = validate_auth_record(&auth)?;
         let mut sanitized = json!({"OPENAI_API_KEY":null});
-        if auth["auth_mode"] == "chatgpt"
-            || (auth["auth_mode"].is_null() && auth["tokens"].is_object())
-        {
+        if mode == Some("chatgpt") || (mode.is_none() && auth["tokens"].is_object()) {
             let tokens = &auth["tokens"];
             if !tokens["account_id"].is_null() && !tokens["account_id"].is_string() {
                 return Err(invalid("invalid Codex account metadata"));
@@ -346,6 +358,7 @@ pub fn prepare(
             let mut policy = Policy::new(builder.grants);
             policy.allow_configured(&scopes.keys);
             policy.allow_configured(&scopes.chatgpt);
+            policy.allow_configured(&scopes.configured);
             policy
         },
     })

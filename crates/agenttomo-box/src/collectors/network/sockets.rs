@@ -64,10 +64,23 @@ impl Socket {
 
     fn duplicate_addr(&self, call: &Call) -> Option<SocketAddr> {
         use std::os::fd::{FromRawFd, OwnedFd};
-        let pidfd =
-            Errno::result(unsafe { libc::syscall(libc::SYS_pidfd_open, call.tid.as_raw(), 0) })
-                .ok()?;
-        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
+        // Linux 6.9+ supports PIDFD_THREAD (O_EXCL) for non-leader threads; on
+        // older kernels fall back to the thread group leader (TGID), which
+        // shares the descriptor table. Inode verification below guards against
+        // concurrent FD replacement.
+        let open_pidfd = |id: i32, flags: libc::c_uint| {
+            Errno::result(unsafe { libc::syscall(libc::SYS_pidfd_open, id, flags) })
+                .ok()
+                .map(|fd| unsafe { OwnedFd::from_raw_fd(fd as i32) })
+        };
+        let pidfd = open_pidfd(call.tid.as_raw(), libc::O_EXCL as libc::c_uint)
+            .or_else(|| open_pidfd(call.tid.as_raw(), 0))
+            .or_else(|| {
+                let tgid = call.process.map(|p| p.pid)?;
+                (tgid != call.tid.as_raw())
+                    .then(|| open_pidfd(tgid, 0))
+                    .flatten()
+            })?;
         let fd = Errno::result(unsafe {
             libc::syscall(
                 libc::SYS_pidfd_getfd,
@@ -395,5 +408,38 @@ mod tests {
         );
         assert!(!registry.by_inode.contains_key(&old_inode));
         assert_eq!(registry.by_watch.len(), 1);
+    }
+
+    #[test]
+    fn worker_thread_socket_addr_falls_back_to_tgid_pidfd() {
+        let mut registry = Registry::default();
+        let bound = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let expected = bound.local_addr().unwrap();
+        let fd = bound.as_raw_fd();
+        track(&mut registry, &bound);
+        let socket = registry.lookup(Pid::this(), fd).unwrap();
+        let tgid = Pid::this().as_raw();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            tid_tx.send(tid).unwrap();
+            let _ = done_rx.recv();
+        });
+        let worker_tid = tid_rx.recv().unwrap();
+        assert_ne!(worker_tid, tgid);
+        let call = Call {
+            tid: Pid::from_raw(worker_tid),
+            process: Some(crate::process::Identity {
+                pid: tgid,
+                process_instance_id: 1,
+            }),
+            number: libc::SYS_sendto,
+            args: [fd as u64, 0, 0, 0, 0, 0],
+        };
+        let resolved = socket.local_addr(&call);
+        let _ = done_tx.send(());
+        worker.join().unwrap();
+        assert_eq!(resolved, Some(expected));
     }
 }

@@ -548,3 +548,72 @@ fn custom_provider_base_paths_do_not_acquire_chatgpt_backend_semantics() {
         .unwrap();
     assert_eq!(headers["authorization"], "Bearer host-provider-key");
 }
+
+#[test]
+fn inline_profiles_openai_base_url_mcp_args_and_auth_modes_are_enforced() {
+    let profile_config = r#"
+openai_base_url = "https://top.example/v1"
+[model_providers.local]
+base_url = "http://127.0.0.1:11434/v1"
+[model_providers.shared]
+base_url = "https://base.example/v1"
+experimental_bearer_token = "profile-bearer-secret"
+[profiles.work]
+cli_auth_credentials_store = "keyring"
+openai_base_url = "https://profile.example/v1"
+[profiles.work.model_providers.shared]
+base_url = "https://override.example/v1"
+"#;
+    let prepared = prepare(
+        Path::new("/unused"),
+        files(json!({"OPENAI_API_KEY": "host-api-key"}), profile_config),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let snapshot = serde_json::to_string(&prepared.files).unwrap();
+    assert!(!snapshot.contains("profile-bearer-secret"));
+    assert!(!snapshot.contains("host-api-key"));
+    let parsed: toml::Value = toml::from_str(&prepared.files["config.toml"]).unwrap();
+    assert_eq!(
+        parsed["profiles"]["work"]["cli_auth_credentials_store"].as_str(),
+        Some("file")
+    );
+    assert!(
+        prepared
+            .policy
+            .direct_allowed(&"127.0.0.1:11434".parse().unwrap()),
+        "unauthenticated configured local providers remain reachable in direct mode"
+    );
+    assert!(
+        prepared
+            .policy
+            .origin(&"127.0.0.1:11434".parse().unwrap())
+            .is_none(),
+        "unauthenticated local providers do not receive OpenAI credentials"
+    );
+    for host in ["top.example:443", "profile.example:443", "override.example:443"] {
+        assert!(prepared.policy.origin(&host.parse().unwrap()).is_some(), "{host}");
+    }
+
+    for rejected in [
+        "[profiles.bad.otel]\nbearer_token = 'secret-fixture'",
+        "[profiles.bad.mcp_servers.s]\nurl = 'https://user:secret-fixture@mcp.example/sse'",
+        "[mcp_servers.cli]\ncommand = 'mcp'\nargs = ['--api-key=secret-fixture']",
+        "[mcp_servers.cli]\ncommand = 'mcp'\nargs = ['-H', 'Authorization: Bearer secret-fixture']",
+        "[mcp_servers.cli]\ncommand = 'mcp'\nargs = ['https://mcp.example/sse?token=secret-fixture']",
+        "[mcp_enterprise_managed_auth.idp]\naccess_token = 'secret-fixture'",
+        "[mcp_servers.s.oauth]\ntoken = 'secret-fixture'",
+        "openai_base_url = 'https://user:secret-fixture@api.example/v1'",
+    ] {
+        assert_external_credential_rejected(rejected, "secret-fixture");
+    }
+
+    for invalid_auth in [
+        json!({"auth_mode": 123, "OPENAI_API_KEY": "fixture-key"}),
+        json!({"auth_mode": "unknown", "OPENAI_API_KEY": "fixture-key"}),
+    ] {
+        assert!(
+            prepare(Path::new("/unused"), files(invalid_auth, ""), BTreeMap::new()).is_err()
+        );
+    }
+}

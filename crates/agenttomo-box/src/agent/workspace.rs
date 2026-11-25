@@ -23,10 +23,13 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         report_marker: Option<String>,
     },
-    Cancel,
+    Cancel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<Scope>,
+    },
 }
 
-pub async fn run(browser: bool) -> io::Result<u8> {
+pub async fn run() -> io::Result<u8> {
     let adapter = super::Adapter::selected()?
         .ok_or_else(|| io::Error::other("workspace requires an agent adapter"))?;
     let listener = UnixListener::bind(SOCKET)?;
@@ -39,13 +42,8 @@ pub async fn run(browser: bool) -> io::Result<u8> {
         }
     };
     drop(listener);
-    let mut terminal = if browser {
-        Command::new("/usr/local/bin/agenttomo-browser-session")
-    } else {
-        let mut terminal = Command::new("/bin/bash");
-        terminal.args(["--noprofile", "--norc", "-i"]);
-        terminal
-    };
+    let mut terminal = Command::new("/bin/bash");
+    terminal.args(["--noprofile", "--norc", "-i"]);
     adapter.configure(&mut terminal)?;
     let mut terminal = terminal.kill_on_drop(true).spawn()?;
     if adapter.conversation_server() {
@@ -65,7 +63,12 @@ pub async fn run(browser: bool) -> io::Result<u8> {
             status = terminal.wait() => { kill_group(task.as_mut()); return Ok(status?.code().unwrap_or(125) as u8) },
             action = read.receive::<Action>() => {
                 match action? {
-                    Action::Cancel => { cancelled = true; kill_group(task.as_mut()); },
+                    Action::Cancel { scope } => {
+                        if scope.is_none() || scope.as_ref() == current.as_ref() {
+                            cancelled = true;
+                            kill_group(task.as_mut());
+                        }
+                    }
                     Action::Start { scope, mut prompt, sample, report_marker } => {
                         if task.is_some() || sample.is_none() && prompt.trim().is_empty() || prompt.len() > 8192 {
                             if let Some(id) = &sample {
@@ -288,7 +291,7 @@ pub async fn drive(
                         }
                         continue;
                     }
-                    if matches!(action, Action::Cancel) && running.is_none() { continue; }
+                    if matches!(action, Action::Cancel { .. }) && running.is_none() { continue; }
                     if let Action::Start { scope, sample, report_marker, .. } = &mut action && running.is_none() {
                         running = Some(scope.clone());
                         agents.begin_turn(scope, conversation && sample.is_none());
@@ -301,9 +304,14 @@ pub async fn drive(
                             *report_marker = Some(marker);
                         }
                     }
-                    if matches!(action, Action::Cancel) { cancelled = true; }
-                    if matches!(action, Action::Cancel) && let Some(scope) = &running && let Err(error) = agents.cancel(scope) {
-                        events.send(crate::recording::Observation { source:"agent_launcher", kind:"agent.capture.error", data:json!({"task_id":scope.task_id,"agent_instance_id":scope.agent_instance_id,"error":format!("some task processes could not be stopped and remain traced: {error}"),"captured_unix_ns":super::now()}) }).await.map_err(io::Error::other)?;
+                    if let Action::Cancel { scope } = &mut action
+                        && let Some(active) = &running
+                    {
+                        *scope = Some(active.clone());
+                        cancelled = true;
+                        if let Err(error) = agents.cancel(active) {
+                            events.send(crate::recording::Observation { source:"agent_launcher", kind:"agent.capture.error", data:json!({"task_id":active.task_id,"agent_instance_id":active.agent_instance_id,"error":format!("some task processes could not be stopped and remain traced: {error}"),"captured_unix_ns":super::now()}) }).await.map_err(io::Error::other)?;
+                        }
                     }
                     protocol::send(&mut write, &action).await?;
                 },

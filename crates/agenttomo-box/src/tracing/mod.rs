@@ -5,7 +5,7 @@ mod processes;
 mod report_tests;
 mod syscalls;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -54,7 +54,7 @@ pub struct Launch {
     pub with_terminal: bool,
     pub capture_files: bool,
     pub clear_proxy_environment: bool,
-    pub trust_overlay: Option<(std::path::PathBuf, String)>,
+    pub trust_overlay: Option<(Option<std::path::PathBuf>, String)>,
     pub root_overlay: Option<(std::path::PathBuf, crate::execution::rootfs::Options)>,
 }
 
@@ -93,14 +93,6 @@ fn run(
     } = launch;
     let root_session =
         (with_terminal || root_overlay.is_some()) && nix::unistd::geteuid().is_root();
-    if root_session {
-        // This thread reads target memory/FDs and spawns the root shell. Only
-        // the recording/runtime threads retain the host filesystem identity.
-        crate::credentials::filesystem_identity(
-            nix::unistd::geteuid().as_raw(),
-            nix::unistd::getegid().as_raw(),
-        )?;
-    }
     // The helper cannot exec user code until we arm ptrace and send its gate byte.
     // SEIZE supports group-stop/LISTEN and avoids a pre_exec SIGSTOP/spawn deadlock.
     let (mut control, child_control) = UnixStream::pair()?;
@@ -115,7 +107,10 @@ fn run(
         launch.arg("--root-session");
     }
     if let Some((path, _)) = &trust_overlay {
-        launch.arg("--trust-overlay").arg(path);
+        launch.arg("--trust-ca");
+        if let Some(path) = path {
+            launch.arg("--trust-overlay").arg(path);
+        }
     }
     if let Some((root, options)) = &root_overlay {
         launch
@@ -207,31 +202,46 @@ fn run(
     if crate::syscall::SUPPORTED {
         // The acknowledgement itself is a send/write on the private gate.
         // Drive that stop before waiting for its byte; do not expose it as a
-        // target event. A failed filter installation instead reaches EXIT.
-        let status = loop {
-            match waitpid(root, Some(WaitPidFlag::__WALL)) {
-                Err(Errno::EINTR) => continue,
-                result => break result?,
-            }
-        };
-        match status {
-            WaitStatus::PtraceEvent(pid, _, nix::libc::PTRACE_EVENT_SECCOMP) => {
-                let call = crate::syscall::Call::read(pid, None)?;
-                if call.args[0] != 3 {
+        // target event. Forward unrelated signals (e.g. SIGWINCH) instead of
+        // aborting startup. A failed filter installation instead reaches EXIT.
+        loop {
+            let status = loop {
+                match waitpid(root, Some(WaitPidFlag::__WALL)) {
+                    Err(Errno::EINTR) => continue,
+                    result => break result?,
+                }
+            };
+            match status {
+                WaitStatus::PtraceEvent(pid, _, nix::libc::PTRACE_EVENT_SECCOMP) => {
+                    let call = crate::syscall::Call::read(pid, None)?;
+                    if call.args[0] != 3 {
+                        return Err(io::Error::other(
+                            "unexpected syscall before startup acknowledgement",
+                        ));
+                    }
+                    ptrace::cont(pid, None)?;
+                    break;
+                }
+                WaitStatus::PtraceEvent(pid, _, nix::libc::PTRACE_EVENT_EXIT) => {
+                    ptrace::cont(pid, None)?;
+                    break;
+                }
+                WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => break,
+                WaitStatus::Stopped(pid, signal) => {
+                    ptrace::cont(pid, Some(signal))?;
+                }
+                WaitStatus::PtraceEvent(pid, signal, nix::libc::PTRACE_EVENT_STOP) => {
+                    if signal == Signal::SIGTRAP {
+                        ptrace::cont(pid, None)?;
+                    } else {
+                        listen(pid)?;
+                    }
+                }
+                _ => {
                     return Err(io::Error::other(
-                        "unexpected syscall before startup acknowledgement",
+                        "helper stopped before startup acknowledgement",
                     ));
                 }
-                ptrace::cont(pid, None)?;
-            }
-            WaitStatus::PtraceEvent(pid, _, nix::libc::PTRACE_EVENT_EXIT) => {
-                ptrace::cont(pid, None)?;
-            }
-            WaitStatus::Exited(_, _) => {}
-            _ => {
-                return Err(io::Error::other(
-                    "helper stopped before startup acknowledgement",
-                ));
             }
         }
     }
@@ -266,6 +276,7 @@ fn run(
 
     let mut known = HashSet::from([root]);
     let mut newborn = HashSet::new();
+    let mut held_newborns: HashMap<Pid, Option<i32>> = HashMap::new();
     let mut root_exited = false;
     let workspace = reports.is_some();
     let mut calls = syscalls::Dispatch::new(registry, netns, capture_files, reports);
@@ -294,6 +305,7 @@ fn run(
                 calls.forget(pid);
                 known.remove(&pid);
                 newborn.remove(&pid);
+                held_newborns.remove(&pid);
                 if let Some(identity) = processes.exit(pid) {
                     agents.exited(identity);
                     let mut data = json!({"exit_code": code});
@@ -303,6 +315,7 @@ fn run(
                         data,
                     })?;
                 }
+                release_orphaned_newborns(&calls, &processes, &known, &mut held_newborns)?;
                 if pid == root {
                     root_exited = true;
                     emit(sender, Event::RootExit(code as u8))?;
@@ -312,6 +325,7 @@ fn run(
                 calls.forget(pid);
                 known.remove(&pid);
                 newborn.remove(&pid);
+                held_newborns.remove(&pid);
                 if let Some(identity) = processes.exit(pid) {
                     agents.exited(identity);
                     let mut data = json!({"signal": signal as i32, "core_dumped": core_dumped});
@@ -321,15 +335,24 @@ fn run(
                         data,
                     })?;
                 }
+                release_orphaned_newborns(&calls, &processes, &known, &mut held_newborns)?;
                 if pid == root {
                     root_exited = true;
                     emit(sender, Event::RootExit(128 + signal as u8))?;
                 }
             }
             WaitStatus::PtraceEvent(pid, signal, event) => {
-                let first_stop = known.insert(pid) | newborn.remove(&pid);
+                let was_known = !known.insert(pid);
+                let from_newborn = newborn.remove(&pid);
+                let first_stop = !was_known || from_newborn;
                 if event != nix::libc::PTRACE_EVENT_EXEC {
                     processes.observe(pid);
+                }
+                if event == nix::libc::PTRACE_EVENT_STOP && !was_known {
+                    // Hold an unseen newborn until its parent's FORK/VFORK/CLONE
+                    // stop binds and tracks it, avoiding lost agent attribution.
+                    held_newborns.insert(pid, creator_tgid(pid));
+                    continue;
                 }
                 match event {
                     nix::libc::PTRACE_EVENT_SECCOMP => {
@@ -367,8 +390,11 @@ fn run(
                                 child.identity.process_instance_id,
                             );
                             if !child.exited {
-                                agents.track(child.identity)?;
+                                track_agent(&agents, child.identity)?;
                             }
+                        }
+                        if held_newborns.remove(&new).is_some() {
+                            resume(&calls, new, None)?;
                         }
                         let child = child.map(|child| child.identity);
                         if parent.is_none() || child.is_none() || parent != child {
@@ -390,16 +416,18 @@ fn run(
                             }
                             Err(error) => return Err(error.into()),
                         };
+                        calls.forget(pid);
                         if old != pid {
                             calls.forget(old);
                             known.remove(&old);
                             newborn.remove(&old);
+                            held_newborns.remove(&old);
                         }
                         let identity = processes.exec(pid, old);
                         let mut data = exec_context(pid);
                         let environment = crate::agent::environment(pid);
                         agents.observe_exec(identity.process_instance_id, &environment, pid);
-                        agents.track(identity)?;
+                        track_agent(&agents, identity)?;
                         if environment
                             .as_object()
                             .is_some_and(|values| !values.is_empty())
@@ -412,6 +440,9 @@ fn run(
                             kind: "process.exec",
                             data,
                         })?;
+                    }
+                    nix::libc::PTRACE_EVENT_EXIT => {
+                        held_newborns.remove(&pid);
                     }
                     nix::libc::PTRACE_EVENT_STOP if !first_stop && signal != Signal::SIGTRAP => {
                         listen(pid)?;
@@ -444,6 +475,64 @@ fn run(
         }
     }
     emit(sender, Event::Finished)
+}
+
+fn track_agent(agents: &crate::agent::Hub, identity: crate::process::Identity) -> io::Result<()> {
+    match agents.track(identity) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(nix::libc::EMFILE | nix::libc::ENFILE)
+            ) =>
+        {
+            eprintln!(
+                "agenttomo-box: cannot pin pid {} for cancellation: {error}",
+                identity.pid
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn creator_tgid(pid: Pid) -> Option<i32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let mut tgid = None;
+    let mut ppid = None;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("Tgid:") {
+            tgid = value.trim().parse::<i32>().ok();
+        } else if let Some(value) = line.strip_prefix("PPid:") {
+            ppid = value.trim().parse::<i32>().ok();
+        }
+    }
+    match tgid {
+        Some(group) if group != pid.as_raw() => Some(group),
+        _ => ppid,
+    }
+}
+
+fn release_orphaned_newborns(
+    calls: &syscalls::Dispatch,
+    processes: &processes::Registry,
+    known: &HashSet<Pid>,
+    held_newborns: &mut HashMap<Pid, Option<i32>>,
+) -> io::Result<()> {
+    if held_newborns.is_empty() {
+        return Ok(());
+    }
+    let only_held = known.len() == held_newborns.len();
+    let release: Vec<_> = held_newborns
+        .iter()
+        .filter(|(_, creator)| only_held || creator.is_none_or(|tgid| !processes.is_live_pid(tgid)))
+        .map(|(&pid, _)| pid)
+        .collect();
+    for pid in release {
+        held_newborns.remove(&pid);
+        resume(calls, pid, None)?;
+    }
+    Ok(())
 }
 
 fn resume(calls: &syscalls::Dispatch, pid: Pid, signal: Option<Signal>) -> io::Result<()> {

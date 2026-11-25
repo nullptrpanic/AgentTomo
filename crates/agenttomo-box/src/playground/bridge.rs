@@ -57,7 +57,17 @@ impl Client {
 
     pub async fn connect(container: &str, id: &str) -> io::Result<Self> {
         let client = Self::new(container, id);
-        let connection = Self::open(container, id, &client.0.token).await?;
+        let connection = tokio::time::timeout(
+            Duration::from_secs(15),
+            Self::open(container, id, &client.0.token),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "sandbox read channel startup timed out",
+            )
+        })??;
         *client.0.connection.lock().await = Some(connection);
         Ok(client)
     }
@@ -230,7 +240,7 @@ pub(super) async fn forward(State(app): State<App>, request: Request, next: Next
         .nth(3)
         .unwrap_or("")
         .to_owned();
-    if !access.authorized(&app) && !access.can_monitor(&app, &id) {
+    if !access.authorized(&app) && !access.can_monitor(&app, &id) && !access.was_monitor(&app, &id) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let head = request.method() == axum::http::Method::HEAD;
@@ -250,11 +260,12 @@ pub(super) async fn forward(State(app): State<App>, request: Request, next: Next
         .get(&id)
         .cloned();
     let Some(client) = client else {
-        return if app
-            .running
-            .lock()
-            .expect("session registry")
-            .contains_key(&id)
+        return if !app.is_ended(&id)
+            && app
+                .running
+                .lock()
+                .expect("session registry")
+                .contains_key(&id)
         {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
@@ -316,7 +327,6 @@ pub async fn serve(id: &str) -> io::Result<()> {
     let token: String = protocol::receive(&mut input).await?;
     let app = App {
         settings: Arc::new(Settings {
-            browser: false,
             image: String::new(),
             image_id: String::new(),
             binary: Default::default(),
@@ -332,10 +342,10 @@ pub async fn serve(id: &str) -> io::Result<()> {
         }),
         shutdown: Default::default(),
         sessions: tokio_util::task::TaskTracker::new(),
-        desktops: Default::default(),
         running: Default::default(),
         proxy_peers: Default::default(),
         bridges: None,
+        ended_viewers: Default::default(),
     };
     app.running.lock().unwrap().insert(id.to_owned(), None);
     let io = TokioIo::new(tokio::io::join(input, tokio::io::stdout()));

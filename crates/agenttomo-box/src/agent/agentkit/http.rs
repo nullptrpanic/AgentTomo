@@ -179,7 +179,8 @@ pub(super) fn final_text(kind: &str, data: &str) -> io::Result<bool> {
         // Ark errors may include the upstream body. Only expose the HTTP status.
         let diagnostic = event["error"]
             .as_str()
-            .or(event["errorMessage"].as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| event["errorMessage"].as_str().filter(|s| !s.is_empty()))
             .unwrap_or("");
         let status = diagnostic
             .split_once("code: ")
@@ -200,4 +201,19 @@ pub(super) fn final_text(kind: &str, data: &str) -> io::Result<bool> {
                     && part["text"].as_str().is_some_and(|s| !s.trim().is_empty())
             })
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::final_text;
+
+    #[test]
+    fn empty_error_field_falls_back_to_error_message_status() {
+        let err = final_text(
+            "message",
+            r#"{"error":"","errorCode":"ERR_UPSTREAM","errorMessage":"upstream failed with code: 429 too many requests"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "Model request failed (HTTP 429)");
+    }
 }

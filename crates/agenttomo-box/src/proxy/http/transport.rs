@@ -69,12 +69,13 @@ where
             timeout(Duration::from_secs(5), &mut connection).await.map_err(io::Error::other).and_then(|result| result.map_err(io::Error::other))
         },
     };
-    driver.abort();
-    let _ = driver.await;
-    // Drop body observers before flushing their capture/upgrade jobs.
+    // Drop body observers and finish capture/upgrade jobs before aborting the
+    // upstream HTTP driver, which may still be completing an upgrade handoff.
     drop(connection);
     writes.close();
     writes.wait().await;
+    driver.abort();
+    let _ = driver.await;
     result
 }
 

@@ -22,7 +22,6 @@ impl Fixture {
     fn app(&self) -> App {
         App {
             settings: Arc::new(Settings {
-                browser: false,
                 image: String::new(),
                 image_id: String::new(),
                 binary: PathBuf::new(),
@@ -38,10 +37,10 @@ impl Fixture {
             }),
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
-            desktops: Default::default(),
             running: Default::default(),
             proxy_peers: Default::default(),
             bridges: None,
+            ended_viewers: Default::default(),
         }
     }
 

@@ -286,7 +286,13 @@ pub async fn forward(
             finished: finished.clone(),
             scheme,
         };
-        bridge(client, upstream, session).await?;
+        let error = bridge(client, upstream, session).await.err();
+        return Ok(transfer::Outcome {
+            up: counts.up.load(Ordering::Relaxed),
+            down: Some(counts.down.load(Ordering::Relaxed)),
+            reason: if error.is_some() { "failed" } else { "closed" },
+            error,
+        });
     } else {
         // No HTTP parser sees opaque protocols. Existing passive SNI/Host
         // observation and half-close behavior stay available in this branch.
@@ -298,12 +304,6 @@ pub async fn forward(
         outcome.down = Some(counts.down.load(Ordering::Relaxed));
         return Ok(outcome);
     }
-    Ok(transfer::Outcome {
-        up: counts.up.load(Ordering::Relaxed),
-        down: Some(counts.down.load(Ordering::Relaxed)),
-        reason: "closed",
-        error: None,
-    })
 }
 
 // Both direct TLS and HTTP CONNECT tunnels use the same task CA and verifier.
@@ -345,7 +345,9 @@ async fn decrypt(
             .collect();
         let inspect = offered.is_empty() || offered.iter().any(|p| p == b"http/1.1");
         let mut outbound = inspection.authority.client.clone();
-        if !inspect {
+        if offered.is_empty() {
+            Arc::make_mut(&mut outbound).alpn_protocols.clear();
+        } else if !inspect {
             Arc::make_mut(&mut outbound).alpn_protocols = offered;
         }
         let remote = tokio_rustls::TlsConnector::from(outbound)

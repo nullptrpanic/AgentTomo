@@ -69,8 +69,8 @@ fn capabilities(setup: bool, root_session: bool) -> io::Result<()> {
         Errno::result(unsafe { libc::syscall(libc::SYS_capget, &header, caps.as_mut_ptr()) })?;
         caps[0].inheritable |= (1 << 12) | (1 << 13);
     } else if root_session {
-        // SETGID/SETUID allow the root terminal to launch an unprivileged
-        // browser. Network and mount administration stay out of the workload.
+        // SETGID/SETUID allow a root session to drop privileges for child
+        // processes. Network and mount administration stay out of the workload.
         let identity = (1 << 6) | (1 << 7);
         caps[0] = CapData {
             effective: identity,
@@ -81,7 +81,7 @@ fn capabilities(setup: bool, root_session: bool) -> io::Result<()> {
     Errno::result(unsafe { libc::syscall(libc::SYS_capset, &header, caps.as_ptr()) })?;
     if setup || root_session {
         // Ambient capabilities survive exec for the namespace setup tools, or
-        // for dropping the root terminal's child to the browser's ordinary UID.
+        // for switching identities from a root session.
         for cap in if setup { [12, 13] } else { [6, 7] } {
             Errno::result(unsafe {
                 libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_RAISE, cap, 0, 0)
@@ -179,7 +179,7 @@ pub fn map_root_session(control: &mut UnixStream, child: nix::unistd::Pid) -> io
         )));
     }
     // Only the parent can map multiple identities. Reuse its mapped ranges so
-    // Chrome can drop privileges and create its own normal user namespace.
+    // root sessions and directory overlays preserve multi-UID ownership.
     for map in ["uid_map", "gid_map"] {
         let outer = std::fs::read_to_string(format!("/proc/self/{map}"))?;
         let mut inner = String::new();

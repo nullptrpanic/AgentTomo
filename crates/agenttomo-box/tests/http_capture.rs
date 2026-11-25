@@ -259,9 +259,12 @@ fn tls_server(fixture: &Fixture) -> (std::path::PathBuf, rustls::ServerConfig) {
     let trust = fixture.0.join("upstream-ca.pem");
     std::fs::write(&trust, ca_cert.pem()).unwrap();
     let leaf_key = rcgen::KeyPair::generate().unwrap();
-    let leaf =
-        rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.2".to_string()])
-            .unwrap()
+    let leaf = rcgen::CertificateParams::new(vec![
+        "localhost".to_string(),
+        "127.0.0.2".to_string(),
+        "origin.test".to_string(),
+    ])
+    .unwrap()
             .signed_by(&leaf_key, &rcgen::Issuer::new(ca, ca_key))
             .unwrap();
     let config = rustls::ServerConfig::builder()
@@ -338,7 +341,7 @@ fn check_https_inspection(tunnel: bool, box_proxy: bool) {
             .unwrap();
         if tunnel || box_proxy {
             let expected = if box_proxy {
-                "CONNECT localhost:443 HTTP/1.1"
+                "CONNECT origin.test:443 HTTP/1.1"
             } else {
                 "CONNECT 127.0.0.2:"
             };
@@ -355,7 +358,7 @@ fn check_https_inspection(tunnel: bool, box_proxy: bool) {
             "exec env -u SSL_CERT_FILE curl --noproxy '' --proxy http://127.0.0.1:{port} --max-time 10 -fsS -d hello-upload https://127.0.0.2:{port}/echo"
         )
     } else if box_proxy {
-        "exec env -u SSL_CERT_FILE curl --resolve localhost:443:192.0.2.42 --max-time 10 -fsS -d hello-upload https://localhost/echo".to_owned()
+        "exec env -u SSL_CERT_FILE curl --resolve origin.test:443:192.0.2.42 --max-time 10 -fsS -d hello-upload https://origin.test/echo".to_owned()
     } else {
         format!(
             "exec env -u SSL_CERT_FILE curl --noproxy '*' --resolve localhost:{port}:127.0.0.1 --max-time 10 -fsS -d hello-upload https://localhost:{port}/echo"
@@ -385,7 +388,7 @@ fn check_https_inspection(tunnel: bool, box_proxy: bool) {
         let events = fixture.events();
         assert!(!events.iter().any(|e| e["data"]["method"] == "CONNECT"));
         assert!(events.iter().any(|e| e["kind"] == "network.protocol"
-            && e["data"]["domain"] == "localhost"
+            && e["data"]["domain"] == "origin.test"
             && e["data"]["destination"] == "192.0.2.42:443"));
     }
     if tunnel {
@@ -422,8 +425,8 @@ fn task_trust_files_are_available_to_the_target_without_saved_previews() {
     let fixture = fixture();
     let script = r#"
 from pathlib import Path
-import hashlib
 import os
+import sys
 ca = Path('/etc/ssl/certs/agenttomo-task-ca.pem').read_bytes()
 assert ca in Path('/etc/ssl/certs/ca-certificates.crt').read_bytes()
 for flags in [os.O_WRONLY, os.O_PATH]:
@@ -431,15 +434,7 @@ for flags in [os.O_WRONLY, os.O_PATH]:
     os.close(fd)
 Path('ordinary.txt').write_text('ordinary-preview')
 assert Path('ordinary.txt').read_text() == 'ordinary-preview'
-# Cover the NSS database paths used by the Chrome launcher, plus its journal.
-for directory in ['home/.local/share/pki/nssdb', 'home/.pki/nssdb']:
-    path = Path(directory)
-    path.mkdir(parents=True, exist_ok=True)
-    for name in ['cert9.db', 'cert9.db-wal', 'cert9.db-journal']:
-        file = path / name
-        file.write_bytes(ca)
-        assert file.read_bytes() == ca
-print(hashlib.sha256(ca).hexdigest())
+sys.stdout.buffer.write(ca)
 "#;
     std::fs::write(fixture.0.join("trust_probe.py"), script).unwrap();
     let mut command = fixture.command("exec python3 trust_probe.py");
@@ -454,8 +449,6 @@ print(hashlib.sha256(ca).hexdigest())
     for path in [
         "/etc/ssl/certs/agenttomo-task-ca.pem",
         "/etc/ssl/certs/ca-certificates.crt",
-        "home/.local/share/pki/nssdb/cert9.db",
-        "home/.pki/nssdb/cert9.db-wal",
     ] {
         let opens: Vec<_> = events
             .iter()
@@ -476,9 +469,10 @@ print(hashlib.sha256(ca).hexdigest())
         && event["data"]["path"] == "ordinary.txt"
         && event["data"]["preview"]["status"] == "complete"));
     assert!(!fixture.0.join("run/task-ca.pem").exists());
-    let ca = std::fs::read(fixture.0.join("home/.pki/nssdb/cert9.db")).unwrap();
+    let ca = output.stdout;
+    assert!(!ca.is_empty());
     let saved = std::fs::read(fixture.0.join("run/file-previews.bin")).unwrap();
-    assert!(!saved.windows(ca.len()).any(|bytes| bytes == ca));
+    assert!(!saved.windows(ca.len()).any(|bytes| bytes == ca.as_slice()));
 }
 
 #[test]

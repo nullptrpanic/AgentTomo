@@ -57,15 +57,14 @@ flowchart LR
 
 Docker CLI 子进程使用独立进程组，宿主终端的 Ctrl-C 由 Playground 处理，连续按键不会打断创建、attach 或清理命令；网页终端中的 Ctrl-C 仍通过 PTY 作用于目标前台任务。控制命令保留 30 秒超时。`docker rm` 失败或超时时，再查询该名称的容器：只有查询成功且确认不存在才把清理记为成功；容器仍存在或无法查询时，记录原命令的退出码/信号或 I/O 错误，以及复核结果，不把 Docker 权限/连接错误视为容器已删除。
 
-默认使用本地 `agenttomo-playground-chrome:24.04` 并自动启动 Chrome，镜像包含 Ubuntu 24.04 工具集和桌面组件。构建方法见[镜像说明](../docker/playground-chrome/README.md)。可由 `--image` 指定其他兼容镜像，不自动拉取或构建。宿主机只提供只读的 box 二进制及所选 Agent 的运行文件；不提供可写 bind mount，不挂载项目、宿主根目录或 Docker socket。容器使用 `--log-driver=none`，防止终端协议内容被 Docker 日志驱动另存到宿主机。
+默认使用本地 `agenttomo-playground:24.04`，镜像包含 Ubuntu 24.04 工具集。构建方法见[镜像说明](../docker/playground/README.md)。可由 `--image` 指定其他兼容镜像，不自动拉取或构建。宿主机只提供只读的 box 二进制及所选 Agent 的运行文件；不提供可写 bind mount，不挂载项目、宿主根目录或 Docker socket。容器使用 `--log-driver=none`，防止终端协议内容被 Docker 日志驱动另存到宿主机。
 
 可通过 `--overlay-root` 开启[一级目录及 SSL OverlayFS](root-overlay-design.md)，所有私有层
 共用默认 512 MiB 的容量上限，可配置豁免路径；不增加 Docker capabilities。只覆盖能整目录
-挂载的一级目录，以及 `/etc/ssl`；包含子挂载的目录整体跳过。当前 `/usr`、`/etc/ssl` 之外的
-`/etc`、带浏览器时的 `/tmp` 保持容器原视图，写入不隔离。浏览器通信使用两个小型 tmpfs；
-主命令退出后，存活后代继续使用任务挂载。
+挂载的一级目录，以及 `/etc/ssl`；包含子挂载的目录整体跳过。当前 `/usr` 和 `/etc/ssl` 之外的
+`/etc` 保持容器原视图，写入不隔离；主命令退出后，存活后代继续使用任务挂载。
 
-容器采集器及终端使用 root（UID/GID 0），终端的 HOME 和初始工作目录为 `/root`。容器从 `cap-drop=ALL` 开始，仅为身份映射和文件检查增加 SETUID、SETGID、SETFCAP、DAC_OVERRIDE，保留 no-new-privileges，不使用 privileged。启动器在独立 user/net namespace 中完成配置，父采集器写入与外层相同的有效 UID/GID 范围，使终端可以切换到普通浏览器用户。目标执行前收回网络、挂载等管理能力，只保留身份切换能力；root 账号仍受这些能力限制，并非无限制的系统管理权限。为允许嵌套 user/net namespace，开发容器设置 seccomp=unconfined、apparmor=unconfined；这放宽了容器策略。网络工具与内核 TPROXY 能力不足时启动失败，不回退旧路径。
+容器采集器及终端使用 root（UID/GID 0），终端的 HOME 和初始工作目录为 `/root`。容器从 `cap-drop=ALL` 开始，仅为身份映射和文件检查增加 SETUID、SETGID、SETFCAP、DAC_OVERRIDE，保留 no-new-privileges，不使用 privileged。启动器在独立 user/net namespace 中完成配置，父采集器写入与外层相同的有效 UID/GID 范围。目标执行前收回网络、挂载等管理能力，只保留身份切换能力；root 账号仍受这些能力限制，并非无限制的系统管理权限。为允许嵌套 user/net namespace，开发容器设置 seccomp=unconfined、apparmor=unconfined；这放宽了容器策略。网络工具与内核 TPROXY 能力不足时启动失败，不回退旧路径。
 
 Playground 采集器以容器 root 写入记录，目录 0700、文件 0600。原有 `run` 的执行身份和持久化行为不变。
 
@@ -85,17 +84,7 @@ Playground 采集器以容器 root 写入记录，目录 0700、文件 0600。�
 
 ## Web 与证据
 
-启动时检查所选镜像中的浏览器启动、桌面和 Chrome wrapper 三个可执行脚本。完整安装自动启用浏览器，全部缺省进入终端模式，部分安装或 Docker 探测失败则报告错误。检查在网络禁用、只读的临时容器中执行并清理，后续会话使用同一镜像 ID。`--image` 保留镜像选择能力，旧命令应删除 `--browser`。
-浏览器模式下左侧显示 Terminal / Browser 标签页，右侧展示观察视图和原始事件详情。
-被跟踪的启动脚本等待图形环境就绪后启动 Chrome，再 exec 为交互 Bash；
-Chrome wrapper 使用 setpriv 切换为 nobody（UID/GID 65534，HOME=/tmp），保留 Chrome 自身沙箱及证书校验，不加入 --no-sandbox。Chrome 的网络服务及其他后代复用同一采集链路。Xvfb/Openbox/x11vnc 同样使用 nobody，作为
-会话内显示基础设施运行，不放入目标进程树。独立 desktop 模块负责就绪检查、
-`/api/sessions/{session}/desktop` WebSocket 的 token/Origin/存活会话校验、
-有界转发和取消；仅通过 Docker exec 连接容器 loopback VNC，无额外公开端口。
-Chrome wrapper 从既有 OverlayFS 读取任务公开 CA，导入临时容器 NSS 数据库；
-宿主信任不变。用户关闭工作区主页面或服务关闭时，显示连接和容器统一清理。
-
-默认地址为 `127.0.0.1:8080`，支持 `--listen`。启动时生成随机访问令牌并打印完整 URL；页面和 WS 均校验令牌，浏览器 WS 同时校验 Origin。静态资源在二进制内，不依赖 CDN 或生产环境 Node.js。
+默认地址为 `127.0.0.1:8080`，支持 `--listen`。启动时检查所选本地镜像并固定其镜像 ID，生成随机访问令牌并打印完整 URL；页面和 WS 均校验令牌，浏览器 WS 同时校验 Origin。静态资源在二进制内，不依赖 CDN 或生产环境 Node.js。
 
 `file.open` 增加独立文件预览面板，原始事件 JSON 详情继续保留。预览从事件关联的已保存内容加载，提供文本/JSON/Hex，使用图标按钮复制当前内容和关闭预览；失败、未采集、空文件与截断有独立状态。`GET /api/sessions/{session}/file-preview` 使用同一个访问令牌，仅接受固定快照文件的 offset/length，限制读取大小并拒绝路径符号链接；不允许任意宿主文件路径。旧记录无内容时不发起路径读取。完整边界见[内容检查设计](content-inspection-design.md)。
 
@@ -105,9 +94,9 @@ Chrome wrapper 从既有 OverlayFS 读取任务公开 CA，导入临时容器 NS
 
 ### 同一会话的多个监控页面
 
-右上角只增加两个图标：收起/展开当前页的监控栏，以及在新页面打开同一 session 的监控。打开独立页不改变主页面布局；多个监控页与主页面可以共存，事件筛选、当前标签、选中项和滚动状态各自独立。独立页保留完整的观察界面，不显示终端、浏览器控制、New session 或收起按钮。
+右上角只增加两个图标：收起/展开当前页的监控栏，以及在新页面打开同一 session 的监控。打开独立页不改变主页面布局；多个监控页与主页面可以共存，事件筛选、当前标签、选中项和滚动状态各自独立。独立页保留完整的观察界面，不显示终端、New session 或收起按钮。
 
-`app.js` 根据 `monitor` 查询参数选择入口：`workspace.mjs` 负责原有终端/桌面和拥有容器的 WebSocket；`monitor.mjs` 只跟随事件日志。两者共用 `observation.mjs` 初始化的进程树、Traffic、文件预览与事件详情，不复制观察逻辑。无效或已丢失的 session 显示错误，绝不回退到创建容器。
+`app.js` 根据 `monitor` 查询参数选择入口：`workspace.mjs` 负责原有终端和拥有容器的 WebSocket；`monitor.mjs` 只跟随事件日志。两者共用 `observation.mjs` 初始化的进程树、Traffic、文件预览与事件详情，不复制观察逻辑。无效或已丢失的 session 显示错误，绝不回退到创建容器。
 
 独立页通过带相同访问令牌的 `GET /api/sessions/{session}/events?offset=<字节游标>` 分批读取 `events.jsonl`。每批目标上限为 256 条或 1 MiB；单条完整记录可超过批次字节上限，但不超过现有 16 MiB 记录限制。活跃时每 250 ms 查询一次，回放未读历史时立即继续，单页不并发轮询。瞬时连接错误从原游标重试，关闭页面取消请求。每页保有自己的游标，不影响其他读者或采集器；前端内存仍采用现有最近事件窗口。
 
@@ -132,7 +121,7 @@ Traffic 列表以 request ID 缓存和复用 DOM 行，一次 HTTP 交换始终�
 
 进程树的 HTTP 行定位到 Traffic 的具体请求；TCP 父行按 connection ID 筛选同一连接的全部请求，覆盖 keep-alive，清除之前的文本筛选并定位选中行。父行右侧箭头独立展开/收起 HTTP 子行为。UDP 行展开其原始包明细。可点击 Show all requests 返回全量列表。不用域名或 PID 猜测关联；没有已采集 HTTP 请求时说明原因并保留原始事件详情，后续匹配请求到达时自动显示。
 
-桌面布局的工作区与观测区之间提供拖拽分隔条，限制两侧最小宽度，支持左右方向键、Home/End 和双击恢复默认比例。终端和浏览器沿用自身尺寸观察机制；窄屏仍采用上下布局。
+桌面布局的工作区与观测区之间提供拖拽分隔条，限制两侧最小宽度，支持左右方向键、Home/End 和双击恢复默认比例。终端沿用自身尺寸观察机制；窄屏仍采用上下布局。
 
 核心事件与前端模型统一使用 PID 归属。同一进程寿命内的 process_instance_id 保持不变，非主线程 exec 也延续该身份；PID 再次使用时分配新实例。新 schema v2 不导出线程 ID 或线程任务 ID，创建事件使用 parent_pid、child_pid 和 child_process_instance_id。tracing/processes.rs 在底层把 ptrace 句柄映射到 TGID，内部维护线程存活状态，只有最后一个已知成员退出才导出 process.exit。前端 process-tree.mjs 直接消费进程记录；历史 v1 日志的线程聚合隔离在 legacy-process-tree.mjs 中。
 

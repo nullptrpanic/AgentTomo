@@ -111,7 +111,7 @@ pub(super) async fn record(
                             .map_err(io::Error::other)?;
                     }
                     Input::AgentCancel => agents
-                        .send(crate::agent::workspace::Action::Cancel)
+                        .send(crate::agent::workspace::Action::Cancel { scope: None })
                         .await
                         .map_err(io::Error::other)?,
                     Input::Resize { rows, cols } => {
@@ -181,7 +181,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), actions.recv())
                 .await
                 .unwrap(),
-            Some(crate::agent::workspace::Action::Cancel)
+            Some(crate::agent::workspace::Action::Cancel { .. })
         ));
         let mut delivered = Vec::new();
         tokio::time::timeout(Duration::from_secs(2), child.read_to_end(&mut delivered))

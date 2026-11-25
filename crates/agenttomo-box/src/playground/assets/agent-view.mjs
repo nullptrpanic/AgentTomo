@@ -76,13 +76,36 @@ export class AgentView {
     }, 1000);
     if (!busy && this.progressTimer) { clearInterval(this.progressTimer); this.progressTimer = null; }
   }
-  cancel() {
+  cancel(force = false) {
     const task = this.model.runningTasks.values().next().value;
-    if (!task || task.stopping || !this.control) return;
+    if (!this.control || (!task && !force) || task?.stopping) return false;
     try {
-      this.control.cancel(); task.stopping = true;
-      this.renderChat(task); this.updateControls();
-    } catch (error) { this.status.textContent = error.message; }
+      this.control.cancel();
+      if (task) {
+        task.stopping = true;
+        this.renderChat(task);
+        this.updateControls();
+      }
+      return true;
+    } catch (error) {
+      this.status.textContent = error.message;
+      return false;
+    }
+  }
+  controlError(message) {
+    for (const task of [...this.model.runningTasks]) {
+      if (!task.started && !task.rounds.length && !task.timeline.length) {
+        task.state = "rejected";
+        task.endedAt = Date.now();
+        this.model.runningTasks.delete(task);
+        this.renderChat(task);
+      } else if (task.stopping) {
+        task.stopping = false;
+        this.renderChat(task);
+      }
+    }
+    if (message) this.status.textContent = message;
+    this.updateControls();
   }
   submit() {
     const prompt = this.prompt.value;
@@ -219,43 +242,102 @@ export class AgentView {
       if (!resources.has(entry.nodeId)) resources.set(entry.nodeId, []);
       resources.get(entry.nodeId).push(entry);
     }
+    const scopeKeyOf = binding => `${binding.task_id}\0${binding.agenttomo_toolcall_id || ""}`;
+    const matchesScope = (agent, binding, solo) => {
+      if (!agent) return solo;
+      return agent.task_id === binding.task_id &&
+        (agent.agenttomo_toolcall_id || null) === (binding.agenttomo_toolcall_id || null);
+    };
+    const projectCard = (card, binding, solo, scopeKey) => {
+      if (card.type === "tcp") {
+        const records = (card.records || []).filter(r => matchesScope(r.event.data?.agent, binding, solo));
+        const children = (card.children || []).filter(child =>
+          (child.records || [child]).some(r => matchesScope(r.event.data?.agent, binding, solo))
+        );
+        const owned = card.children?.length ? children.length > 0 : records.length > 0;
+        if (!owned) return null;
+        const items = children.length ? children : records;
+        const started = items.reduce((min, item) => Math.min(min, item.started ?? eventTime(item.event) ?? Infinity), Infinity);
+        const scopedActivity = Math.max(
+          0,
+          ...records.map(r => sequences.get(r.id) || 0),
+          ...children.flatMap(c => (c.records || [c]).map(r => sequences.get(r.id) || 0)),
+        );
+        return {
+          ...card,
+          children,
+          started: Number.isFinite(started) ? started : card.started,
+          scopedActivity,
+          branchKey: `${card.id}:${scopeKey}`,
+        };
+      }
+      if (card.records) {
+        const records = card.records.filter(r => matchesScope(r.event.data?.agent, binding, solo));
+        if (!records.length) return null;
+        const scopedActivity = Math.max(0, ...records.map(r => sequences.get(r.id) || 0));
+        return { ...card, scopedActivity, branchKey: `${card.id}:${scopeKey}` };
+      }
+      if (!matchesScope(card.event.data?.agent, binding, solo)) return null;
+      return {
+        ...card,
+        scopedActivity: sequences.get(card.activity ?? card.id) || 0,
+        branchKey: `${card.id}:${scopeKey}`,
+      };
+    };
     for (const node of snapshot.nodes.values()) {
       // A conversation server spans turns. Project each observation under the
       // scope captured with that event, including late arrivals.
       const bindings = new Map();
       for (const entry of node.events) {
         const binding = entry.event.data?.agent;
-        if (binding) bindings.set(binding.task_id, binding);
+        if (binding?.task_id) bindings.set(scopeKeyOf(binding), binding);
       }
       const last = this.model.bindings.get(node.instanceId);
-      if (!bindings.size && last) bindings.set(last.task_id, last);
-      for (const binding of bindings.values()) {
-        const owns = entry => entry.event.data?.agent?.task_id === binding.task_id ||
-          (!entry.event.data?.agent && bindings.size === 1);
+      if (!bindings.size && last?.task_id) bindings.set(scopeKeyOf(last), last);
+      const solo = bindings.size === 1;
+      for (const [scopeKey, binding] of bindings) {
+        const owns = entry => matchesScope(entry.event.data?.agent, binding, solo);
         const events = node.events.filter(owns);
-        const owned = (resources.get(node.id) || []).filter(owns);
-        const key = `pid-${node.instanceId}-${binding.task_id}`;
-        const sequence = Math.max(0, ...events.map(entry => sequences.get(entry.id) || 0));
-        processes.push({...node, binding, events, owned, key});
+        const owned = (resources.get(node.id) || [])
+          .map(card => projectCard(card, binding, solo, scopeKey))
+          .filter(Boolean);
+        const key = binding.agenttomo_toolcall_id
+          ? `pid-${node.instanceId}-${binding.task_id}-${binding.agenttomo_toolcall_id}`
+          : `pid-${node.instanceId}-${binding.task_id}`;
+        const sequence = Math.max(
+          0,
+          ...events.map(entry => sequences.get(entry.id) || 0),
+          ...owned.map(card => card.scopedActivity || 0),
+        );
+        processes.push({ ...node, allEvents: node.events, binding, scopeKey, events, owned, key });
         this.activitySequences.set(key, sequence);
         taskActivity.set(binding.task_id, Math.max(taskActivity.get(binding.task_id) || 0, sequence));
         if (binding.agenttomo_toolcall_id) this.activitySequences.set(binding.agenttomo_toolcall_id, Math.max(this.activitySequences.get(binding.agenttomo_toolcall_id) || 0, sequence));
       }
     }
+    const byBranch = new Map(processes.map(proc => [`${proc.id}\0${proc.scopeKey}`, proc]));
+    for (const proc of processes) {
+      const sequence = this.activitySequences.get(proc.key) || 0;
+      for (let parent = byBranch.get(`${proc.parentId}\0${proc.scopeKey}`); parent; parent = byBranch.get(`${parent.parentId}\0${parent.scopeKey}`)) {
+        this.activitySequences.set(parent.key, Math.max(this.activitySequences.get(parent.key) || 0, sequence));
+      }
+    }
     const sameBranch = (parent, child) => parent.id === child.parentId &&
-      parent.binding.task_id === child.binding.task_id &&
-      parent.binding.agenttomo_toolcall_id === child.binding.agenttomo_toolcall_id;
-    const resource = entry => {
-      this.activitySequences.set(`resource-${entry.id}`, sequences.get(entry.activity ?? entry.id) || entry.event.sequence || 0);
-      return this.branch(`resource-${entry.id}`, entry.event.category || entry.event.kind.split(".")[0], entry.title || clipped(entry.description), entry.type ? entry.description : entry.event.kind,
-        (entry.children || []).map(resource), () => { this.closeDetail(); this.onSelect(entry.event); });
+      parent.scopeKey === child.scopeKey;
+    const resource = (entry, scopeKey = "") => {
+      const id = `resource-${entry.branchKey || (scopeKey ? `${entry.id}:${scopeKey}` : entry.id)}`;
+      this.activitySequences.set(id, entry.scopedActivity ?? (sequences.get(entry.activity ?? entry.id) || entry.event.sequence || 0));
+      return this.branch(id, entry.event.category || entry.event.kind.split(".")[0], entry.title || clipped(entry.description), entry.type ? entry.description : entry.event.kind,
+        (entry.children || []).map(child => resource(child, scopeKey)), () => { this.closeDetail(); this.onSelect(entry.event); });
     };
     const process = node => {
       const binding = node.binding;
-      const argv = [...node.events].reverse().find(entry => entry.event.kind === "process.exec")?.event.data.argv || [node.name || "Process"];
+      const argv = [...node.events].reverse().find(entry => entry.event.kind === "process.exec")?.event.data.argv
+        || [...(node.allEvents || [])].reverse().find(entry => entry.event.kind === "process.exec")?.event.data.argv
+        || [node.name || "Process"];
       const childProcesses = processes.filter(child => sameBranch(node, child));
       const children = () => {
-        const entries = node.owned.map(entry => ({ time: entry.started ?? eventTime(entry.event), item: resource(entry) }));
+        const entries = node.owned.map(entry => ({ time: entry.started ?? eventTime(entry.event), item: resource(entry, node.scopeKey) }));
         for (const child of childProcesses) entries.push({ time: child.events.length ? eventTime(child.events[0].event) : 0, item: process(child) });
         entries.sort((a, b) => (a.time || 0) - (b.time || 0));
         return entries.map(entry => entry.item);
@@ -263,7 +345,7 @@ export class AgentView {
       const evidence = [...node.events].reverse().find(entry => entry.event.kind === "process.exec")?.event || node.events[0]?.event;
       const inspect = evidence ? () => { this.closeDetail(); this.onSelect(evidence); } : null;
       const branch = this.branch(node.key, "process", formatCommand(argv), `PID ${node.pid} · ${node.exit || node.state} · ${binding.association}`, node.owned.length || childProcesses.length ? children : [], inspect, false);
-      if (binding.association.includes("inferred")) branch.classList.add("agent-inferred");
+      branch.classList.toggle("agent-inferred", Boolean(binding.association?.includes("inferred")));
       return branch;
     };
     const roots = (task, toolId) => processes.filter(node => {

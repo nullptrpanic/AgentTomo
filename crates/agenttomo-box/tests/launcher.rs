@@ -54,7 +54,7 @@ fn public_help_describes_run_and_playground() {
         .unwrap();
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
-    assert!(help.contains("agenttomo-playground-chrome:24.04"));
+    assert!(help.contains("agenttomo-playground:24.04"));
     assert!(help.contains("--image"));
     assert!(!help.contains("--browser"));
 }

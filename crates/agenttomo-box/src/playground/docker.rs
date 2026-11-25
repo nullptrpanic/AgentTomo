@@ -35,59 +35,6 @@ pub async fn check(image: &str) -> io::Result<String> {
         .to_owned())
 }
 
-pub async fn supports_browser(image: &str) -> io::Result<bool> {
-    let name = format!("agenttomo-probe-{}", uuid::Uuid::new_v4().simple());
-    let output = execute(
-        Command::new("docker")
-            .args([
-                "run",
-                "--pull=never",
-                "--rm",
-                "--name",
-                &name,
-                "--network=none",
-                "--read-only",
-                "--cap-drop=ALL",
-                "--security-opt=no-new-privileges",
-                "--user",
-            ])
-            .arg(format!(
-                "{}:{}",
-                nix::unistd::getuid(),
-                nix::unistd::getgid()
-            ))
-            .args([
-                "--entrypoint",
-                "/bin/sh",
-                image,
-                "-c",
-                r#"if [ ! -e /usr/local/bin/agenttomo-browser-session ] &&
-   [ ! -e /usr/local/bin/agenttomo-desktop ] &&
-   [ ! -e /usr/local/bin/agenttomo-chrome ]; then
-    exit 10
-fi
-for helper in agenttomo-browser-session agenttomo-desktop agenttomo-chrome; do
-    if [ ! -x "/usr/local/bin/$helper" ]; then
-        printf 'Missing executable browser helper: /usr/local/bin/%s\n' "$helper" >&2
-        exit 1
-    fi
-done"#,
-            ]),
-    )
-    .await;
-    // Also remove the named probe after a timeout or failed Docker client.
-    remove(&name).await?;
-    let output = output?;
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(10) => Ok(false),
-        _ => Err(io::Error::other(format!(
-            "cannot detect browser support in Docker image {image}: {}",
-            command_failure(&output)
-        ))),
-    }
-}
-
 fn mount(source: &Path, destination: &str, readonly: bool) -> io::Result<String> {
     let source = source.to_str().ok_or_else(|| {
         io::Error::new(
@@ -110,7 +57,6 @@ pub struct Create<'a> {
     pub tmpfs_size_mib: u32,
     pub preview_limits: crate::recording::file_preview::Limits,
     pub http: crate::proxy::http::Options,
-    pub browser: bool,
     pub rootfs: &'a crate::execution::rootfs::Options,
     pub agent: Option<&'a dyn crate::agent::Installation>,
     pub agent_id: &'a str,
@@ -123,7 +69,6 @@ pub async fn create(options: Create<'_>) -> io::Result<()> {
         tmpfs_size_mib,
         preview_limits,
         http,
-        browser,
         rootfs,
         agent,
         agent_id,
@@ -131,11 +76,6 @@ pub async fn create(options: Create<'_>) -> io::Result<()> {
     let mut rootfs = rootfs.clone();
     if rootfs.enabled {
         rootfs.exemptions.push("/records".into());
-        if browser {
-            rootfs
-                .exemptions
-                .extend(["/tmp/.X11-unix".into(), "/tmp/agenttomo-desktop".into()]);
-        }
     }
     let mut command = Command::new("docker");
     command
@@ -151,7 +91,7 @@ pub async fn create(options: Create<'_>) -> io::Result<()> {
                 "--init",
                 "--cap-drop=ALL",
                 // Root bootstrap needs credential mapping; DAC_OVERRIDE lets
-                // the collector inspect the browser's private files. Target
+                // the collector inspect the target's private files. Target
                 // capabilities are restricted in its own user namespace.
                 "--cap-add=SETUID",
                 "--cap-add=SETGID",
@@ -176,17 +116,6 @@ pub async fn create(options: Create<'_>) -> io::Result<()> {
                 "--env",
                 "PS1=\\u@playground:\\w\\$ ",
             ])
-            .args(if browser {
-                vec!["--shm-size=256m"]
-            } else {
-                vec![]
-            })
-            .args(if browser && rootfs.enabled {
-                vec![
-                    "--tmpfs", "/tmp/.X11-unix:rw,nosuid,nodev,noexec,size=1m,mode=1777",
-                    "--tmpfs", "/tmp/agenttomo-desktop:rw,nosuid,nodev,noexec,size=16m,mode=0711,uid=65534,gid=65534",
-                ]
-            } else { vec![] })
             .arg("--user")
             .arg("0:0")
             .arg("--mount")
@@ -223,12 +152,8 @@ pub async fn create(options: Create<'_>) -> io::Result<()> {
                 "--output-dir",
                 &format!("/records/{agent_id}/run"),
                 "-c",
-                if agent.is_some() && browser {
-                    "exec /agenttomo-box __workspace --browser"
-                } else if agent.is_some() {
+                if agent.is_some() {
                     "exec /agenttomo-box __workspace"
-                } else if browser {
-                    "exec /usr/local/bin/agenttomo-browser-session"
                 } else {
                     "exec /bin/bash --noprofile --norc -i"
                 },

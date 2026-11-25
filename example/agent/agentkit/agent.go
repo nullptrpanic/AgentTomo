@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -83,44 +84,82 @@ func (b *commandOutput) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-func runCommand(ctx agent.Context, args commandArgs) (map[string]any, error) {
-	ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctxWithTimeout, "/bin/bash", "-c", args.Command)
-	cmd.SysProcAttr = &unix.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		err := unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
-		if errors.Is(err, unix.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
-	}
-	cmd.Env = []string{}
-	for _, entry := range os.Environ() {
+func commandEnv(environ []string) []string {
+	env := make([]string, 0, 16)
+	for _, entry := range environ {
 		name, _, _ := strings.Cut(entry, "=")
 		switch name {
-		case "MODEL_AGENT_API_KEY", "OPENAI_API_KEY", "ARK_API_KEY":
-			continue
+		case "PATH", "HOME", "USER", "LOGNAME", "TERM", "SHELL",
+			"LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ", "PWD", "SHLVL",
+			"SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+			"NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE",
+			"AGENTTOMO_AGENT_ID", "AGENTTOMO_TASK_ID", "AGENTTOMO_TOOLCALL_ID":
+			env = append(env, entry)
 		}
-		cmd.Env = append(cmd.Env, entry)
 	}
+	return env
+}
+
+func runCommand(ctx agent.Context, args commandArgs) (map[string]any, error) {
+	return runShellCommand(ctx, args.Command, time.Minute)
+}
+
+func runShellCommand(ctx context.Context, command string, limit time.Duration) (map[string]any, error) {
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	cmd := exec.Command("/bin/bash", "-c", command)
+	cmd.SysProcAttr = &unix.SysProcAttr{Setpgid: true}
+	cmd.Env = commandEnv(os.Environ())
 	cmd.WaitDelay = time.Second
 	var output commandOutput
 	cmd.Stdout, cmd.Stderr = &output, &output
-	err := cmd.Start()
+	err := ctxWithTimeout.Err()
 	if err == nil {
+		err = cmd.Start()
+	}
+	if err == nil {
+		pgid := cmd.Process.Pid
+		var mu sync.Mutex
+		reaped := false
+		timedOut := false
+		done := make(chan struct{})
+		watchDone := make(chan struct{})
+		go func() {
+			defer close(watchDone)
+			select {
+			case <-ctxWithTimeout.Done():
+				mu.Lock()
+				if !reaped {
+					timedOut = true
+					_ = unix.Kill(-pgid, unix.SIGKILL)
+				}
+				mu.Unlock()
+			case <-done:
+			}
+		}()
 		// Observe exit without reaping the group leader. Its PID cannot be
 		// reused while we stop background children and release their pipes.
 		var info unix.Siginfo
 		var waitErr error
 		for {
-			waitErr = unix.Waitid(unix.P_PID, cmd.Process.Pid, &info, unix.WEXITED|unix.WNOWAIT, nil)
+			waitErr = unix.Waitid(unix.P_PID, pgid, &info, unix.WEXITED|unix.WNOWAIT, nil)
 			if !errors.Is(waitErr, unix.EINTR) {
 				break
 			}
 		}
-		_ = cmd.Cancel()
-		err = errors.Join(waitErr, cmd.Wait())
+		mu.Lock()
+		_ = unix.Kill(-pgid, unix.SIGKILL)
+		reaped = true
+		wasTimedOut := timedOut
+		mu.Unlock()
+		close(done)
+		<-watchDone
+		waitCmdErr := cmd.Wait()
+		if wasTimedOut && ctxWithTimeout.Err() != nil {
+			err = errors.Join(waitErr, waitCmdErr, ctxWithTimeout.Err())
+		} else {
+			err = errors.Join(waitErr, waitCmdErr)
+		}
 	}
 	result := map[string]any{"output": output.buffer.String(), "exit_code": -1}
 	if output.truncated {

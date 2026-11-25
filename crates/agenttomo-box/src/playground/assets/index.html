@@ -10,7 +10,6 @@
   <link rel="stylesheet" href="/assets/style.css">
   <link rel="stylesheet" href="/assets/file-preview.css">
   <link rel="stylesheet" href="/assets/traffic.css">
-  <link rel="stylesheet" href="/assets/browser.css">
   <link rel="stylesheet" href="/assets/agent.css">
   <link rel="stylesheet" href="/assets/samples.css">
   <script defer src="/assets/vendor/xterm.js"></script>
@@ -35,7 +34,7 @@
   <main>
     <section id="workspace-panel" class="terminal-panel" aria-labelledby="terminal-title">
       <div class="panel-heading"><div><span class="eyebrow">WORKSPACE</span><h1 id="terminal-title">Container terminal</h1></div><span id="image" class="image-label">Docker</span></div>
-      <div class="terminal-toolbar"><nav class="workspace-tabs" aria-label="Workspace view"><button type="button" data-workspace="terminal" aria-pressed="true">Terminal</button><button id="browser-tab" type="button" data-workspace="browser" aria-pressed="false" hidden>Browser</button><button id="chat-tab" type="button" data-workspace="chat" aria-pressed="false">Chat</button><button type="button" data-workspace="samples" aria-pressed="false">Security tests</button></nav><span id="session-id">Creating a temporary container…</span></div>
+      <div class="terminal-toolbar"><nav class="workspace-tabs" aria-label="Workspace view"><button type="button" data-workspace="terminal" aria-pressed="true">Terminal</button><button id="chat-tab" type="button" data-workspace="chat" aria-pressed="false">Chat</button><button type="button" data-workspace="samples" aria-pressed="false">Security tests</button></nav><span id="session-id">Creating a temporary container…</span></div>
       <section id="agent-chat" aria-label="Agent conversation" hidden>
         <div class="agent-history-region">
           <div class="agent-history" aria-live="polite"></div>
@@ -48,11 +47,6 @@
       </section>
       <section id="security-samples" aria-label="Built-in security samples" tabindex="0" hidden></section>
       <div id="terminal" aria-label="Interactive container terminal"></div>
-      <section id="browser" aria-label="Container Chrome window" hidden>
-        <div class="browser-toolbar"><span id="browser-status" role="status">Waiting for desktop</span><button id="browser-reconnect" type="button" disabled>Reconnect display</button></div>
-        <div id="browser-screen" aria-label="Interactive remote desktop"></div>
-        <p class="browser-help">Chrome is part of this traced session. Reopen a closed window with <code>google-chrome</code> in Terminal.</p>
-      </section>
       <div class="terminal-footer"><span><span class="small-dot"></span> Isolated Docker session</span><span id="workspace-hint">Ctrl-C to interrupt · Ctrl-D to exit</span></div>
     </section>
     <div id="panel-resizer" role="separator" tabindex="0" aria-label="Resize workspace and activity panels" aria-orientation="vertical" aria-controls="workspace-panel" title="Drag to resize · Arrow keys to adjust · Double-click to reset"></div>

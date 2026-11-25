@@ -334,3 +334,44 @@ fn direct_routes_check_the_resolved_address_including_mapped_ipv4() {
         assert!(!public_destination(ip.parse().unwrap()));
     }
 }
+
+#[tokio::test]
+async fn proxied_routes_reject_unconfigured_local_and_private_destinations() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy: Proxy = format!("http://{}", listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    for destination in [
+        "127.0.0.1:8080",
+        "127.1:8080",
+        "0177.0.0.1:8080",
+        "2130706433:8080",
+        "169.254.169.254:80",
+        "10.0.0.1:443",
+        "[::1]:8080",
+        "[::ffff:127.0.0.1]:8080",
+        "localhost:8080",
+        "LOCALHOST.:8080",
+        "localhost.localdomain:8080",
+        "metadata.google.internal:80",
+        "intranet:80",
+    ] {
+        let authority: HttpAuthority = destination.parse().unwrap();
+        assert!(
+            connect(&authority, Some(&proxy), false).await.is_err(),
+            "{destination}"
+        );
+    }
+    let accept = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = headers(&mut socket).await;
+        assert!(request.starts_with("CONNECT 127.0.0.1:8080 HTTP/1.1\r\n"));
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let authority: HttpAuthority = "127.0.0.1:8080".parse().unwrap();
+    connect(&authority, Some(&proxy), true).await.unwrap();
+    accept.await.unwrap();
+}

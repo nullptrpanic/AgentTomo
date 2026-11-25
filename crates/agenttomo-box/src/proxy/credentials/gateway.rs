@@ -187,6 +187,21 @@ impl Gateway {
     }
 }
 
+fn local_interface_ips() -> io::Result<Vec<IpAddr>> {
+    let mut local = Vec::new();
+    for interface in nix::ifaddrs::getifaddrs()? {
+        if let Some(address) = interface.address {
+            if let Some(v4) = address.as_sockaddr_in() {
+                local.push(IpAddr::V4(v4.ip()));
+            }
+            if let Some(v6) = address.as_sockaddr_in6() {
+                local.push(IpAddr::V6(v6.ip()).to_canonical());
+            }
+        }
+    }
+    Ok(local)
+}
+
 async fn connect(
     target: &HttpAuthority,
     proxy: Option<&Proxy>,
@@ -197,23 +212,39 @@ async fn connect(
         .port_u16()
         .ok_or_else(|| invalid("CONNECT port is required"))?;
     if proxy.is_some() {
-        let ip = host.parse().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        let domain = host.parse::<IpAddr>().is_err().then_some(host);
-        outbound::connect(SocketAddr::new(ip, port), proxy, domain).await
-    } else {
-        let mut local = Vec::new();
+        let parsed = crate::proxy::tcp::protocol::parse_ip_literal(host);
         if !configured {
-            for interface in nix::ifaddrs::getifaddrs()? {
-                if let Some(address) = interface.address {
-                    if let Some(v4) = address.as_sockaddr_in() {
-                        local.push(IpAddr::V4(v4.ip()));
-                    }
-                    if let Some(v6) = address.as_sockaddr_in6() {
-                        local.push(IpAddr::V6(v6.ip()).to_canonical());
-                    }
+            let local = local_interface_ips()?;
+            let allowed =
+                |ip: IpAddr| public_destination(ip) && !local.contains(&ip.to_canonical());
+            if let Some(ip) = parsed {
+                if !allowed(ip) {
+                    return Err(invalid("proxied destination is restricted"));
+                }
+            } else {
+                let normalized = host.trim_end_matches('.');
+                if crate::proxy::tcp::protocol::is_local_hostname(normalized)
+                    || !normalized.contains('.')
+                {
+                    return Err(invalid("proxied destination is restricted"));
+                }
+                if let Ok(Ok(resolved)) =
+                    timeout(Duration::from_secs(2), tokio::net::lookup_host((host, port))).await
+                    && resolved.into_iter().any(|addr| !allowed(addr.ip()))
+                {
+                    return Err(invalid("proxied destination is restricted"));
                 }
             }
         }
+        let ip = parsed.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let domain = parsed.is_none().then_some(host);
+        outbound::connect(SocketAddr::new(ip, port), proxy, domain).await
+    } else {
+        let local = if configured {
+            Vec::new()
+        } else {
+            local_interface_ips()?
+        };
         let addresses: Vec<_> = tokio::net::lookup_host((host, port))
             .await?
             .filter(|addr| {

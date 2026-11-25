@@ -26,9 +26,6 @@ pub async fn get(Path(path): Path<String>, headers: HeaderMap) -> Response {
         "observation.mjs" => ("text/javascript", include_str!("assets/observation.mjs")),
         "monitor.mjs" => ("text/javascript", include_str!("assets/monitor.mjs")),
         "panel-resize.mjs" => ("text/javascript", include_str!("assets/panel-resize.mjs")),
-        "browser-view.mjs" => ("text/javascript", include_str!("assets/browser-view.mjs")),
-        "browser.css" => ("text/css", include_str!("assets/browser.css")),
-        "vendor/novnc.mjs" => ("text/javascript", include_str!("assets/vendor/novnc.mjs")),
         "vendor/marked.mjs" => ("text/javascript", include_str!("assets/vendor/marked.mjs")),
         "vendor/dompurify.mjs" => (
             "text/javascript",
@@ -45,14 +42,6 @@ pub async fn get(Path(path): Path<String>, headers: HeaderMap) -> Response {
         "vendor/dompurify-LICENSE-MPL.txt" => (
             "text/plain",
             include_str!("assets/vendor/dompurify-LICENSE-MPL.txt"),
-        ),
-        "vendor/novnc-LICENSE.txt" => (
-            "text/plain",
-            include_str!("assets/vendor/novnc-LICENSE.txt"),
-        ),
-        "vendor/novnc-NOTICES.txt" => (
-            "text/plain",
-            include_str!("assets/vendor/novnc-NOTICES.txt"),
         ),
         "traffic-view.mjs" => ("text/javascript", include_str!("assets/traffic-view.mjs")),
         "traffic-model.mjs" => ("text/javascript", include_str!("assets/traffic-model.mjs")),

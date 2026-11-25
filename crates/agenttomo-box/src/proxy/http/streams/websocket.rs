@@ -236,6 +236,7 @@ impl Observer {
                         message.feed(bytes)
                     })
                 {
+                    self.failed = true;
                     self.emit(message, false);
                     self.fail(&error);
                     return;

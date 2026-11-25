@@ -92,7 +92,7 @@ async fn collect(
         crate::proxy::http::Inspection::create(recording.directory(), http, agents.clone()).await?;
     let trust = inspection
         .as_ref()
-        .map(|inspection| super::trust::Overlay::new(&inspection.authority.pem))
+        .map(|inspection| super::trust::Overlay::new(&inspection.authority.pem, !rootfs.enabled))
         .transpose()?;
     let registry = crate::network::association::Registry::with_agents(agents.clone());
     let associations = registry.clone();

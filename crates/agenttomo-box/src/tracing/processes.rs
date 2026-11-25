@@ -97,17 +97,29 @@ impl Registry {
         })
     }
 
+    pub fn is_live_pid(&self, pid: i32) -> bool {
+        self.groups.contains_key(&pid)
+    }
+
     pub fn exec(&mut self, handle: Pid, former: Pid) -> Identity {
-        if let Some(tracee) = self.tracees.remove(&former) {
-            if former != handle {
-                self.tracees.remove(&handle);
-                self.unparented_exits
-                    .retain(|(_, owner), _| *owner != tracee.identity.process_instance_id);
-            }
-            let group = self.groups.get_mut(&tracee.identity.pid).unwrap();
-            group.members.remove(&former);
-            group.members.insert(handle);
+        if let Some(mut tracee) = self.tracees.remove(&former) {
             let identity = tracee.identity;
+            if former != handle {
+                if let Some(leader) = self.tracees.remove(&handle) {
+                    tracee.parent = leader.parent;
+                } else if tracee.parent == Some(identity) {
+                    tracee.parent = None;
+                }
+            }
+            // exec destroys all other threads in the group, so no pending
+            // pre-exec creation stop from this process can still arrive.
+            self.unparented_exits
+                .retain(|(_, owner), _| *owner != identity.process_instance_id);
+            let group = self.groups.get_mut(&identity.pid).unwrap();
+            group.members.retain(|member| *member == handle);
+            group.members.insert(handle);
+            self.tracees
+                .retain(|tid, entry| *tid == handle || entry.identity != identity);
             self.tracees.insert(handle, tracee);
             identity
         } else {
@@ -229,5 +241,31 @@ mod tests {
         registry.exit(parent);
         registry.exit(child);
         assert!(registry.unparented_exits.is_empty());
+    }
+
+    #[test]
+    fn main_and_nonleader_exec_clean_unparented_exits_and_preserve_parent() {
+        let mut registry = Registry::default();
+        let grandparent = Pid::from_raw(5);
+        let leader = Pid::from_raw(10);
+        let worker = Pid::from_raw(11);
+        let child = Pid::from_raw(12);
+        let gp = registry.register(grandparent, 5);
+        registry.child(grandparent, None);
+        let creator = registry.register(leader, 10);
+        registry.tracees.get_mut(&leader).unwrap().parent = Some(gp);
+        registry.child(leader, Some(gp));
+        registry.register(child, 12);
+        registry.tracees.get_mut(&child).unwrap().parent = Some(creator);
+        registry.exit(child);
+        // Main-thread exec must clear stale unparented exits too.
+        assert_eq!(registry.exec(leader, leader), creator);
+        assert!(registry.unparented_exits.is_empty());
+
+        // Non-leader exec must keep the leader's parent rather than self-referencing.
+        registry.register(worker, 10);
+        registry.tracees.get_mut(&worker).unwrap().parent = Some(creator);
+        assert_eq!(registry.exec(leader, worker), creator);
+        assert_eq!(registry.tracees[&leader].parent, Some(gp));
     }
 }

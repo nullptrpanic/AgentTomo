@@ -263,6 +263,7 @@ async fn forward(
     let mut incoming = vec![0; 65536];
     let mut counts = Counts::default();
     let mut metadata: Option<Metadata> = None;
+    let mut last_socket_id: Option<u64> = None;
     let mut timing: Option<TransferTiming> = None;
     let idle = tokio::time::sleep(Duration::from_secs(120));
     tokio::pin!(idle);
@@ -274,17 +275,25 @@ async fn forward(
                     Some(at) => registry.resolve(&key, Some(at)).await,
                     None => None,
                 };
-                if metadata.as_ref().map(|m| m.socket_id) != next.as_ref().map(|m| m.socket_id)
-                    && let Some(previous) = timing.take()
-                {
-                    let reason = if metadata.is_some() && next.is_some() { "socket_replaced" } else { "attribution_changed" };
+                let same_owner = metadata.as_ref().map(|m| (m.socket_id, &m.agent))
+                    == next.as_ref().map(|m| (m.socket_id, &m.agent));
+                if !same_owner && let Some(previous) = timing.take() {
+                    let replaced = last_socket_id.is_some()
+                        && next
+                            .as_ref()
+                            .is_some_and(|m| Some(m.socket_id) != last_socket_id);
+                    let reason = if replaced { "socket_replaced" } else { "attribution_changed" };
                     emit(&events, summary(key, id, metadata.as_ref(), &counts, previous, reason)).await?;
-                    if reason == "socket_replaced" {
-                        let Some(next) = bind(id).await? else { return Ok(()) }; upstream = next;
-                    }
                     id = ids.fetch_add(1, Ordering::Relaxed);
                     flow_id.store(id, Ordering::Relaxed);
+                    if replaced {
+                        let Some(next_socket) = bind(id).await? else { return Ok(()) };
+                        upstream = next_socket;
+                    }
                     counts = Counts::default();
+                }
+                if let Some(m) = &next {
+                    last_socket_id = Some(m.socket_id);
                 }
                 timing.get_or_insert(request.received);
                 metadata = next;
@@ -307,7 +316,13 @@ async fn forward(
                     }
                 };
                 if peer.ip().to_canonical() != key.destination.ip().to_canonical() { continue; }
-                let bytes = packet::reply(peer, key.source, &incoming[..size])?;
+                let bytes = match packet::reply(peer, key.source, &incoming[..size]) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        emit(&events, event(key, id, metadata.as_ref(), "network.udp.error", json!({"stage":"reply", "error":error.to_string()}))).await?;
+                        continue;
+                    }
+                };
                 match raw_reply(&reply, &bytes, key.source).await {
                     Ok(()) => {
                         counts.down += size as u64;

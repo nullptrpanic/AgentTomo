@@ -217,37 +217,46 @@ fn rooted(root: &File, path: &Path, flags: OFlag) -> Option<File> {
         .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_MAGICLINKS);
     match openat2(root, path, how) {
         Ok(fd) => Some(fd.into()),
-        Err(nix::errno::Errno::ENOSYS) => {
-            // On older kernels walk simple paths with pinned directory handles.
-            let mut dirs = vec![root.try_clone().ok()?];
-            for component in path.components() {
-                match component {
-                    Component::RootDir | Component::CurDir => {}
-                    Component::ParentDir => {
-                        if dirs.len() > 1 {
-                            dirs.pop();
-                        }
-                    }
-                    Component::Normal(name) => {
-                        if !dirs.last()?.metadata().ok()?.is_dir() {
-                            return None;
-                        }
-                        let fd = openat(
-                            dirs.last()?,
-                            Path::new(name),
-                            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-                            Mode::empty(),
-                        )
-                        .ok()?;
-                        dirs.push(fd.into());
-                    }
-                    Component::Prefix(_) => return None,
-                }
-            }
-            dirs.pop()
-        }
+        Err(nix::errno::Errno::ENOSYS) => rooted_fallback(root, path, flags),
         Err(_) => None,
     }
+}
+
+fn rooted_fallback(root: &File, path: &Path, flags: OFlag) -> Option<File> {
+    // On older kernels walk simple paths with pinned directory handles.
+    let mut dirs = vec![root.try_clone().ok()?];
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                if !dirs.last()?.metadata().ok()?.is_dir() {
+                    return None;
+                }
+                if dirs.len() > 1 {
+                    dirs.pop();
+                }
+            }
+            Component::Normal(name) => {
+                if !dirs.last()?.metadata().ok()?.is_dir() {
+                    return None;
+                }
+                let fd = openat(
+                    dirs.last()?,
+                    Path::new(name),
+                    OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .ok()?;
+                dirs.push(fd.into());
+            }
+            Component::Prefix(_) => return None,
+        }
+    }
+    let resolved = dirs.pop()?;
+    if flags.contains(OFlag::O_DIRECTORY) && !resolved.metadata().ok()?.is_dir() {
+        return None;
+    }
+    Some(resolved)
 }
 
 fn argument_pin(tid: Pid, dirfd: i32, pointer: u64, nofollow: bool) -> Option<File> {
@@ -395,6 +404,9 @@ mod tests {
             let observed = rooted(&root, Path::new("/../current/report"), OFlag::empty()).unwrap();
             assert!(same_file(&observed, &File::open(report).unwrap()));
         }
+        assert!(rooted_fallback(&root, Path::new("/public/report/.."), OFlag::empty()).is_none());
+        assert!(rooted_fallback(&root, Path::new("/public/report"), OFlag::O_DIRECTORY).is_none());
+        assert!(rooted_fallback(&root, Path::new("/public"), OFlag::O_DIRECTORY).is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

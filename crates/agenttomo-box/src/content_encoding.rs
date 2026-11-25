@@ -39,7 +39,7 @@ impl ContentEncoding {
                 decoder.window_log_max(
                     limit
                         .saturating_sub(1)
-                        .max(1 << 20)
+                        .max(1 << 23)
                         .next_power_of_two()
                         .ilog2()
                         .min(26),

@@ -274,7 +274,7 @@ try {
   const invalid = await context.newPage();
   await invalid.goto(`${url}&monitor=invalid`);
   await until(async () => await invalid.locator("#status").textContent() === "Session error", "invalid monitor must fail read-only");
-  assert.equal(sockets.filter(socket => socket.page !== owner).length, 0, "monitors must never open owner or desktop WebSockets");
+  assert.equal(sockets.filter(socket => socket.page !== owner).length, 0, "monitors must never open owner WebSockets");
   await invalid.close();
   await owner.close();
   await until(async () => await monitor.locator("#status").textContent() === "Session ended", "closing owner ends the existing session");

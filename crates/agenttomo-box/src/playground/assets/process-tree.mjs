@@ -67,7 +67,11 @@ export class ProcessTree {
       let parent = node;
       while (parent && parent !== child) parent = this.nodes.get(parent.parentId);
       if (!parent) {
-        this.nodes.get(child.parentId)?.children.delete(child.id);
+        const previousParent = this.nodes.get(child.parentId);
+        if (previousParent && previousParent !== node) {
+          previousParent.children.delete(child.id);
+          this.prune(previousParent);
+        }
         child.parentId = node.id;
         child.birth = event.kind.replace("process.", "");
         child.startedNs ??= time;

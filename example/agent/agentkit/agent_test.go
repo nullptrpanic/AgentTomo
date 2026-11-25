@@ -61,7 +61,7 @@ func TestAgentStreamsOverHTTP(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		last := call.Messages[len(call.Messages)-1]
 		if last.Role != "tool" {
-			args, _ := json.Marshal(map[string]string{"command": `sleep 5 & test -z "${MODEL_AGENT_API_KEY+x}${OPENAI_API_KEY+x}${ARK_API_KEY+x}" && printf sandbox-tool > proof.txt && cat proof.txt`})
+			args, _ := json.Marshal(map[string]string{"command": `sleep 5 & test -z "${MODEL_AGENT_API_KEY+x}${OPENAI_API_KEY+x}${ARK_API_KEY+x}${VOLCENGINE_SECRET_KEY+x}${AWS_SECRET_ACCESS_KEY+x}" && printf sandbox-tool > proof.txt && cat proof.txt`})
 			chunk, _ := json.Marshal(map[string]any{
 				"id": "tool-round", "object": "chat.completion.chunk", "model": "fixture-model",
 				"choices": []any{map[string]any{"index": 0, "finish_reason": "tool_calls", "delta": map[string]any{
@@ -115,7 +115,8 @@ func TestAgentStreamsOverHTTP(t *testing.T) {
 	child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAgentStreamsOverHTTP$")
 	child.Dir = workspace
 	child.Env = append(os.Environ(), "AGENTKIT_TEST_CHILD_PORT="+port, "MODEL_AGENT_PROVIDER=ark", "MODEL_AGENT_NAME=fixture-model",
-		"MODEL_AGENT_API_BASE="+model.URL+"/api/v3", "MODEL_AGENT_API_KEY=fixture-key")
+		"MODEL_AGENT_API_BASE="+model.URL+"/api/v3", "MODEL_AGENT_API_KEY=fixture-key",
+		"VOLCENGINE_SECRET_KEY=host-volc-secret", "AWS_SECRET_ACCESS_KEY=host-aws-secret")
 	var logs bytes.Buffer
 	child.Stdout, child.Stderr = &logs, &logs
 	if err := child.Start(); err != nil {
@@ -203,5 +204,50 @@ func TestCommandOutputKeepsOnlyBoundedPrefix(t *testing.T) {
 	n, err := io.Copy(&dst, bytes.NewReader(input))
 	if err != nil || n != int64(len(input)) || !dst.truncated || dst.buffer.Len() != commandOutputLimit {
 		t.Fatalf("copied %d, retained %d, truncated %v, error %v", n, dst.buffer.Len(), dst.truncated, err)
+	}
+}
+
+func TestCommandEnvAllowlistStripsCredentials(t *testing.T) {
+	filtered := commandEnv([]string{
+		"PATH=/usr/bin:/bin",
+		"HOME=/root",
+		"SSL_CERT_FILE=/etc/ssl/certs/agenttomo-task-ca.pem",
+		"AGENTTOMO_TASK_ID=task-1",
+		"MODEL_AGENT_API_KEY=secret-1",
+		"OPENAI_API_KEY=secret-2",
+		"ARK_API_KEY=secret-3",
+		"VOLCENGINE_SECRET_KEY=secret-4",
+		"AWS_SECRET_ACCESS_KEY=secret-5",
+		"CUSTOM_TOKEN=secret-6",
+	})
+	joined := strings.Join(filtered, "\n")
+	for _, want := range []string{
+		"PATH=/usr/bin:/bin",
+		"HOME=/root",
+		"SSL_CERT_FILE=/etc/ssl/certs/agenttomo-task-ca.pem",
+		"AGENTTOMO_TASK_ID=task-1",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected %q in %v", want, filtered)
+		}
+	}
+	for _, secret := range []string{"secret-1", "secret-2", "secret-3", "secret-4", "secret-5", "secret-6"} {
+		if strings.Contains(joined, secret) {
+			t.Fatalf("unexpected secret %q in %v", secret, filtered)
+		}
+	}
+}
+
+func TestRunShellCommandTimeoutKillsProcessGroup(t *testing.T) {
+	start := time.Now()
+	result, err := runShellCommand(t.Context(), "sleep 30 & sleep 30", 150*time.Millisecond)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("timeout did not stop process group promptly: %v", elapsed)
+	}
+	if result["error"] == nil {
+		t.Fatalf("expected timeout error in result: %v", result)
 	}
 }

@@ -108,6 +108,12 @@ impl Hub {
         let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, identity.pid, 0) };
         if fd < 0 {
             let error = std::io::Error::last_os_error();
+            if cancelled {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(identity.pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
             return if error.raw_os_error() == Some(nix::libc::ESRCH) {
                 Ok(())
             } else {

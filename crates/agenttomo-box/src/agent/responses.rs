@@ -204,7 +204,11 @@ impl Response {
     }
 
     fn complete_item(&mut self, item: &Value, events: &mut Vec<Event>) {
-        let Some(id) = item["id"].as_str().or_else(|| item["call_id"].as_str()) else {
+        let Some(id) = item["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .or_else(|| item["call_id"].as_str().filter(|id| !id.is_empty()))
+        else {
             return;
         };
         if !self.done.insert(id.to_owned()) {
@@ -426,5 +430,27 @@ mod tests {
                 .any(|event| event.kind == "agent.message" && event.content == Some(json!("done")))
         );
         assert_eq!(events.last().unwrap().kind, "agent.model.complete");
+    }
+
+    #[test]
+    fn empty_item_id_falls_back_to_call_id_without_dedup_collision() {
+        let mut response = Response::default();
+        let events = response.event(json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp2",
+                "output": [
+                    {"type": "function_call", "id": "", "call_id": "call-1", "name": "a", "arguments": "{}"},
+                    {"type": "function_call", "id": "", "call_id": "call-2", "name": "b", "arguments": "{}"}
+                ]
+            }
+        }));
+        let calls: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "agent.tool.call")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].data["call_id"], "call-1");
+        assert_eq!(calls[1].data["call_id"], "call-2");
     }
 }

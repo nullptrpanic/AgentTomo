@@ -37,6 +37,7 @@ export class StreamView {
       try {
         const snapshot = await this.load(this.requestId, null, this.pollRequest.signal);
         if (!this.active || request.signal.aborted) return;
+        this.consecutiveErrors = 0;
         const previous = this.model.selected;
         const expired = this.model.update(snapshot);
         const signature = `${this.model.messages.length}:${this.model.messages[0]?.id}:${this.model.messages.at(-1)?.id}`;
@@ -47,7 +48,8 @@ export class StreamView {
         if (finalRead) { this.complete = true; return; }
       } catch (error) {
         if (request.signal.aborted) return;
-        const terminal = this.finished || this.row.streamClosed || [400,401,403,404,410].includes(error.status);
+        this.consecutiveErrors = (this.consecutiveErrors || 0) + 1;
+        const terminal = this.finished || [400,401,403,404,410].includes(error.status) || (this.row.streamClosed && this.consecutiveErrors >= 3);
         if (this.active && error.name !== "AbortError") this.root.querySelector(".stream-retention").textContent = `Messages unavailable: ${error.message}.${terminal ? "" : " Retrying…"}`;
         if (terminal) { this.complete = true; return; }
       }
@@ -78,8 +80,7 @@ export class StreamView {
     this.renderedTop = this.list.scrollTop;
   }
   async renderPayload(expired = false) {
-    this.payloadRequest?.abort(); const version = ++this.version;
-    this.payloadRequest = new AbortController();
+    this.payloadRequest?.abort(); this.payloadRequest = null; const version = ++this.version;
     const message = this.model.messages.find(message => message.id === this.model.selected);
     const status = this.root.querySelector(".stream-payload-status"), body = this.root.querySelector(".stream-payload"), copy = this.root.querySelector(".stream-copy");
     resetCopyFeedback(copy);
@@ -88,8 +89,9 @@ export class StreamView {
     this.onSelect({ kind: "network.stream.message", category: "network", source: "tcp_proxy", data: message });
     if (message.kind === "inspection_error") { status.textContent = message.error; return; }
     status.textContent = "Loading retained message…";
+    const request = this.payloadRequest = new AbortController();
     try {
-      const bytes = await this.load(this.requestId, message.id, this.payloadRequest.signal);
+      const bytes = await this.load(this.requestId, message.id, request.signal);
       if (!this.active || version !== this.version) return;
       this.payloadRequest = null;
       const content = previewContent(bytes, { pretty: true, truncated: message.truncated || message.complete === false, forceHex: message.kind === "binary" || message.decoded === false });
@@ -100,6 +102,7 @@ export class StreamView {
       copy.setAttribute("aria-label", copy.title);
       copy.onclick = async () => { try { await copyWithFeedback(copy, content.text); if (this.active && version === this.version) status.textContent = "Displayed message copied."; } catch (error) { if (this.active && version === this.version) status.textContent = error.message; } };
     } catch (error) {
+      if (version === this.version) this.payloadRequest = null;
       if (this.active && version === this.version) status.textContent = error.status === 410 ? "Message expired from the sliding window." : `Message unavailable: ${error.message}`;
     }
   }

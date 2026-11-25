@@ -4,7 +4,6 @@ mod agent_egress;
 mod assets;
 pub(crate) mod bridge;
 mod config;
-mod desktop;
 mod docker;
 mod monitor;
 #[cfg(test)]
@@ -16,7 +15,7 @@ mod session;
 mod streams;
 mod trace_feed;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -34,7 +33,6 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::cli::PlaygroundArgs;
 
 struct Settings {
-    browser: bool,
     image: String,
     image_id: String,
     binary: PathBuf,
@@ -49,16 +47,37 @@ struct Settings {
     credential_gateway: Option<Arc<crate::proxy::credentials::gateway::Gateway>>,
 }
 
+const MAX_ENDED_VIEWERS: usize = 1024;
+const PAGE_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'";
+
 #[derive(Clone)]
 struct App {
     settings: Arc<Settings>,
     shutdown: CancellationToken,
     sessions: TaskTracker,
-    desktops: Arc<Mutex<HashMap<String, desktop::Display>>>,
     running: Arc<Mutex<HashMap<String, Option<i32>>>>,
     proxy_peers: agent_egress::Peers,
     // None only inside the container read service (and filesystem API tests).
     bridges: Option<Arc<Mutex<HashMap<String, bridge::Client>>>>,
+    ended_viewers: Arc<Mutex<VecDeque<(String, String)>>>,
+}
+
+impl App {
+    fn remember_ended_viewer(&self, id: String, viewer: String) {
+        let mut ended = self.ended_viewers.lock().unwrap();
+        if ended.len() >= MAX_ENDED_VIEWERS {
+            ended.pop_front();
+        }
+        ended.push_back((id, viewer));
+    }
+
+    fn is_ended(&self, id: &str) -> bool {
+        self.ended_viewers
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(session, _)| session == id)
+    }
 }
 
 #[derive(Deserialize)]
@@ -97,12 +116,18 @@ impl Access {
                 .is_some_and(|client| self.matches(client.viewer()))
         })
     }
+    fn was_monitor(&self, app: &App, id: &str) -> bool {
+        app.ended_viewers
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(session, viewer)| session == id && self.matches(viewer))
+    }
 }
 
 pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
     let config = config::Config::load(&options)?;
     let image_id = docker::check(&config.image).await?;
-    let browser = docker::supports_browser(&image_id).await?;
     let shutdown = CancellationToken::new();
     let proxy_peers = agent_egress::Peers::default();
     let credential_gateway = (!config.agents.is_empty())
@@ -120,7 +145,6 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
     http.enabled = config.capture_http;
     let app = App {
         settings: Arc::new(Settings {
-            browser,
             image: config.image,
             image_id,
             binary: std::fs::canonicalize(std::env::current_exe()?)?,
@@ -136,10 +160,10 @@ pub async fn run(options: PlaygroundArgs) -> io::Result<()> {
         }),
         shutdown,
         sessions: TaskTracker::new(),
-        desktops: Default::default(),
         running: Default::default(),
         proxy_peers,
         bridges: Some(Default::default()),
+        ended_viewers: Default::default(),
     };
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let address = listener.local_addr()?;
@@ -172,7 +196,6 @@ fn router(app: App) -> Router {
         .route("/", get(index))
         .route("/api/agents", get(available_agents))
         .route("/ws", get(websocket))
-        .route("/api/sessions/{session}/desktop", get(desktop::websocket))
         .route("/assets/{*path}", get(assets::get))
         .layer(axum::middleware::from_fn(browser_access))
         .with_state(app)
@@ -201,14 +224,21 @@ async fn browser_access(
         !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
     }) {
         let uri = request.uri();
-        let target = uri.path_and_query().map_or("/", |value| value.as_str());
-        if let Ok(uri) = format!(
-            "{target}{}token={token}",
-            if uri.query().is_some() { "&" } else { "?" }
-        )
-        .parse()
-        {
-            *request.uri_mut() = uri;
+        let has_token = uri.query().is_some_and(|query| {
+            query
+                .split('&')
+                .any(|part| part == "token" || part.starts_with("token="))
+        });
+        if !has_token {
+            let target = uri.path_and_query().map_or("/", |value| value.as_str());
+            if let Ok(uri) = format!(
+                "{target}{}token={token}",
+                if uri.query().is_some() { "&" } else { "?" }
+            )
+            .parse()
+            {
+                *request.uri_mut() = uri;
+            }
         }
     }
     next.run(request).await
@@ -247,21 +277,30 @@ async fn index(State(app): State<App>, Query(page): Query<PageAccess>) -> Respon
         && !page
             .monitor
             .as_deref()
-            .is_some_and(|id| page.access.can_monitor(&app, id))
+            .is_some_and(|id| page.access.can_monitor(&app, id) || page.access.was_monitor(&app, id))
     {
         return (
             StatusCode::UNAUTHORIZED,
-            [(header::CACHE_CONTROL, "no-store"), (header::REFERRER_POLICY, "no-referrer")],
+            [
+                (header::CACHE_CONTROL, "no-store"),
+                (header::REFERRER_POLICY, "no-referrer"),
+                (header::CONTENT_SECURITY_POLICY, PAGE_CSP),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
             Html(r#"<!doctype html><meta charset="utf-8"><p>Open the complete access URL printed by agenttomo-box playground.</p><script type="module" src="/assets/resume.mjs"></script>"#),
         )
             .into_response();
     }
-    ([
-        (header::CACHE_CONTROL, "no-store"),
-        (header::REFERRER_POLICY, "no-referrer"),
-        (header::CONTENT_SECURITY_POLICY, "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"),
-        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-    ], Html(include_str!("assets/index.html"))).into_response()
+    (
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::CONTENT_SECURITY_POLICY, PAGE_CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        Html(include_str!("assets/index.html")),
+    )
+        .into_response()
 }
 
 async fn available_agents(State(app): State<App>, Query(access): Query<Access>) -> Response {
@@ -378,7 +417,6 @@ mod tests {
         store.flush().await.unwrap();
         let app = App {
             settings: Arc::new(Settings {
-                browser: false,
                 image: String::new(),
                 image_id: String::new(),
                 binary: PathBuf::new(),
@@ -394,10 +432,10 @@ mod tests {
             }),
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
-            desktops: Default::default(),
             running: Default::default(),
             proxy_peers: Default::default(),
             bridges: None,
+            ended_viewers: Default::default(),
         };
         let router = router(app);
         let base = format!("/api/sessions/{id}/stream-messages");
@@ -486,7 +524,6 @@ mod tests {
         std::fs::write(&payload, b"abcdefgh").unwrap();
         let app = App {
             settings: Arc::new(Settings {
-                browser: false,
                 image: String::new(),
                 image_id: String::new(),
                 binary: PathBuf::new(),
@@ -502,10 +539,10 @@ mod tests {
             }),
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
-            desktops: Default::default(),
             running: Default::default(),
             proxy_peers: Default::default(),
             bridges: None,
+            ended_viewers: Default::default(),
         };
         let router = router(app);
         let base = format!("/api/sessions/{id}/{endpoint}");
@@ -657,7 +694,6 @@ mod tests {
     async fn access_token_protects_the_page_and_assets_are_embedded() {
         let app = App {
             settings: Arc::new(Settings {
-                browser: false,
                 image: String::new(),
                 image_id: String::new(),
                 binary: PathBuf::new(),
@@ -673,10 +709,10 @@ mod tests {
             }),
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
-            desktops: Default::default(),
             running: Default::default(),
             proxy_peers: Default::default(),
             bridges: Some(Default::default()),
+            ended_viewers: Default::default(),
         };
         let id = "1234567890abcdef1234567890abcdef";
         let bridge = bridge::Client::new("sandbox", id);
@@ -687,11 +723,17 @@ mod tests {
             .lock()
             .unwrap()
             .insert(id.into(), bridge);
-        let router = router(app);
+        let router = router(app.clone());
         for (method, path, token, expected) in [
             (
                 "GET",
                 format!("/?monitor={id}"),
+                viewer.as_str(),
+                StatusCode::OK,
+            ),
+            (
+                "GET",
+                format!("/?monitor={id}&token={viewer}"),
                 viewer.as_str(),
                 StatusCode::OK,
             ),
@@ -726,6 +768,49 @@ mod tests {
                 expected
             );
         }
+        // Ending a session keeps a bounded tombstone so live/reloaded monitors
+        // receive 404 (Session ended) instead of 401.
+        let removed = app
+            .bridges
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(id)
+            .unwrap();
+        app.remember_ended_viewer(id.into(), removed.viewer().to_owned());
+        for (path, token, expected) in [
+            (format!("/?monitor={id}"), viewer.as_str(), StatusCode::OK),
+            (
+                format!("/api/sessions/{id}/events?offset=0"),
+                viewer.as_str(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                format!("/api/sessions/{id}/events?offset=0"),
+                "wrong-token",
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let request = Request::builder()
+                .uri(&path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                expected,
+                "{path}"
+            );
+        }
+        let unauthorized = router
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert!(unauthorized.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+        assert_eq!(unauthorized.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
         for (path, expected) in [
             ("/", StatusCode::UNAUTHORIZED),
             ("/?token=wrong", StatusCode::UNAUTHORIZED),
@@ -734,8 +819,9 @@ mod tests {
             ("/api/agents?token=wrong", StatusCode::UNAUTHORIZED),
             ("/api/agents?token=test-token", StatusCode::OK),
             ("/assets/vendor/xterm.js", StatusCode::OK),
-            ("/assets/vendor/novnc.mjs", StatusCode::OK),
-            ("/assets/browser-view.mjs", StatusCode::OK),
+            ("/assets/vendor/novnc.mjs", StatusCode::NOT_FOUND),
+            ("/assets/browser-view.mjs", StatusCode::NOT_FOUND),
+            ("/assets/browser.css", StatusCode::NOT_FOUND),
             ("/assets/workspace.mjs", StatusCode::OK),
             ("/assets/monitor.mjs", StatusCode::OK),
             ("/assets/observation.mjs", StatusCode::OK),

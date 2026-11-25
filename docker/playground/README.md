@@ -1,8 +1,6 @@
 # Playground 工具镜像
 
-`agenttomo-playground:24.04` 基于 Ubuntu 24.04，供终端诊断使用。通过 `--image agenttomo-playground:24.04` 选择。
-
-Playground 默认选择 Chrome 镜像并自动打开浏览器。加上 `--capture-http` 可注入 Chrome 的 CA 信任并采集 HTTPS 内容。详见 [Chrome 镜像](../playground-chrome/README.md)。
+`agenttomo-playground:24.04` 基于 Ubuntu 24.04，是 Playground 的默认工具镜像。可通过 `--image` 显式指定其他本地兼容镜像。
 
 在仓库根目录构建：
 

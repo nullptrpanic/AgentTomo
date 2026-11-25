@@ -27,7 +27,7 @@ const neutral = run => ({waiting:"等待沙箱响应",running:"任务执行中",
 export class SamplesView {
   constructor({root, findings, onRun, onCancel, onTask, onEvidence, onChat, onCount}) {
     Object.assign(this, {root, findings, onRun, onCancel, onTask, onEvidence, onChat, onCount});
-    this.model = new SamplesModel(); this.available = false; this.busy = false; this.pending = null;
+    this.model = new SamplesModel(); this.available = false; this.busy = false; this.pending = null; this.stopping = false;
     this.renderFindings(); this.load();
   }
   async load() {
@@ -49,8 +49,10 @@ export class SamplesView {
       node.title = !this.available ? this.unavailableReason || "Connect a workspace with an available Agent" : busy ? "Wait for the current task to finish" : "Run with the current real Agent";
     }
     if (this.stop) {
-      this.stop.hidden = !["waiting","running"].includes(this.currentRun()?.status);
-      this.stop.disabled = !this.available || !busy;
+      const active = ["waiting","running"].includes(this.currentRun()?.status);
+      this.stop.hidden = !active;
+      this.stop.disabled = !this.available || !busy || this.stopping;
+      this.stop.textContent = this.stopping ? "Stopping…" : "Stop";
     }
   }
   catalogView() {
@@ -100,7 +102,13 @@ export class SamplesView {
     this.runError = el("p", "sample-error"); this.feedback.append(this.runError);
     const footer = el("footer", "sample-detail-footer");
     const actions = el("div", "sample-run-actions");
-    this.stop = button("Stop", () => this.onCancel());
+    this.stop = button("Stop", () => {
+      if (this.stopping) return;
+      if (this.onCancel() !== false) {
+        this.stopping = true;
+        this.updateControls();
+      }
+    });
     actions.append(this.stop, button("Run", () => this.run(sample), "sample-button sample-run", playIcon));
     footer.append(el("p", "samples-note", "自动准备 → 注入 → 执行 → 检查结果"), actions);
     card.append(head, el("p", "sample-description", sample.explanation), task, chain, input, this.progress, this.feedback, footer,
@@ -116,18 +124,27 @@ export class SamplesView {
   run(sample) {
     if (!this.available || this.busy || this.pending || [...this.model.runs.values()].some(run => run.status === "running")) return;
     const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2,"0")).join("");
-    this.request = {task_id:id, sample_id:sample.id, status:"waiting"}; this.pending = id;
+    this.request = {task_id:id, sample_id:sample.id, status:"waiting"}; this.pending = id; this.stopping = false;
     try {
       this.onRun(id, sample.id);
     } catch (error) { this.pending = null; this.request.status = "error"; this.request.error = error.message; }
     this.updateStatus(); this.updateControls();
   }
+  controlError(message) {
+    this.stopping = false;
+    if (!this.pending || !this.request) { this.updateControls(); return; }
+    this.pending = null;
+    this.request.status = "error";
+    this.request.error = message || "Request rejected by server.";
+    this.updateStatus(); this.updateControls();
+  }
   add(event) {
     if (event.data?.task_id === this.pending && event.kind === "agent.task.rejected") {
-      this.pending = null; this.request.status = "error"; this.request.error = event.data.error;
+      this.pending = null; this.stopping = false; this.request.status = "error"; this.request.error = event.data.error;
       this.updateStatus(); this.updateControls(); return;
     }
     if (!this.model.add(event)) return;
+    if (event.kind === "security.sample.finished") this.stopping = false;
     if (this.request && event.kind.startsWith("security.sample.") &&
         (event.data.task_id === this.request.task_id || !this.pending && event.data.sample_id === this.request.sample_id)) {
       this.pending = null; this.request = null;
@@ -136,7 +153,7 @@ export class SamplesView {
   }
   end() {
     if (this.request?.status === "waiting") this.request.status = "interrupted";
-    this.pending = null; this.model.end(); this.updateStatus(); this.updateControls(); this.renderFindings();
+    this.pending = null; this.stopping = false; this.model.end(); this.updateStatus(); this.updateControls(); this.renderFindings();
   }
   updateStatus() {
     if (!this.selected || !this.feedback) return;

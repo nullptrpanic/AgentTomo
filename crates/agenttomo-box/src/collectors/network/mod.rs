@@ -123,9 +123,15 @@ impl Collector {
                 pending,
             } => (call, socket, destinations, pending),
         };
+        // Blocking connect() interrupted by a signal with SA_RESTART reports
+        // -ERESTARTSYS (-512) at ptrace syscall-exit.
+        const ERESTARTSYS: i32 = 512;
         if result < 0
             && !(call.number == libc::SYS_connect
-                && matches!(-result as i32, libc::EINPROGRESS | libc::EINTR))
+                && matches!(
+                    -result as i32,
+                    libc::EINPROGRESS | libc::EINTR | ERESTARTSYS
+                ))
         {
             return;
         }

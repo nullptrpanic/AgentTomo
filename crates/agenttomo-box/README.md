@@ -63,7 +63,7 @@ printf 'hello\n' | cargo run --quiet -p agenttomo-box -- run \
 
 按 `agents` 的顺序显示下拉选项。Codex 的 `path` 省略或留空时自动查找本机安装。AgentKit 的 `endpoint` 填模型接入点 ID，文件模式使用北京方舟地址 `https://ark.cn-beijing.volces.com/api/v3`。`apikey` 由宿主读取，沙箱内只收到会话占位凭据。
 
-`listen` 和 `image` 留空时分别使用 `127.0.0.1:8080` 和 `agenttomo-playground-chrome:24.04`。显式的 `--listen`、`--image` 或 `--capture-http` 优先。Chat 需要 HTTP 采集，配置了 Agent 时省略 `capture_http` 会自动开启。纯终端可设置 `"agents": []` 和 `"capture_http": false`。省略 `agents` 时沿用宿主环境自动发现。
+`listen` 和 `image` 留空时分别使用 `127.0.0.1:8080` 和 `agenttomo-playground:24.04`。显式的 `--listen`、`--image` 或 `--capture-http` 优先。Chat 需要 HTTP 采集，配置了 Agent 时省略 `capture_http` 会自动开启。纯终端可设置 `"agents": []` 和 `"capture_http": false`。省略 `agents` 时沿用宿主环境自动发现。
 
 ### 配置火山引擎 AgentKit
 
@@ -99,17 +99,16 @@ target/debug/agenttomo-box playground --listen 0.0.0.0:18889
 
 Playground 兼容工作目录下的 `.agenttomo/playground.json`，例如 `{"proxy":"http://127.0.0.1:8118"}`。优先级为显式命令参数、宿主代理变量、本地配置、默认 `http://127.0.0.1:8118`；它们现在都配置 box 出口，不注入应用。多个不同的代理变量会要求使用 `--proxy` 明确选择；显式空代理变量仍可关闭本地配置和默认值回退，`--no-proxy` 直接关闭全部回退。`run` 不读取这些兼容来源，未传参时直接使用默认值。Task trajectory 的父节点会在收到新的子级活动时闪烁提示，折叠状态同样生效。树节点按稳定 ID 原位更新，实时事件不会替换正在点击的按钮；点击卡片或箭头折叠，右侧图标查看证据。聊天卡片在回答下方显示可折叠执行区，重试与错误在执行区展示。
 
-工具详情的 Request parameters 与 Returned content 展示模型协议中可见的完整参数和返回，分别支持折叠、复制。进程关联按进程实例冻结，时间回退与继承推断会明确标注。终端、浏览器、Traffic、文件预览和原始事件详情继续使用现有入口。协议范围、保留上限和关联边界见[任务设计](../../docs/agent-task-design.md)。
+工具详情的 Request parameters 与 Returned content 展示模型协议中可见的完整参数和返回，分别支持折叠、复制。进程关联按进程实例冻结，时间回退与继承推断会明确标注。终端、Traffic、文件预览和原始事件详情继续使用现有入口。协议范围、保留上限和关联边界见[任务设计](../../docs/agent-task-design.md)。
 
 Chat 按首次观察到的顺序穿插回复和工具卡片。卡片默认折叠，展开后按需加载完整参数与返回，并可定位到轨迹详情。流式更新保留选中文字、焦点和展开状态；向上阅读会暂停跟随，点击 Latest 返回最新消息。停止操作立即显示 Stopping，失败时会在输入框没有新草稿的情况下恢复原始任务。
 
 左侧 **Security tests** 提供工具泄露假凭据、健康检查修改模拟认证配置、伪造检查结果导致错误放行三个受控演示。点击卡片查看说明，再点击 **Run** 自动准备独立文件并启动真实 Agent。Agent 根据卡片上的任务调用工具并做出发布决定，可信基线由校验器保存。右侧 **Findings** 从运行期间的公开报告写入和结束时的产物判定实际影响。点报告卡的标记观测可定位进程、时间和文件，只有 Reproduced 的运行计入角标。展开 Injection evidence 可查看执行前的工具文件比对结果。Chat 与 Task trajectory 展示执行过程。启用 `--overlay-root` 时，样本注入写入 `/home` 的 OverlayFS upper，原目录保持不变。所有样本随沙箱销毁。需要 Python 3 和可用 Agent。详见[内置样本说明](../../docs/builtin-security-samples.md)。
 
-需要能访问本机 Docker daemon，默认使用本地 `agenttomo-playground-chrome:24.04` 镜像并自动启动 Chrome。它基于 Ubuntu 24.04 工具镜像，包含 ifconfig/netstat、ip/ss、curl/wget、dig、nc、jq、strace、Python 和图形桌面组件。首次使用前在仓库根目录构建，需已有 Ubuntu 基础镜像及软件源访问。
+需要能访问本机 Docker daemon，默认使用本地 `agenttomo-playground:24.04` 镜像。它基于 Ubuntu 24.04，包含 ifconfig/netstat、ip/ss、curl/wget、dig、nc、jq、strace 和 Python 等工具。首次使用前在仓库根目录构建，需已有 Ubuntu 基础镜像及软件源访问。
 
 ```bash
 docker build --pull=false -t agenttomo-playground:24.04 docker/playground
-docker build --pull=false -t agenttomo-playground-chrome:24.04 docker/playground-chrome
 ```
 
 完整工具列表与使用说明见[镜像说明](../../docker/playground/README.md)。Playground 启动时不会自动拉取或构建镜像，也不会更改 Docker 或宿主权限配置。
@@ -120,28 +119,14 @@ cargo run --quiet -p agenttomo-box -- playground
 # 允许从其他机器访问；打开启动日志中的 URL，并将地址换成服务器 IP。
 cargo run --quiet -p agenttomo-box -- playground --listen 0.0.0.0:8080
 
-# 指定本地兼容镜像和日志根目录。
+# 开启 HTTP/HTTPS 内容采集。
+target/debug/agenttomo-box playground --listen 0.0.0.0:18889 --capture-http
+
+# 指定本地兼容镜像和会话 tmpfs 上限。
 target/debug/agenttomo-box playground --image my-compatible-image:latest --session-tmpfs-size-mib 512
 ```
 
-默认监听 `127.0.0.1:8080`，输出带随机令牌的访问 URL。页面和 WebSocket 都需要令牌；浏览器 WebSocket 还会校验 Origin。持有该 URL 的用户可以创建并操作容器；本版用于受信用户的诊断环境，没有多用户权限或配额管理。前端资源随二进制内置，运行时无需 Node.js 或 CDN。
-
-Chrome 窗口与观察面板共用一个会话，启动示例如下。
-
-```bash
-target/debug/agenttomo-box playground --listen 0.0.0.0:18889 --capture-http
-
-# 选择普通工具镜像时进入终端模式。
-target/debug/agenttomo-box playground --listen 0.0.0.0:18889 \
-  --image agenttomo-playground:24.04
-```
-
-镜像提供完整浏览器组件时，页面显示 Terminal / Browser 切换，并从被跟踪进程树启动 Chrome。`--image` 指定其他本地镜像，旧命令应删除 `--browser`。
-启动时在临时容器内检查 `/usr/local/bin/agenttomo-browser-session`、`agenttomo-desktop` 和 `agenttomo-chrome`。三个可执行脚本齐全时启用浏览器，全部缺省时进入终端模式，部分缺失或探测失败时报告错误。探测容器自动清理。同一次服务使用启动时检查过的镜像 ID，镜像名用于页面和会话记录。
-`--capture-http` 同时启用现有 HTTPS 解密；Chrome 从 OverlayFS 中读取任务 CA，导入本会话容器的 NSS 信任库。
-Chrome、其网络服务子进程的真实 PID、文件行为和 HTTP/HTTPS 内容都复用右侧观察窗口。
-显示转发沿用同一个鉴权入口，不发布 VNC 端口。依赖、生命周期及协议边界见
-[Chrome 镜像说明](../../docker/playground-chrome/README.md)。
+默认监听 `127.0.0.1:8080`，输出带随机令牌的访问 URL。页面和 WebSocket 都需要令牌；浏览器 WebSocket 还会校验 Origin。持有该 URL 的用户可以创建并操作容器；本版用于受信用户的诊断环境，没有多用户权限或配额管理。前端资源随二进制内置，运行时无需 Node.js 或 CDN。同一次服务使用启动时检查过的镜像 ID，镜像名用于页面和会话记录。
 
 每个工作区主页面创建一个临时容器，目标以服务用户的 UID/GID 运行，清空 capabilities，启用 `no-new-privileges`。为允许嵌套 user/net namespace，开发容器显式使用 `seccomp=unconfined`、`apparmor=unconfined`；这会放宽容器策略，不能作为恶意代码安全沙箱。仅挂载只读 box 二进制和当前会话日志目录，不挂载宿主项目或 Docker socket。镜像需包含 `/bin/bash`、`ip`、`iptables`、`ip6tables`，架构及动态链接库需兼容宿主构建的二进制；当前实测为 Linux x86_64 + Ubuntu 24.04。Docker daemon 必须能访问本机绑定路径，不支持远程 daemon。
 
@@ -195,7 +180,7 @@ Body 默认用 **Decoded** 展示，查看时解压 gzip／deflate／zstd 并按
 
 **Headers** 和 **Body** 使用同级标题样式。网络 URL、头信息、正文和 SSE/WebSocket 消息按面板宽度自动换行，复制内容保留原始换行。正文与消息使用复制图标并保留悬停提示，详情不再显示 Copy URL 按钮。
 
-`--capture-http` 同时启用 HTTP/1.1 解析和 TLS 解密，默认不启用。目标 helper 在私有 mount namespace 中用 OverlayFS 覆盖 `/etc/ssl/certs`，保留原证书并追加本次 CA，不修改 lower。要求 Debian/Ubuntu 的 `ca-certificates.crt`、允许创建 mount namespace 和挂载 tmpfs/OverlayFS；失败停止启动，不静默回退。上游 TLS 使用原证书库校验；不会因目标使用 `curl -k` 而跳过代理的上游校验。每个运行随机生成 `AgentTomo Root CA`，私钥在内存中，公开证书经启动 Unix 通道送入目标 tmpfs/OverlayFS，随诊断作用域释放。注入的信任文件和 NSS 证书数据库的文件事件会标记预览已排除，避免证书随默认预览归档。
+`--capture-http` 同时启用 HTTP/1.1 解析和 TLS 解密，默认不启用。目标 helper 在私有 mount namespace 中用 OverlayFS 覆盖 `/etc/ssl/certs`，保留原证书并追加本次 CA，不修改 lower。要求 Debian/Ubuntu 的 `ca-certificates.crt`、允许创建 mount namespace 和挂载 tmpfs/OverlayFS；失败停止启动，不静默回退。上游 TLS 使用原证书库校验；不会因目标使用 `curl -k` 而跳过代理的上游校验。每个运行随机生成 `AgentTomo Root CA`，私钥在内存中，公开证书经启动 Unix 通道送入目标 tmpfs/OverlayFS，随诊断作用域释放。注入的信任文件的文件事件会标记预览已排除，避免证书随默认预览归档。
 
 HTTP 内容采集限 HTTP/1.1。TLS 客户端仅声明其他 ALPN 时，按上游协商结果转发字节。当前不支持 QUIC、证书固定、mTLS、ECH、STARTTLS 或自带证书库的自动注入。根 CA 有效期 10 个日历年，域名证书有效期 1 天。每个运行有独立的证书缓存，固定 TTL 1 小时，容量配置为 1,024 条，并发首次访问同组域名共用签发结果。PSL 处理公共后缀和租户边界，例如 `www.baidu.com`、`a.baidu.com` 和 `baidu.com` 共用含 `*.baidu.com`、`baidu.com` 的证书，深层子域单独分组，IP、单段名称和未知后缀使用精确证书。普通 HTTP 压缩正文保留原压缩字节。完整边界见[内容检查设计](../../docs/content-inspection-design.md)。
 

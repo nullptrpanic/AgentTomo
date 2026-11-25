@@ -49,6 +49,7 @@ pub async fn copy(
                     down += n as u64;
                     pending = &pending[n..];
                 }
+                client_write.flush().await?;
             }
         };
         tokio::pin!(upload, download);
@@ -72,7 +73,9 @@ pub async fn copy(
             if let Err(error) = result {
                 let half_closed = matches!(
                     error.kind(),
-                    io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::NotConnected
+                        | io::ErrorKind::ConnectionReset
                 );
                 failure.get_or_insert(error);
                 if !half_closed {
@@ -87,7 +90,13 @@ pub async fn copy(
     Ok(Outcome {
         up,
         down: (download_done || down != 0).then_some(down),
-        reason: if failure.is_some() { "failed" } else { reason },
+        reason: if reason == "upload_drain_timeout" {
+            reason
+        } else if failure.is_some() {
+            "failed"
+        } else {
+            reason
+        },
         error: failure,
     })
 }
@@ -116,6 +125,7 @@ async fn upload(
             *sent += n as u64;
             remaining = &remaining[n..];
         }
+        upstream.flush().await?;
         if let Some(name) = name {
             events
                 .send(context.event(

@@ -2,7 +2,7 @@
 
 ## First implementation
 
-The Playground offers Chat alongside Terminal and Browser. Chat launches the selected external executable inside the traced sandbox and permits one foreground task at a time. Codex continues conversations through `codex exec resume`. AgentKit keeps one Go process with an in-memory conversation per sandbox.
+The Playground offers Chat alongside Terminal. Chat launches the selected external executable inside the traced sandbox and permits one foreground task at a time. Codex continues conversations through `codex exec resume`. AgentKit keeps one Go process with an in-memory conversation per sandbox.
 
 Each Codex session pins `model = "gpt-6-sol"` and `model_reasoning_effort = "high"` in its sanitized `config.toml` and named `.config.toml` copies. Terminal Codex uses the session configuration. The adapter also explicitly passes these settings for Chat and Security tests, including resumed turns.
 
@@ -15,7 +15,7 @@ flowchart LR
     Chat[Chat page] --> WS[Owner WebSocket]
     WS --> Collector[Collector control channel]
     Collector --> Workspace[Traced workspace parent]
-    Workspace --> Shell[Terminal / Chrome session]
+    Workspace --> Shell[Terminal session]
     Workspace --> Codex[External Codex]
     Workspace --> AgentKit[External AgentKit]
     AgentKit --> Proxy

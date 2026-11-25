@@ -20,24 +20,22 @@
 
 当前 Playground 默认豁免 `/dev`、`/proc`、`/sys`、`/run`、`/records`。
 Chat 控制 socket 位于已豁免的 `/records/control`，保证采集器与沙箱启动器访问同一 socket。
-浏览器通信路径 `/tmp/.X11-unix` 和 `/tmp/agenttomo-desktop` 也保留原挂载。
-当前 Docker 布局中的 `/etc`、`/usr` 含有子挂载；带浏览器时 `/tmp` 也含有子挂载，
-因此这些目录整体跳过，只有 `/etc/ssl` 额外覆盖。未开启浏览器且没有其他子挂载或
-豁免路径时，`/tmp` 可以整体覆盖。
+当前 Docker 布局中的 `/etc`、`/usr` 含有子挂载，因此这些目录整体跳过，只有 `/etc/ssl` 额外覆盖。
+没有其他子挂载或豁免路径时，`/tmp` 可以整体覆盖。
 
 ## 选择依据
 
-原方案递归拆分锁定挂载边界，并提前复制边界上的零散文件。当前 Chrome 镜像实测约
+原方案递归拆分锁定挂载边界，并提前复制边界上的零散文件。实测约
 80 个 OverlayFS，初始化私有 tmpfs 约 8.1 MiB，主要复制成本来自 `/usr/sbin`。
 用户选择先缩小覆盖范围，减少挂载数量及复制工作。直接使用单个根 OverlayFS 在当前
 继承锁定子挂载的 user namespace 中返回 `EINVAL`；本次不增加 Docker `SYS_ADMIN`。
 
-收窄范围后，同一 Chrome 镜像及挂载配置实测新增 12 个 OverlayFS，开启 CA 注入后的
-私有 tmpfs 占用约 184 KiB。测量未启动 Chrome 工作负载，不包含挂载内核元数据、程序
+收窄范围后，实测新增约 12 个 OverlayFS，开启 CA 注入后的
+私有 tmpfs 占用约 184 KiB。测量不包含挂载内核元数据、程序
 内存和后续写入；目录数量会随镜像及实际子挂载变化。
 
-未覆盖区域的写入会修改容器原文件系统，包括 `/etc/ssl` 之外的 `/etc`、当前 `/usr`、
-带浏览器时的 `/tmp` 和根目录的零散文件。它们不受私有 tmpfs 容量上限约束。
+未覆盖区域的写入会修改容器原文件系统，包括 `/etc/ssl` 之外的 `/etc`、当前 `/usr`
+和根目录的零散文件。它们不受私有 tmpfs 容量上限约束。
 
 ## 挂载与存储
 
@@ -66,8 +64,8 @@ OverlayFS 自身的 opaque、redirect 等内部标记只属于原来的层，复
 污染原系统。未开启 `--overlay-root` 时，沿用仅覆盖 `/etc/ssl/certs` 的原有方案。
 
 挂载跟随目标及后代的 namespace 存活，主命令退出不会提前销毁子进程的文件系统。
-收集结束后删除外层空锚点，内核在最后引用释放后回收存储。Chrome 继续使用普通用户
-及自身沙箱，采集器使用原根验证上游证书。文件预览仍通过目标 FD 获取内容。
+收集结束后删除外层空锚点，内核在最后引用释放后回收存储。采集器使用原根验证上游证书。
+文件预览仍通过目标 FD 获取内容。
 
 跨 OverlayFS 挂载点的 rename/硬链接可能返回 `EXDEV`，挂载点本身的删除或重命名可能
 返回 `EBUSY`。依赖现有 Linux user/mount namespace、OverlayFS、`open_tree`、
@@ -81,5 +79,3 @@ Playground 沿用现有 root 引导与完整 UID/GID 映射。普通用户使用
 `tests/root_overlay.rs` 使用真实 Docker 验证选中目录 CoW、未选中区域写回、只读子挂载
 保留、CA 不写入原系统、不提前复制大文件、存储隐藏、后代存活和容量上限。还验证普通
 扩展属性、OverlayFS 私有标记，以及单 UID 映射下的目录所有权检查。
-`AGENTTOMO_TEST_ROOT_OVERLAY=1` 运行 `tests/browser-smoke.mjs` 检查 Chrome、HTTPS
-解密、文件预览和 UI。浏览器模式下 `/tmp` 保留原视图，私有写入断言使用 `/root`。

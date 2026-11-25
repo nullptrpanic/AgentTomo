@@ -100,6 +100,9 @@ const toggle = $("toggle-monitor");
 const open = $("open-monitor");
 toggle.innerHTML = panelCloseIcon;
 open.innerHTML = externalLinkIcon;
+const syncMonitorVisibility = () => {
+  observation.visibility(!document.body.classList.contains("monitor-collapsed") && !document.hidden);
+};
 toggle.addEventListener("click", () => {
   const collapsed = document.body.classList.toggle("monitor-collapsed");
   toggle.setAttribute("aria-expanded", String(!collapsed));
@@ -107,7 +110,9 @@ toggle.addEventListener("click", () => {
   toggle.setAttribute("aria-label", label);
   toggle.title = label;
   toggle.innerHTML = collapsed ? panelOpenIcon : panelCloseIcon;
+  syncMonitorVisibility();
 });
+document.addEventListener("visibilitychange", syncMonitorVisibility);
 
 function onMessage(message) {
   switch (message.type) {
@@ -154,7 +159,7 @@ function onMessage(message) {
       else notice(`${complete ? "Collection completed." : "This session stopped before collection completed."} Recordings are deleted when the sandbox ends; previously loaded content may still appear on this page.`);
       break;
     }
-    case "control_error": notice(message.message); break;
+    case "control_error": observation.controlError(message.message); notice(message.message); break;
     case "error": observation.stop(`Sandbox stopped: ${message.message}`); finalStatus = true; setStatus("Session error", "error"); notice(message.message); break;
     case "disconnected":
       if (!finalStatus) {

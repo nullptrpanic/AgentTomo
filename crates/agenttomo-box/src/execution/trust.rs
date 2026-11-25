@@ -18,33 +18,42 @@ pub const PRIVATE_PATHS: &[&str] = &[
 ];
 
 pub struct Overlay {
-    directory: PathBuf,
+    directory: Option<PathBuf>,
     pem: String,
 }
 
 impl Overlay {
-    pub fn new(pem: &str) -> io::Result<Self> {
-        let directory = fs::canonicalize(std::env::temp_dir())?
-            .join(format!("agenttomo-trust-{}", uuid::Uuid::new_v4()));
-        fs::DirBuilder::new().mode(0o700).create(&directory)?;
+    pub fn new(pem: &str, create_mountpoint: bool) -> io::Result<Self> {
+        let directory = if create_mountpoint {
+            let directory = fs::canonicalize(std::env::temp_dir())?
+                .join(format!("agenttomo-trust-{}", uuid::Uuid::new_v4()));
+            fs::DirBuilder::new().mode(0o700).create(&directory)?;
+            Some(directory)
+        } else {
+            None
+        };
         Ok(Self {
             directory,
             pem: pem.to_owned(),
         })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.directory
+    #[cfg(test)]
+    pub fn path(&self) -> Option<&Path> {
+        self.directory.as_deref()
     }
 
-    pub fn handoff(&self) -> (PathBuf, String) {
-        (self.path().to_owned(), self.pem.clone())
+    pub fn handoff(&self) -> (Option<PathBuf>, String) {
+        (self.directory.clone(), self.pem.clone())
     }
 }
 
 impl Drop for Overlay {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.directory);
+        // The collector only creates an empty mountpoint anchor; never recursively delete.
+        if let Some(directory) = &self.directory {
+            let _ = fs::remove_dir(directory);
+        }
     }
 }
 
@@ -115,11 +124,14 @@ mod tests {
 
     #[test]
     fn overlay_mountpoint_never_contains_an_archived_ca() {
-        let overlay = Overlay::new("public CA fixture").unwrap();
-        let path = overlay.path().to_owned();
+        let overlay = Overlay::new("public CA fixture", true).unwrap();
+        let path = overlay.path().unwrap().to_owned();
         assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
         drop(overlay);
         assert!(!path.exists());
+
+        let root_overlay_mode = Overlay::new("public CA fixture", false).unwrap();
+        assert!(root_overlay_mode.path().is_none());
     }
 
     #[test]

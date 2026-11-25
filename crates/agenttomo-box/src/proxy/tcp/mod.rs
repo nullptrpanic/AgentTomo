@@ -1,6 +1,6 @@
 //! Persistent transparent TCP listeners. Payload observations originate here,
 //! using private process metadata supplied independently by the tracer.
-mod protocol;
+pub(crate) mod protocol;
 pub(super) mod transfer;
 
 use crate::timing::OperationTiming as TransferTiming;

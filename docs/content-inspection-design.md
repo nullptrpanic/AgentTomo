@@ -40,10 +40,7 @@ user namespace, makes mount propagation private and mounts a small tmpfs for
 OverlayFS upper/work. The overlay covers `/etc/ssl/certs`, preserving lower
 entries and replacing `ca-certificates.crt` with the original bundle plus the
 task CA. This supports the Debian/Ubuntu system **bundle**; it does not rebuild
-hashed CA directories or general Java/NSS/custom runtime stores. The optional
-Playground Chrome image has a separate launcher that imports this same public
-CA into its disposable container NSS database; see
-[Chrome integration](../docker/playground-chrome/README.md). Mounts and upper data
+hashed CA directories or general Java/NSS/custom runtime stores. Mounts and upper data
 die with the target namespace. Failed setup stops launch with a clear
 error and does not run the target. Capabilities are dropped before target exec.
 
@@ -69,7 +66,7 @@ and one terminal dot, and IP keys use the parsed address representation. PSL
 data updates with the dependency. Upstream verification uses the requested host.
 
 Evidence stores trust-file open metadata with `task_trust_material` as the
-preview reason for the injected bundle, task CA and NSS certificate databases/journals.
+preview reason for the injected bundle and task CA.
 This keeps automatic file previews from archiving session trust material.
 The recorder owns this retention decision. File collectors pin handles and
 inspect metadata at syscall exit, and recording applies the trust exclusion
@@ -152,7 +149,6 @@ formatting requires complete, losslessly parsed text. HTML is displayed as text.
   pinning and mTLS are not supported for content capture.
 - Clients with their own CA bundles, custom `SSL_CERT_FILE` / `SSL_CERT_DIR`,
   Java/NSS stores or bundled roots may not trust the injected system bundle.
-  The provided Playground Chrome launcher explicitly handles its NSS store.
 - The initial HTTP preface is recognized with httparse, bounded to 64 KiB,
   128 headers and 500 ms after the first client byte. Incomplete/unsupported prefaces
   are replayed through the opaque forwarder; unusually slow headers may not be
@@ -251,7 +247,7 @@ The 1,000-exchange live list prefers evicting ordinary/completed requests before
 active streams; if all 1,000 entries are active, the oldest is still evicted to
 keep the UI bounded. Stream message retention remains a separate run-wide budget.
 
-Verification includes actual Chrome EventSource and compressed WebSocket traffic,
+Verification includes real EventSource and compressed WebSocket traffic,
 live data before EOF, authenticated retrieval/expiry, scroll/copy/tab behavior,
 TLS-wrapped SSE/WSS, byte-preserving transfer, compression/fragments/control
 frames, parser overflow recovery and bounded storage reuse.

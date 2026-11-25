@@ -2,8 +2,9 @@
 import { orderByStart } from "./event-time.mjs";
 
 const utf8 = new TextEncoder();
+const toMillis = raw => Number.isFinite(raw) ? raw / 1e6 : NaN;
 
-export const capturedTime = event => (event?.data?.captured_unix_ns ?? event?.observed_unix_ns) / 1e6;
+export const capturedTime = event => toMillis(event?.data?.captured_unix_ns ?? event?.observed_unix_ns);
 
 export function elapsedTime(task, start, end = task.finished) {
   const began = capturedTime(start);
@@ -84,13 +85,21 @@ export class AgentModel {
     }
     if (!event.kind.startsWith("agent.") || !d.task_id) return;
     const task = this.task(d.task_id);
-    const observed = (event.observed_unix_ns ?? d.captured_unix_ns) / 1e6;
-    if ((task.state === "running" || event.kind === "agent.task.started") && Number.isFinite(observed)) {
+    const observed = toMillis(event.observed_unix_ns ?? d.captured_unix_ns);
+    if (task.state === "running" && !task.finished && Number.isFinite(observed)) {
       // A replayed or delayed event must not rewind the live clock.
       task.clockOffset = Math.max(task.clockOffset ?? -Infinity, observed - Date.now());
     }
     task.activity = Math.max(task.activity, event.sequence || 0);
-    if (event.kind === "agent.task.started") { task.prompt = d.prompt; task.started = event; task.state = "running"; task.endedAt = undefined; this.runningTasks.add(task); progress(task, "Connecting to model"); }
+    if (event.kind === "agent.task.started") {
+      task.prompt = d.prompt;
+      task.started = event;
+      if (!task.finished && task.state === "running") {
+        task.endedAt = undefined;
+        this.runningTasks.add(task);
+        progress(task, "Connecting to model");
+      }
+    }
     if (event.kind === "agent.task.finished") { task.state = d.cancelled || d.status === "cancelled" ? "cancelled" : d.status === "completed" || d.exit_code === 0 ? "completed" : "failed"; task.finished = event; }
     if (event.kind === "agent.task.rejected") { task.state = d.cancelled ? "cancelled" : "rejected"; task.finished = event; }
     if (task.state !== "running") {

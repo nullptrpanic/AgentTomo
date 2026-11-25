@@ -6,6 +6,7 @@ use std::{collections::BTreeMap, io};
 pub(super) struct Scopes {
     pub keys: Vec<Scope>,
     pub chatgpt: Vec<Scope>,
+    pub configured: Vec<Scope>,
 }
 
 pub(super) fn sanitize(
@@ -21,6 +22,7 @@ pub(super) fn sanitize(
     let mut scopes = Scopes {
         keys: vec![provider_scope(base)?],
         chatgpt: vec![chatgpt_scope("https://chatgpt.com/backend-api")?],
+        configured: Vec::new(),
     };
     // Read base providers first, then overlay each named configuration. A profile
     // can inherit a base URL while supplying its own credential field.
@@ -36,135 +38,43 @@ pub(super) fn sanitize(
         .and_then(toml::Value::as_table)
         .cloned()
         .unwrap_or_default();
+    let empty_providers = toml::Table::new();
     for (name, document) in &mut documents {
-        if let Some(base) = document
-            .get("chatgpt_base_url")
-            .and_then(toml::Value::as_str)
-        {
-            let base = base.trim_end_matches('/');
-            let base = if base.ends_with("/backend-api") {
-                base.to_owned()
-            } else {
-                format!("{base}/backend-api")
-            };
-            scopes.chatgpt.push(chatgpt_scope(&base)?);
-        }
-        validate_mcp(document)?;
-        if let Some(otel) = document.get("otel") {
-            validate_telemetry(otel)?;
-        }
-        // Sandbox authentication is synthetic and intentionally uses its private file.
-        document.insert("cli_auth_credentials_store".into(), "file".into());
-        let Some(providers) = document.get_mut("model_providers") else {
-            continue;
+        let doc_parent = if name == "config.toml" {
+            &empty_providers
+        } else {
+            &base_providers
         };
-        let providers = providers
-            .as_table_mut()
-            .ok_or_else(|| invalid("invalid Codex model provider configuration"))?;
-        for (id, provider) in providers {
-            let table = provider
+        let mut profile_parent = doc_parent.clone();
+        if let Some(raw_providers) = document
+            .get("model_providers")
+            .and_then(toml::Value::as_table)
+        {
+            for (id, provider) in raw_providers {
+                if let Some(table) = provider.as_table() {
+                    let mut merged = profile_parent
+                        .get(id)
+                        .and_then(toml::Value::as_table)
+                        .cloned()
+                        .unwrap_or_default();
+                    merged.extend(table.clone());
+                    profile_parent.insert(id.clone(), toml::Value::Table(merged));
+                }
+            }
+        }
+        sanitize_table(document, builder, &mut scopes, doc_parent, true)?;
+        if let Some(profiles) = document.get_mut("profiles") {
+            let profiles = profiles
                 .as_table_mut()
-                .ok_or_else(|| invalid("invalid Codex model provider"))?;
-            let mut effective = if name == "config.toml" {
-                toml::Table::new()
-            } else {
-                base_providers
-                    .get(id)
-                    .and_then(toml::Value::as_table)
-                    .cloned()
-                    .unwrap_or_default()
-            };
-            effective.extend(table.clone());
-            *table = effective.clone();
-            if effective.contains_key("auth") || effective.contains_key("gateway_oauth") {
-                return Err(invalid(
-                    "command-backed and gateway OAuth credentials need a separate Codex credential adapter",
-                ));
-            }
-            if let Some(query) = effective.get("query_params") {
-                let query = query
-                    .as_table()
-                    .ok_or_else(|| invalid("invalid Codex provider query parameters"))?;
-                if !query.iter().all(|(name, value)| {
-                    value
-                        .as_str()
-                        .is_some_and(|v| public_query_parameter(name, v))
-                }) {
-                    return Err(invalid(
-                        "unsupported Codex provider query parameter; use a scoped authentication header for credentials",
-                    ));
-                }
-            }
-            let base = effective
-                .get("base_url")
-                .and_then(toml::Value::as_str)
-                .unwrap_or("https://api.openai.com/v1");
-            let scope = provider_scope(base)?;
-            if id == "openai"
-                || effective
-                    .get("requires_openai_auth")
-                    .and_then(toml::Value::as_bool)
-                    == Some(true)
-            {
-                scopes.keys.push(scope.clone());
-                scopes.chatgpt.push(scope.clone());
-            }
-            if let Some(value) = table.get_mut("experimental_bearer_token") {
-                let token = value
-                    .as_str()
-                    .ok_or_else(|| invalid("invalid Codex bearer token configuration"))?;
-                *value = builder
-                    .bind(
-                        std::slice::from_ref(&scope),
-                        "authorization",
-                        token,
-                        true,
-                        None,
-                        None,
-                    )?
-                    .into();
-            }
-            if let Some(headers) = table.get_mut("http_headers") {
-                let headers = headers
+                .ok_or_else(|| invalid("invalid Codex profile configuration"))?;
+            for (_, profile) in profiles {
+                let profile = profile
                     .as_table_mut()
-                    .ok_or_else(|| invalid("invalid Codex header configuration"))?;
-                for (header, value) in headers {
-                    let secret = value
-                        .as_str()
-                        .ok_or_else(|| invalid("invalid Codex header configuration"))?;
-                    if metadata_header(header) {
-                        axum::http::HeaderValue::from_str(secret)
-                            .map_err(|_| invalid("invalid Codex header configuration"))?;
-                        continue;
-                    }
-                    *value = builder
-                        .bind(
-                            std::slice::from_ref(&scope),
-                            header,
-                            secret,
-                            false,
-                            None,
-                            None,
-                        )?
-                        .into();
+                    .ok_or_else(|| invalid("invalid Codex profile configuration"))?;
+                if profile.contains_key("profiles") {
+                    return Err(invalid("invalid Codex profile configuration"));
                 }
-            }
-            if let Some(name) = effective.get("env_key") {
-                let name = name
-                    .as_str()
-                    .ok_or_else(|| invalid("invalid Codex environment key configuration"))?;
-                builder.environment(std::slice::from_ref(&scope), "authorization", name, true)?;
-            }
-            if let Some(headers) = effective.get("env_http_headers") {
-                let headers = headers
-                    .as_table()
-                    .ok_or_else(|| invalid("invalid Codex environment header configuration"))?;
-                for (header, name) in headers {
-                    let name = name
-                        .as_str()
-                        .ok_or_else(|| invalid("invalid Codex environment header configuration"))?;
-                    builder.environment(std::slice::from_ref(&scope), header, name, false)?;
-                }
+                sanitize_table(profile, builder, &mut scopes, &profile_parent, false)?;
             }
         }
     }
@@ -182,6 +92,154 @@ pub(super) fn sanitize(
         );
     }
     Ok(scopes)
+}
+
+fn sanitize_table(
+    document: &mut toml::Table,
+    builder: &mut Builder,
+    scopes: &mut Scopes,
+    inherited_providers: &toml::Table,
+    top_level: bool,
+) -> io::Result<()> {
+    if let Some(value) = document.get("chatgpt_base_url") {
+        let base = value
+            .as_str()
+            .ok_or_else(|| invalid("invalid Codex ChatGPT base URL"))?;
+        let base = base.trim_end_matches('/');
+        let base = if base.ends_with("/backend-api") {
+            base.to_owned()
+        } else {
+            format!("{base}/backend-api")
+        };
+        scopes.chatgpt.push(chatgpt_scope(&base)?);
+    }
+    if let Some(value) = document.get("openai_base_url") {
+        let base = value
+            .as_str()
+            .ok_or_else(|| invalid("invalid Codex OpenAI base URL"))?;
+        let scope = provider_scope(base)?;
+        scopes.keys.push(scope.clone());
+        scopes.chatgpt.push(scope.clone());
+        scopes.configured.push(scope);
+    }
+    validate_mcp(document)?;
+    if let Some(otel) = document.get("otel") {
+        validate_telemetry(otel)?;
+    }
+    // Sandbox authentication is synthetic and intentionally uses its private file.
+    if top_level || document.contains_key("cli_auth_credentials_store") {
+        document.insert("cli_auth_credentials_store".into(), "file".into());
+    }
+    let Some(providers) = document.get_mut("model_providers") else {
+        return Ok(());
+    };
+    let providers = providers
+        .as_table_mut()
+        .ok_or_else(|| invalid("invalid Codex model provider configuration"))?;
+    for (id, provider) in providers {
+        let table = provider
+            .as_table_mut()
+            .ok_or_else(|| invalid("invalid Codex model provider"))?;
+        let mut effective = inherited_providers
+            .get(id)
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        effective.extend(table.clone());
+        *table = effective.clone();
+        if effective.contains_key("auth") || effective.contains_key("gateway_oauth") {
+            return Err(invalid(
+                "command-backed and gateway OAuth credentials need a separate Codex credential adapter",
+            ));
+        }
+        if let Some(query) = effective.get("query_params") {
+            let query = query
+                .as_table()
+                .ok_or_else(|| invalid("invalid Codex provider query parameters"))?;
+            if !query.iter().all(|(name, value)| {
+                value
+                    .as_str()
+                    .is_some_and(|v| public_query_parameter(name, v))
+            }) {
+                return Err(invalid(
+                    "unsupported Codex provider query parameter; use a scoped authentication header for credentials",
+                ));
+            }
+        }
+        let base = effective
+            .get("base_url")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("https://api.openai.com/v1");
+        let scope = provider_scope(base)?;
+        scopes.configured.push(scope.clone());
+        if id == "openai"
+            || effective
+                .get("requires_openai_auth")
+                .and_then(toml::Value::as_bool)
+                == Some(true)
+        {
+            scopes.keys.push(scope.clone());
+            scopes.chatgpt.push(scope.clone());
+        }
+        if let Some(value) = table.get_mut("experimental_bearer_token") {
+            let token = value
+                .as_str()
+                .ok_or_else(|| invalid("invalid Codex bearer token configuration"))?;
+            *value = builder
+                .bind(
+                    std::slice::from_ref(&scope),
+                    "authorization",
+                    token,
+                    true,
+                    None,
+                    None,
+                )?
+                .into();
+        }
+        if let Some(headers) = table.get_mut("http_headers") {
+            let headers = headers
+                .as_table_mut()
+                .ok_or_else(|| invalid("invalid Codex header configuration"))?;
+            for (header, value) in headers {
+                let secret = value
+                    .as_str()
+                    .ok_or_else(|| invalid("invalid Codex header configuration"))?;
+                if metadata_header(header) {
+                    axum::http::HeaderValue::from_str(secret)
+                        .map_err(|_| invalid("invalid Codex header configuration"))?;
+                    continue;
+                }
+                *value = builder
+                    .bind(
+                        std::slice::from_ref(&scope),
+                        header,
+                        secret,
+                        false,
+                        None,
+                        None,
+                    )?
+                    .into();
+            }
+        }
+        if let Some(name) = effective.get("env_key") {
+            let name = name
+                .as_str()
+                .ok_or_else(|| invalid("invalid Codex environment key configuration"))?;
+            builder.environment(std::slice::from_ref(&scope), "authorization", name, true)?;
+        }
+        if let Some(headers) = effective.get("env_http_headers") {
+            let headers = headers
+                .as_table()
+                .ok_or_else(|| invalid("invalid Codex environment header configuration"))?;
+            for (header, name) in headers {
+                let name = name
+                    .as_str()
+                    .ok_or_else(|| invalid("invalid Codex environment header configuration"))?;
+                builder.environment(std::slice::from_ref(&scope), header, name, false)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn metadata_header(name: &str) -> bool {
@@ -244,17 +302,103 @@ fn validate_endpoint(value: &toml::Value) -> io::Result<()> {
     Ok(())
 }
 
+fn is_credential_key(lower: &str) -> bool {
+    [
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "api_key",
+        "api-key",
+        "apikey",
+        "private_key",
+        "private-key",
+        "credential",
+        "authorization",
+        "bearer",
+        "cookie",
+        "headers_helper",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || matches!(lower.trim_start_matches('-'), "auth" | "header" | "headers")
+}
+
+fn validate_mcp_auth_table(table: &toml::Table) -> io::Result<()> {
+    let unsupported = || {
+        invalid(
+            "MCP credentials need a separate credential adapter; remove them from this Codex configuration",
+        )
+    };
+    for (key, value) in table {
+        let lower = key.to_ascii_lowercase();
+        if lower.ends_with("_url")
+            || lower.ends_with("_uri")
+            || lower.ends_with("_endpoint")
+            || matches!(lower.as_str(), "url" | "endpoint" | "issuer")
+        {
+            validate_endpoint(value)?;
+            continue;
+        }
+        if is_credential_key(&lower) {
+            return Err(unsupported());
+        }
+        if let Some(nested) = value.as_table() {
+            validate_mcp_auth_table(nested)?;
+        } else if let Some(text) = value.as_str()
+            && text.contains("://")
+        {
+            validate_endpoint(value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_mcp_argument(arg: &str) -> io::Result<()> {
+    let unsupported = || {
+        invalid(
+            "MCP credentials need a separate credential adapter; remove them from this Codex configuration",
+        )
+    };
+    let lower = arg.to_ascii_lowercase();
+    if lower.contains("authorization:") || lower.contains("bearer ") {
+        return Err(unsupported());
+    }
+    let (head, tail) = arg.split_once('=').unwrap_or((arg, ""));
+    let head_lower = head.to_ascii_lowercase();
+    let is_header_flag = arg == "-H"
+        || arg.starts_with("-H=")
+        || matches!(head_lower.as_str(), "--header" | "--headers");
+    if is_header_flag
+        || ((head.starts_with('-') || arg.contains('=')) && is_credential_key(&head_lower))
+    {
+        return Err(unsupported());
+    }
+    for candidate in [arg, tail] {
+        if candidate.is_empty() {
+            continue;
+        }
+        let candidate_lower = candidate.to_ascii_lowercase();
+        if candidate_lower.starts_with("http://") || candidate_lower.starts_with("https://") {
+            validate_endpoint(&toml::Value::String(candidate.to_owned()))?;
+        } else if candidate.contains("://") && candidate.contains('@') {
+            return Err(unsupported());
+        }
+    }
+    Ok(())
+}
+
 fn validate_mcp(config: &toml::Table) -> io::Result<()> {
     let unsupported = || {
         invalid(
             "MCP credentials need a separate credential adapter; remove them from this Codex configuration",
         )
     };
-    let idp = config
-        .get("mcp_enterprise_managed_auth")
-        .and_then(|auth| auth.get("idp"));
-    if idp.and_then(|idp| idp.get("client_secret")).is_some() {
-        return Err(unsupported());
+    if let Some(auth) = config.get("mcp_enterprise_managed_auth") {
+        let auth = auth
+            .as_table()
+            .ok_or_else(|| invalid("invalid Codex MCP configuration"))?;
+        validate_mcp_auth_table(auth)?;
     }
     let Some(servers) = config.get("mcp_servers") else {
         return Ok(());
@@ -268,22 +412,46 @@ fn validate_mcp(config: &toml::Table) -> io::Result<()> {
             .ok_or_else(|| invalid("invalid Codex MCP server"))?;
         if [
             "env",
+            "env_vars",
             "http_headers",
             "http_headers_helper",
             "env_http_headers",
             "bearer_token_env_var",
+            "bearer_token",
+            "headers",
+            "headers_helper",
+            "auth",
         ]
         .iter()
         .any(|name| server.contains_key(*name))
-            || server
-                .get("oauth")
-                .and_then(|oauth| oauth.get("client_secret"))
-                .is_some()
         {
             return Err(unsupported());
         }
+        if let Some(oauth) = server.get("oauth") {
+            let oauth = oauth
+                .as_table()
+                .ok_or_else(|| invalid("invalid Codex MCP configuration"))?;
+            validate_mcp_auth_table(oauth)?;
+        }
         if let Some(url) = server.get("url") {
             validate_endpoint(url)?;
+        }
+        if let Some(command) = server.get("command") {
+            let command = command
+                .as_str()
+                .ok_or_else(|| invalid("invalid Codex MCP server"))?;
+            validate_mcp_argument(command)?;
+        }
+        if let Some(args) = server.get("args") {
+            let args = args
+                .as_array()
+                .ok_or_else(|| invalid("invalid Codex MCP server"))?;
+            for item in args {
+                let arg = item
+                    .as_str()
+                    .ok_or_else(|| invalid("invalid Codex MCP server"))?;
+                validate_mcp_argument(arg)?;
+            }
         }
     }
     Ok(())
