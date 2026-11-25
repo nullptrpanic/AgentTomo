@@ -54,7 +54,7 @@ struct App {
     settings: Arc<Settings>,
     shutdown: CancellationToken,
     sessions: TaskTracker,
-    desktops: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    desktops: Arc<Mutex<HashMap<String, desktop::Display>>>,
     running: Arc<Mutex<HashMap<String, Option<i32>>>>,
     proxy_peers: agent_egress::Peers,
     // None only inside the container read service (and filesystem API tests).
@@ -75,7 +75,27 @@ struct WorkspaceAccess {
 
 impl Access {
     fn authorized(&self, app: &App) -> bool {
-        self.token.as_deref() == Some(app.settings.token.as_str())
+        self.matches(&app.settings.token)
+    }
+    fn matches(&self, expected: &str) -> bool {
+        let Some(token) = &self.token else {
+            return false;
+        };
+        token.len() == expected.len()
+            && token
+                .bytes()
+                .zip(expected.bytes())
+                .fold(0u8, |diff, (a, b)| diff | std::hint::black_box(a ^ b))
+                == 0
+    }
+    fn can_monitor(&self, app: &App, id: &str) -> bool {
+        app.bridges.as_ref().is_some_and(|clients| {
+            clients
+                .lock()
+                .unwrap()
+                .get(id)
+                .is_some_and(|client| self.matches(client.viewer()))
+        })
     }
 }
 
@@ -154,7 +174,44 @@ fn router(app: App) -> Router {
         .route("/ws", get(websocket))
         .route("/api/sessions/{session}/desktop", get(desktop::websocket))
         .route("/assets/{*path}", get(assets::get))
+        .layer(axum::middleware::from_fn(browser_access))
         .with_state(app)
+}
+
+async fn browser_access(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| {
+            request
+                .headers()
+                .get(header::SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| {
+                    s.split(',')
+                        .find_map(|s| s.trim().strip_prefix("agenttomo."))
+                })
+        });
+    if let Some(token) = token.filter(|s| {
+        !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) {
+        let uri = request.uri();
+        let target = uri.path_and_query().map_or("/", |value| value.as_str());
+        if let Ok(uri) = format!(
+            "{target}{}token={token}",
+            if uri.query().is_some() { "&" } else { "?" }
+        )
+        .parse()
+        {
+            *request.uri_mut() = uri;
+        }
+    }
+    next.run(request).await
 }
 
 fn records_router() -> Router<App> {
@@ -179,11 +236,23 @@ fn valid_session(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-async fn index(State(app): State<App>, Query(access): Query<Access>) -> Response {
-    if !access.authorized(&app) {
+#[derive(Deserialize)]
+struct PageAccess {
+    #[serde(flatten)]
+    access: Access,
+    monitor: Option<String>,
+}
+async fn index(State(app): State<App>, Query(page): Query<PageAccess>) -> Response {
+    if !page.access.authorized(&app)
+        && !page
+            .monitor
+            .as_deref()
+            .is_some_and(|id| page.access.can_monitor(&app, id))
+    {
         return (
             StatusCode::UNAUTHORIZED,
-            "Open the complete access URL printed by agenttomo-box playground.",
+            [(header::CACHE_CONTROL, "no-store"), (header::REFERRER_POLICY, "no-referrer")],
+            Html(r#"<!doctype html><meta charset="utf-8"><p>Open the complete access URL printed by agenttomo-box playground.</p><script type="module" src="/assets/resume.mjs"></script>"#),
         )
             .into_response();
     }
@@ -241,6 +310,11 @@ async fn websocket(
     // Reserve before upgrade so server shutdown waits for sessions that are
     // still completing their WebSocket handshake as well as active containers.
     let tracked = app.sessions.token();
+    let upgrade = if let Some(token) = &request.access.token {
+        upgrade.protocols([format!("agenttomo.{token}")])
+    } else {
+        upgrade
+    };
     upgrade
         .max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
@@ -257,7 +331,7 @@ fn same_origin(headers: &HeaderMap) -> bool {
             let host = headers
                 .get(header::HOST)
                 .and_then(|host| host.to_str().ok());
-            matches!((origin.to_str().ok(), host), (Some(origin), Some(host)) if origin == format!("http://{host}"))
+            matches!((origin.to_str().ok(), host), (Some(origin), Some(host)) if origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://")).is_some_and(|authority| authority.eq_ignore_ascii_case(host)))
         }
     }
 }
@@ -602,9 +676,56 @@ mod tests {
             desktops: Default::default(),
             running: Default::default(),
             proxy_peers: Default::default(),
-            bridges: None,
+            bridges: Some(Default::default()),
         };
+        let id = "1234567890abcdef1234567890abcdef";
+        let bridge = bridge::Client::new("sandbox", id);
+        let viewer = bridge.viewer().to_owned();
+        app.bridges
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .insert(id.into(), bridge);
         let router = router(app);
+        for (method, path, token, expected) in [
+            (
+                "GET",
+                format!("/?monitor={id}"),
+                viewer.as_str(),
+                StatusCode::OK,
+            ),
+            (
+                "GET",
+                "/?monitor=22222222222222222222222222222222".into(),
+                viewer.as_str(),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "GET",
+                "/api/agents".into(),
+                viewer.as_str(),
+                StatusCode::UNAUTHORIZED,
+            ),
+            ("GET", "/api/agents".into(), "test-token", StatusCode::OK),
+            (
+                "POST",
+                format!("/api/sessions/{id}/events"),
+                viewer.as_str(),
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
         for (path, expected) in [
             ("/", StatusCode::UNAUTHORIZED),
             ("/?token=wrong", StatusCode::UNAUTHORIZED),

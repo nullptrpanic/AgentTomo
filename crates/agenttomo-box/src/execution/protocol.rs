@@ -8,6 +8,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 #[derive(Serialize, Deserialize)]
 pub enum Message {
     Started { pid: i32 },
+    InputAck,
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     RootExit(u8),

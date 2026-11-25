@@ -9,9 +9,8 @@ export function followMonitor({ id, token, onMessage }) {
     let delay = 250;
     try {
       const url = new URL(`/api/sessions/${id}/events`, location.href);
-      url.searchParams.set("token", token);
       url.searchParams.set("offset", offset);
-      const response = await fetch(url, { cache: "no-store", signal: controller.signal });
+      const response = await fetch(url, { headers: {Authorization: `Bearer ${token}`}, cache: "no-store", signal: controller.signal });
       if (response.status === 404) {
         onMessage({ type: "monitor_expired" });
         stop();
@@ -34,9 +33,12 @@ export function followMonitor({ id, token, onMessage }) {
       }
       if (Number.isSafeInteger(batch.root_pid) && batch.root_pid !== rootPid) {
         rootPid = batch.root_pid;
-        onMessage({ type: "ready", pid: rootPid });
+        onMessage({ type: "ready", pid: rootPid, monitor_token: batch.monitor_token });
       }
-      for (const event of batch.events) onMessage({ type: "trace", event });
+      for (const event of batch.events) {
+        try { onMessage({ type: "trace", event }); }
+        catch (error) { onMessage({type:"control_error", message:`Cannot display event #${event.sequence ?? "?"}: ${error.message}`}); }
+      }
       offset = batch.next_offset;
       if (!batch.active && !batch.has_more) {
         onMessage({ type: "monitor_end", result: batch.result, incomplete: batch.incomplete });

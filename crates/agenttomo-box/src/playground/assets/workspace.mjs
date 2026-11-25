@@ -24,9 +24,8 @@ export function startWorkspace({ token, agent, onMessage, notice, onView }) {
 
   const url = new URL("/ws", location.href);
   url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  url.searchParams.set("token", token);
   if (agent) url.searchParams.set("agent", agent);
-  const socket = new WebSocket(url);
+  const socket = new WebSocket(url, `agenttomo.${token}`);
   socket.binaryType = "arraybuffer";
   let acceptingInput = false;
   let sending = false;

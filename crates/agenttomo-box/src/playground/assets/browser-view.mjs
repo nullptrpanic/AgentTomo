@@ -13,7 +13,7 @@ export class BrowserView {
   start(session, token) {
     this.url = new URL(`/api/sessions/${session}/desktop`, location.href);
     this.url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    this.url.searchParams.set("token", token);
+    this.protocol = `agenttomo.${token}`;
     this.active = true;
     if (this.visible) this.connect();
   }
@@ -38,7 +38,7 @@ export class BrowserView {
     try {
       const { default: RFB } = await import("./vendor/novnc.mjs");
       if (!this.active || generation !== this.generation) return;
-      const rfb = new RFB(this.screen, this.url.href);
+      const rfb = new RFB(this.screen, this.url.href, {wsProtocols: [this.protocol]});
       this.rfb = rfb;
       rfb.scaleViewport = true;
       rfb.viewOnly = !this.visible;

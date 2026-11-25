@@ -4,15 +4,29 @@ use serde_json::json;
 use std::{io, time::Duration};
 use tokio::sync::mpsc;
 
-pub async fn follow(
-    client: Client,
-    id: &str,
-    token: &str,
-    sender: mpsc::Sender<Frame>,
-) -> io::Result<()> {
+pub async fn follow(client: Client, id: &str, sender: mpsc::Sender<Frame>) -> io::Result<()> {
     let mut offset = 0;
+    let interval = Duration::from_millis(250);
+    let mut retry = interval;
     loop {
-        let batch = client.events(id, token, offset).await?;
+        let batch = match client.events(id, offset).await {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(Duration::from_secs(4));
+                continue;
+            }
+            result => result?,
+        };
+        retry = interval;
         for event in batch["events"]
             .as_array()
             .ok_or_else(|| io::Error::other("invalid event batch"))?

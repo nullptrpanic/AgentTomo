@@ -39,6 +39,7 @@ pub async fn serve(
         .lock()
         .expect("session registry")
         .insert(id.clone(), None);
+    let mut create_attempted = false;
     let result = async {
         let configuration = match &installation {
             Some(agent) => {
@@ -70,6 +71,7 @@ pub async fn serve(
         }
         // Do not cancel create on disconnect: obtain ownership first, then the
         // common cleanup below removes the known container even if start fails.
+        create_attempted = true;
         docker::create(docker::Create {
             name: &name,
             image: &app.settings.image_id,
@@ -91,12 +93,11 @@ pub async fn serve(
     .await;
 
     if let Some(lifetime) = app.desktops.lock().expect("desktop registry").remove(&id) {
-        lifetime.cancel();
+        lifetime.close();
     }
     if let Some(gateway) = &app.settings.credential_gateway {
         gateway.remove(&name);
     }
-    let cleanup = docker::remove(&name).await;
     app.proxy_peers.remove(&name);
     app.bridges
         .as_ref()
@@ -104,6 +105,11 @@ pub async fn serve(
         .lock()
         .expect("read channel registry")
         .remove(&id);
+    let cleanup = if create_attempted {
+        docker::remove(&name).await
+    } else {
+        Ok(())
+    };
     let errors: Vec<_> = [result.err(), cleanup.err()]
         .into_iter()
         .flatten()
@@ -136,14 +142,26 @@ async fn drive(
     let mut input = child.stdin.take().expect("piped Docker stdin");
     let mut output = BufReader::new(child.stdout.take().expect("piped Docker stdout"));
     let stderr = child.stderr.take().expect("piped Docker stderr");
+    let diagnostics = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(read_stderr(stderr)));
+    let diagnostics = async { diagnostics.await.map_err(io::Error::other)? };
     let agent_available = bootstrap.agent.is_some();
-    let bootstrap_sent = sandbox::send(&mut input, &bootstrap);
-    let initialized = tokio::time::timeout(Duration::from_secs(30), bootstrap_sent)
-        .await
-        .map_err(|_| io::Error::other("sandbox configuration timed out"))
-        .and_then(|result| result);
+    let bootstrap_sent = async {
+        // The task cannot run until its bootstrap is delivered.
+        if app.settings.proxy.is_some() {
+            app.proxy_peers.register(name).await?;
+        }
+        sandbox::send(&mut input, &bootstrap).await
+    };
+    let initialized = tokio::select! {
+        status = child.wait() => Err(io::Error::other(format!("container exited with {}", status?))),
+        result = tokio::time::timeout(Duration::from_secs(30), bootstrap_sent) => {
+            result.unwrap_or_else(|_| Err(io::Error::other("sandbox configuration timed out")))
+        }
+        _ = shutdown.cancelled() => return Ok("server_shutdown"),
+    };
     drop(bootstrap);
     if let Err(error) = initialized {
+        drop(input);
         // A failed `docker start` can close stdin before we consume its error.
         // Preserve that diagnostic instead of reporting only "Broken pipe".
         if tokio::time::timeout(Duration::from_secs(2), child.wait())
@@ -152,7 +170,7 @@ async fn drive(
         {
             let _ = child.kill().await;
         }
-        let detail = tokio::time::timeout(Duration::from_secs(2), read_stderr(stderr))
+        let detail = tokio::time::timeout(Duration::from_secs(2), diagnostics)
             .await
             .ok()
             .and_then(Result::ok)
@@ -163,13 +181,13 @@ async fn drive(
         )));
     }
     let (connected, connection) = tokio::sync::oneshot::channel();
-    let mut connected = Some(connected);
     let (outbound, mut frames) = mpsc::channel(32);
     let (incoming, mut inputs) = mpsc::channel(32);
     let (mut sink, mut stream) = socket.split();
 
     let source = async {
         let worker = async {
+            let mut connected = Some(connected);
             let mut desktop: Option<tokio::process::Child> = None;
             loop {
                 let result = tokio::select! {
@@ -187,34 +205,36 @@ async fn drive(
                 };
                 let frame = match message {
                     Message::Started { pid } => {
-                        let client = bridge::Client::connect(name, id, &app.settings.token).await?;
+                        let journal = bridge::Client::connect(name, id).await?;
+                        // Open a separate monitor connection on first use; a slow
+                        // payload download must not hold the terminal's journal cursor.
+                        let monitor = bridge::Client::new(name, id);
+                        let viewer = monitor.viewer().to_owned();
                         app.bridges
                             .as_ref()
                             .unwrap()
                             .lock()
                             .expect("read channel registry")
-                            .insert(id.to_owned(), client.clone());
+                            .insert(id.to_owned(), monitor);
                         if let Some(sender) = connected.take() {
-                            let _ = sender.send(client);
+                            let _ = sender.send(journal);
                         }
 
-                        if app.settings.proxy.is_some() {
-                            app.proxy_peers.register(name).await?;
-                        }
                         app.running
                             .lock()
                             .expect("session registry")
                             .insert(id.to_owned(), Some(pid));
                         if app.settings.browser {
                             desktop = Some(desktop::start(name).await?);
-                            app.desktops
-                                .lock()
-                                .expect("desktop registry")
-                                .insert(id.to_owned(), app.shutdown.child_token());
+                            app.desktops.lock().expect("desktop registry").insert(
+                                id.to_owned(),
+                                desktop::Display::new(app.shutdown.child_token()),
+                            );
                         }
-                        Frame::Json(json!({"type":"ready","pid":pid}))
+                        Frame::Json(json!({"type":"ready","pid":pid,"monitor_token":viewer}))
                     }
                     Message::Stdout(bytes) | Message::Stderr(bytes) => Frame::Bytes(bytes),
+                    Message::InputAck => Frame::Json(json!({"type":"input_ack"})),
                     Message::RootExit(code) => Frame::Json(json!({"type":"root_exit","code":code})),
                     Message::Error(error) => return Err(io::Error::other(error)),
                 };
@@ -224,13 +244,20 @@ async fn drive(
             Ok::<_, io::Error>(status)
         };
         let traces = async {
-            let client = connection.await.map_err(io::Error::other)?;
-            trace_feed::follow(client, id, &app.settings.token, outbound.clone()).await
+            let Ok(client) = connection.await else {
+                return std::future::pending().await;
+            };
+            trace_feed::follow(client, id, outbound.clone()).await?;
+            // The WebSocket writer owns successful delivery of the Complete frame.
+            std::future::pending::<io::Result<&'static str>>().await
         };
-        let (status, (), stderr) = tokio::try_join!(worker, traces, read_stderr(stderr))?;
-        Err::<&'static str, _>(io::Error::other(format!(
-            "container collector exited with {status}: {stderr}"
-        )))
+        tokio::select! {
+            result = async {
+                let (status, detail) = tokio::try_join!(worker, diagnostics)?;
+                Err(io::Error::other(format!("container collector exited with {status}: {}", detail.trim())))
+            } => result,
+            result = traces => result,
+        }
     };
     let receive = async {
         while let Some(message) = stream.next().await {
@@ -243,65 +270,66 @@ async fn drive(
                     }
                     Input::Bytes(bytes.to_vec())
                 }
-                WsMessage::Text(text) => match serde_json::from_str::<Control>(&text)? {
-                    Control::AgentPrompt { task_id, prompt }
-                        if agent_available
-                            && task_id.len() == 32
-                            && task_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-                            && !prompt.trim().is_empty()
-                            && prompt.len() <= 8192 =>
-                    {
-                        Input::AgentPrompt {
-                            task_id,
-                            prompt,
-                            sample: None,
+                WsMessage::Text(text) => match serde_json::from_str::<Control>(&text) {
+                    Err(_) => {
+                        outbound.send(Frame::Json(json!({"type":"control_error","message":"Invalid control message."}))).await.map_err(io::Error::other)?;
+                        continue;
+                    }
+                    Ok(control) => match control {
+                        Control::AgentPrompt { task_id, prompt }
+                            if agent_available
+                                && task_id.len() == 32
+                                && task_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                && !prompt.trim().is_empty()
+                                && prompt.len() <= 8192 =>
+                        {
+                            Input::AgentPrompt {
+                                task_id,
+                                prompt,
+                                sample: None,
+                            }
                         }
-                    }
-                    Control::SampleRun { task_id, sample_id }
-                        if agent_available
-                            && task_id.len() == 32
-                            && task_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-                            && super::samples::contains(&sample_id) =>
-                    {
-                        Input::AgentPrompt {
-                            task_id,
-                            prompt: String::new(),
-                            sample: Some(sample_id),
+                        Control::SampleRun { task_id, sample_id }
+                            if agent_available
+                                && task_id.len() == 32
+                                && task_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                && super::samples::contains(&sample_id) =>
+                        {
+                            Input::AgentPrompt {
+                                task_id,
+                                prompt: String::new(),
+                                sample: Some(sample_id),
+                            }
                         }
-                    }
-                    Control::AgentCancel if agent_available => Input::AgentCancel,
-                    Control::SampleRun { .. } if !agent_available => continue,
-                    Control::Resize { rows, cols }
-                        if (1..=1000).contains(&rows) && (1..=1000).contains(&cols) =>
-                    {
-                        Input::Resize { rows, cols }
-                    }
-                    _ => return Err(io::Error::other("invalid terminal dimensions")),
+                        Control::AgentCancel if agent_available => Input::AgentCancel,
+                        Control::SampleRun { .. } if !agent_available => continue,
+                        Control::Resize { rows, cols }
+                            if (1..=1000).contains(&rows) && (1..=1000).contains(&cols) =>
+                        {
+                            Input::Resize { rows, cols }
+                        }
+                        _ => {
+                            outbound.send(Frame::Json(json!({"type":"control_error","message":"Invalid control parameters or unavailable agent."}))).await.map_err(io::Error::other)?;
+                            continue;
+                        }
+                    },
                 },
                 _ => continue,
             };
-            // Browser input uses one acknowledged chunk at a time. Keep the
-            // reader responsive to Close even if the target stops reading stdin.
             incoming
-                .try_send(input)
-                .map_err(|_| io::Error::other("terminal input queue is full"))?;
+                .send(input)
+                .await
+                .map_err(|_| io::Error::other("terminal input channel closed"))?;
         }
         Ok("browser_disconnected")
     };
     let write_input = async {
         while let Some(message) = inputs.recv().await {
-            let acknowledge = matches!(message, Input::Bytes(_));
             if let Err(error) = protocol::send(&mut input, &message).await {
                 if error.kind() == io::ErrorKind::BrokenPipe {
                     return std::future::pending::<io::Result<&'static str>>().await;
                 }
                 return Err(error);
-            }
-            if acknowledge {
-                outbound
-                    .send(Frame::Json(json!({"type":"input_ack"})))
-                    .await
-                    .map_err(io::Error::other)?;
             }
         }
         std::future::pending::<io::Result<&'static str>>().await

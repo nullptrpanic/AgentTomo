@@ -64,24 +64,35 @@ async fn configured_environment(
 pub struct Peers(Arc<Mutex<HashMap<String, HashSet<IpAddr>>>>);
 impl Peers {
     pub async fn register(&self, container: &str) -> io::Result<()> {
-        let output = Command::new("docker")
-            .args([
+        // docker start --attach and inspect are separate processes. Docker may
+        // not have assigned an IP yet. The bootstrap writer bounds this wait.
+        let ips = loop {
+            let output = super::docker::execute(Command::new("docker").args([
                 "inspect",
                 "--format",
                 "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
                 container,
-            ])
-            .output()
+            ]))
             .await?;
-        if !output.status.success() {
-            return Err(io::Error::other("cannot inspect the owned sandbox network"));
+            if !output.status.success() {
+                return Err(io::Error::other("cannot inspect the owned sandbox network"));
+            }
+            let ips: HashSet<IpAddr> = String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .map(str::parse)
+                .collect::<Result<HashSet<IpAddr>, _>>()
+                .map_err(io::Error::other)?;
+            if !ips.is_empty() {
+                break ips;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let mut owners = self.0.lock().unwrap();
+        // Docker can release an address on an unexpected stop, before host cleanup runs.
+        for previous in owners.values_mut() {
+            previous.retain(|ip| !ips.contains(ip));
         }
-        let ips = String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .map(str::parse)
-            .collect::<Result<HashSet<IpAddr>, _>>()
-            .map_err(io::Error::other)?;
-        self.0.lock().unwrap().insert(container.to_owned(), ips);
+        owners.insert(container.to_owned(), ips);
         Ok(())
     }
     pub fn remove(&self, container: &str) {
@@ -171,13 +182,19 @@ pub async fn configure(
     if !loopback {
         return Ok(Some(proxy));
     }
-    let ip = host
-        .parse()
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    let target = SocketAddr::new(ip, proxy.port());
+    let targets: Vec<_> = tokio::net::lookup_host((host, proxy.port()))
+        .await?
+        .filter(|addr| addr.ip().is_loopback())
+        .collect();
+    if targets.is_empty() {
+        return Err(io::Error::other(
+            "loopback upstream has no loopback address",
+        ));
+    }
+    let targets: Arc<[SocketAddr]> = targets.into();
     let listener = TcpListener::bind(SocketAddr::new(bridge_gateway().await?, 0)).await?;
     let address = listener.local_addr()?;
-    tokio::spawn(relay(listener, target, peers, shutdown.child_token()));
+    tokio::spawn(relay(listener, targets, peers, shutdown.child_token()));
     Ok(Some(
         format!("http://{address}")
             .parse()
@@ -196,7 +213,7 @@ async fn credential_relay(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            accepted = listener.accept() => {
+            accepted = crate::network::socket::accept(&listener), if connections.len() < 256 => {
                 let Ok((client, source)) = accepted else { break };
                 let Some(owner) = peers.owner(source.ip()) else { continue };
                 connections.spawn(gateway.clone().serve(client, owner, proxy.clone(), shutdown.child_token()));
@@ -207,16 +224,14 @@ async fn credential_relay(
 }
 
 async fn bridge_gateway() -> io::Result<IpAddr> {
-    let output = Command::new("docker")
-        .args([
-            "network",
-            "inspect",
-            "bridge",
-            "--format",
-            "{{(index .IPAM.Config 0).Gateway}}",
-        ])
-        .output()
-        .await?;
+    let output = super::docker::execute(Command::new("docker").args([
+        "network",
+        "inspect",
+        "bridge",
+        "--format",
+        "{{(index .IPAM.Config 0).Gateway}}",
+    ]))
+    .await?;
     if !output.status.success() {
         return Err(io::Error::other(
             "cannot find Docker bridge gateway for the host proxy",
@@ -229,7 +244,7 @@ async fn bridge_gateway() -> io::Result<IpAddr> {
 }
 async fn relay(
     listener: TcpListener,
-    target: SocketAddr,
+    targets: Arc<[SocketAddr]>,
     peers: Peers,
     shutdown: CancellationToken,
 ) {
@@ -237,11 +252,12 @@ async fn relay(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            accepted = listener.accept() => {
+            accepted = crate::network::socket::accept(&listener), if connections.len() < 256 => {
                 let Ok((mut client, source)) = accepted else { break };
                 if !peers.allows(source.ip()) { continue }
+                let targets = targets.clone();
                 connections.spawn(async move {
-                    if let Ok(Ok(mut upstream)) = tokio::time::timeout(std::time::Duration::from_secs(15), TcpStream::connect(target)).await {
+                    if let Ok(Ok(mut upstream)) = tokio::time::timeout(std::time::Duration::from_secs(15), TcpStream::connect(&targets[..])).await {
                         let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
                     }
                 });

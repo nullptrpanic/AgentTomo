@@ -16,11 +16,10 @@ export function createObservation(token) {
   async function loadPayload(kind, preview, signal, encoding = "") {
     if (!Number.isSafeInteger(preview.offset) || preview.offset < 0 || !Number.isSafeInteger(preview.captured_bytes) || preview.captured_bytes < 0 || preview.captured_bytes > 1048576) throw new Error("Invalid snapshot reference");
     const target = new URL(`/api/sessions/${sessionId}/${kind}`, location.href);
-    target.searchParams.set("token", token);
     target.searchParams.set("offset", preview.offset);
     target.searchParams.set("length", preview.captured_bytes);
     if (encoding) target.searchParams.set("decode", encoding);
-    const response = await fetch(target, { signal, cache: "no-store" });
+    const response = await fetch(target, { headers: {Authorization: `Bearer ${token}`}, signal, cache: "no-store" });
     if (!response.ok) throw new Error(`Saved content is unavailable (HTTP ${response.status})`);
     const bytes = new Uint8Array(await response.arrayBuffer());
     const decoding = response.headers.get("x-agenttomo-decoding") || "identity";
@@ -31,10 +30,9 @@ export function createObservation(token) {
   const files = new FilePreview($("file-preview"), async (event, signal) => (await loadPayload("file-preview", event.data.preview, signal)).bytes);
   async function loadStream(requestId, messageId, signal) {
     const target = new URL(`/api/sessions/${sessionId}/stream-messages`, location.href);
-    target.searchParams.set("token", token);
     target.searchParams.set("request_id", requestId);
     if (messageId !== null) target.searchParams.set("message_id", messageId);
-    const response = await fetch(target, { signal, cache: "no-store" });
+    const response = await fetch(target, { headers: {Authorization: `Bearer ${token}`}, signal, cache: "no-store" });
     if (!response.ok) { const error = new Error(`HTTP ${response.status}`); error.status = response.status; throw error; }
     return messageId === null ? response.json() : new Uint8Array(await response.arrayBuffer());
   }
@@ -42,8 +40,9 @@ export function createObservation(token) {
   async function loadAgent(preview, signal) {
     if (!Number.isSafeInteger(preview.offset) || preview.offset < 0 || !Number.isSafeInteger(preview.captured_bytes) || preview.captured_bytes < 0 || preview.captured_bytes > 33554432) throw new Error("Invalid semantic payload reference");
     const target = new URL(`/api/sessions/${sessionId}/agent-payload`, location.href);
-    target.searchParams.set("token", token); target.searchParams.set("offset", preview.offset); target.searchParams.set("length", preview.captured_bytes);
-    const response = await fetch(target, { signal, cache: "no-store" });
+
+    target.searchParams.set("offset", preview.offset); target.searchParams.set("length", preview.captured_bytes);
+    const response = await fetch(target, { headers: {Authorization: `Bearer ${token}`}, signal, cache: "no-store" });
     if (!response.ok) throw new Error(`Complete content unavailable (HTTP ${response.status})`);
     return response.json();
   }
@@ -56,9 +55,9 @@ export function createObservation(token) {
       agent.control.sample(id, sample);
       observationView("agent");
     },
-    onCancel:() => agent.control?.cancel(),
+    onCancel:() => agent.cancel(),
     onTask:id => { observationView("agent"); agent.focus(`task-${id}`); },
-    onChat:id => { $("chat-tab").click(); agent.history.querySelector(`[data-task-id="${id}"]`)?.scrollIntoView({block:"nearest"}); },
+    onChat:id => { $("chat-tab").click(); agent.history.querySelector(`[data-task-id="${CSS.escape(id)}"]`)?.scrollIntoView({block:"nearest"}); },
     onEvidence:inspectEvidence,
     onCount:count => { $("finding-count").textContent = count; $("finding-count").hidden = !count; },
   });
@@ -73,6 +72,7 @@ export function createObservation(token) {
     activeView = name;
     for (const button of document.querySelectorAll("[data-observation]")) button.setAttribute("aria-pressed", String(button.dataset.observation === name));
     $("traffic").hidden = name !== "traffic";
+    traffic.visibility(name === "traffic");
     $("trace-scroll").hidden = name !== "process";
     $("agent-trajectory").hidden = name !== "agent";
     $("findings").hidden = name !== "findings";
@@ -91,7 +91,7 @@ export function createObservation(token) {
       agent.closeDetail();
       $("event-detail").open = false;
       files.show(event);
-    } else if (event.kind.startsWith("network.")) {
+    } else if (event.kind.startsWith("network.") && !event.kind.startsWith("network.udp.")) {
       observationView("traffic");
       traffic.select(connectionId === null ? event : { data: { connection_id: connectionId } });
       $("event-detail").open = traffic.selected === null;
@@ -110,8 +110,6 @@ export function createObservation(token) {
   const trace = new TraceView({
     root: $("process-tree"), scroll: $("trace-scroll"), empty: $("empty-trace"), onSelect: selectEvent, onInspect: inspectEvidence,
   });
-
-
   function schedule() {
     if (scheduled) return;
     scheduled = true;
@@ -140,7 +138,7 @@ export function createObservation(token) {
       $("capture-description").textContent = message.http_capture ? "Process lifecycle · files · TCP / UDP · HTTP/HTTPS content available in Traffic." : "Process lifecycle · files · TCP / UDP · HTTP Host / TLS SNI. HTTPS stays encrypted.";
     },
     start(pid) { tree.start(pid); agent.setReady(true); sampleControls(); schedule(); },
-    stop(reason) { agent.setReady(false, reason); samples.end(); sampleControls(); },
+    stop(reason) { traffic.end(); agent.setReady(false, reason); samples.end(); sampleControls(); },
     control(control) { agent.setControl(control); sampleControls(); },
     view:observationView,
     add(event) { samples.add(event); if (event.kind.startsWith("security.sample.")) { sampleControls(); return; } agent.add(event); sampleControls(); if (!event.kind.startsWith("agent.")) { filter.observe(event.kind); tree.add(event); traffic.add(event); } schedule(); },

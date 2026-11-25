@@ -552,6 +552,28 @@ async fn docker_terminal_streams_real_traces_and_cleans_up() {
     )
     .unwrap();
     assert_eq!(session["browser"], false);
+    // A pipelined terminal may have more frames in flight than the host queue.
+    for _ in 0..48 {
+        socket
+            .feed(Message::Binary(Default::default()))
+            .await
+            .unwrap();
+    }
+    socket.flush().await.unwrap();
+    timeout(Duration::from_secs(8), async {
+        let mut acknowledged = 0;
+        while acknowledged < 48 {
+            if let Message::Text(text) = socket.next().await.unwrap().unwrap() {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                assert_ne!(value["type"], "error", "{value}");
+                if value["type"] == "input_ack" {
+                    acknowledged += 1;
+                }
+            }
+        }
+    })
+    .await
+    .expect("pipelined input was lost");
     socket
         .send(Message::Text(
             json!({"type":"resize","rows":33,"cols":101})

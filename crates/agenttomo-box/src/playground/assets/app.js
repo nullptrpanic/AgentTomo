@@ -5,6 +5,14 @@ const $ = id => document.getElementById(id);
 const params = new URL(location.href).searchParams;
 const token = params.get("token") || "";
 const monitorOnly = params.has("monitor");
+if (token) {
+  try {
+    sessionStorage.setItem("agenttomo.access." + (params.get("monitor") || "owner"), token);
+    const address = new URL(location.href);
+    address.searchParams.delete("token");
+    history.replaceState(null, "", address);
+  } catch { /* Storage-disabled browsers retain the access link for reload. */ }
+}
 const observation = createObservation(token);
 let finalStatus = false;
 
@@ -23,8 +31,7 @@ async function selectWorkspaceAgent() {
   const choices = picker.querySelector(".agent-options");
   const template = choices.querySelector("template");
   const url = new URL("/api/agents", location.href);
-  url.searchParams.set("token", token);
-  const response = await fetch(url);
+  const response = await fetch(url, {headers: {Authorization: `Bearer ${token}`}});
   if (!response.ok) throw new Error(`Cannot load workspace agents (HTTP ${response.status}).`);
   const available = await response.json();
   const requested = params.get("agent");
@@ -106,12 +113,7 @@ function onMessage(message) {
   switch (message.type) {
     case "session": {
       observation.session(message);
-      const url = new URL("/", location.href);
-      url.searchParams.set("token", token);
-      url.searchParams.set("monitor", message.id);
-      open.href = url.href;
-      open.removeAttribute("aria-disabled");
-      open.removeAttribute("tabindex");
+      open.dataset.session = message.id;
       if (monitorOnly) {
         document.title = `AgentTomo · Monitor ${message.id.slice(0, 8)}`;
         $("trace-session").textContent = `session ${message.id.slice(0, 8)}`;
@@ -119,7 +121,16 @@ function onMessage(message) {
       setStatus(monitorOnly ? "Loading history" : "Starting container", "starting");
       break;
     }
-    case "ready": observation.start(message.pid); setStatus(monitorOnly ? "Following session" : "Connected", "live"); break;
+    case "ready":
+      if (message.monitor_token) {
+        const url = new URL("/", location.href);
+        url.searchParams.set("monitor", open.dataset.session);
+        url.searchParams.set("token", message.monitor_token);
+        open.href = url.href;
+        open.removeAttribute("aria-disabled");
+        open.removeAttribute("tabindex");
+      }
+      observation.start(message.pid); setStatus(monitorOnly ? "Following session" : "Connected", "live"); break;
     case "trace": observation.add(message.event); break;
     case "root_exit": observation.stop("The sandbox shell exited."); setStatus(`Shell exited (${message.code}) · collecting`, "starting"); break;
     case "complete": observation.stop("Sandbox finished."); finalStatus = true; setStatus("Collection complete", "complete"); break;
@@ -143,6 +154,7 @@ function onMessage(message) {
       else notice(`${complete ? "Collection completed." : "This session stopped before collection completed."} Recordings are deleted when the sandbox ends; previously loaded content may still appear on this page.`);
       break;
     }
+    case "control_error": notice(message.message); break;
     case "error": observation.stop(`Sandbox stopped: ${message.message}`); finalStatus = true; setStatus("Session error", "error"); notice(message.message); break;
     case "disconnected":
       if (!finalStatus) {

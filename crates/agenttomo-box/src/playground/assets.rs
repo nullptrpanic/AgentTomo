@@ -1,11 +1,17 @@
 use axum::{
     extract::Path,
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 
-pub async fn get(Path(path): Path<String>) -> Response {
+pub async fn get(Path(path): Path<String>, headers: HeaderMap) -> Response {
     let (mime, content) = match path.as_str() {
+        "resume.mjs" => ("text/javascript", include_str!("assets/resume.mjs")),
+        "vendor/xterm-LICENSE" => ("text/plain", include_str!("assets/vendor/xterm-LICENSE")),
+        "vendor/addon-fit-LICENSE" => (
+            "text/plain",
+            include_str!("assets/vendor/addon-fit-LICENSE"),
+        ),
         "app.js" => ("text/javascript", include_str!("assets/app.js")),
         "workspace.mjs" => ("text/javascript", include_str!("assets/workspace.mjs")),
         "agent-model.mjs" => ("text/javascript", include_str!("assets/agent-model.mjs")),
@@ -85,13 +91,68 @@ pub async fn get(Path(path): Path<String>) -> Response {
         "vendor/xterm.css" => ("text/css", include_str!("assets/vendor/xterm.css")),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    use std::{
+        collections::HashMap,
+        hash::{DefaultHasher, Hash, Hasher},
+        sync::{Mutex, OnceLock},
+    };
+    static TAGS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let etag = TAGS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("asset tags")
+        .entry(path)
+        .or_insert_with(|| {
+            let mut hash = DefaultHasher::new();
+            content.hash(&mut hash);
+            format!(r#""{:016x}""#, hash.finish())
+        })
+        .clone();
+    let unchanged = headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .flat_map(|line| line.split(','))
+        .map(str::trim)
+        .any(|tag| tag == "*" || tag.trim_start_matches("W/") == etag);
+    let response = if unchanged {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        (
+            [
+                (header::CONTENT_TYPE, mime),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            content,
+        )
+            .into_response()
+    };
     (
         [
-            (header::CONTENT_TYPE, mime),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::ETAG, etag.as_str()),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        content,
+        response,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn embedded_asset_supports_conditional_get() {
+        let first = get(Path("app.js".into()), HeaderMap::new()).await;
+        let etag = first.headers()[header::ETAG].clone();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, etag.clone());
+        let cached = get(Path("app.js".into()), headers.clone()).await;
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(&cached.headers()[header::ETAG], &etag);
+        assert_eq!(
+            get(Path("style.css".into()), headers).await.status(),
+            StatusCode::OK
+        );
+    }
 }

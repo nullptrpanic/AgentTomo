@@ -1,5 +1,5 @@
 //! Read the retained message window; IDs never alias reused payload offsets.
-use super::{Access, App, payload::run_directory};
+use super::{Access, App, payload};
 use crate::recording::streams;
 use axum::{
     Json,
@@ -7,12 +7,7 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use nix::{
-    fcntl::{OFlag, openat},
-    sys::stat::Mode,
-};
 use serde::Deserialize;
-use std::fs::File;
 
 #[derive(Deserialize)]
 pub(super) struct Selection {
@@ -30,8 +25,7 @@ pub async fn read(
     if !query.access.authorized(&app) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if session.len() != 32
-        || !session.bytes().all(|byte| byte.is_ascii_hexdigit())
+    if !super::valid_session(&session)
         || !(1..=i64::MAX as u64).contains(&query.request_id)
         || query
             .message_id
@@ -40,17 +34,9 @@ pub async fn read(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let result = tokio::task::spawn_blocking(move || {
-        let dir =
-            run_directory(&app.settings.output_dir, &session).map_err(|_| StatusCode::NOT_FOUND)?;
-        let file = File::from(
-            openat(
-                &dir,
-                streams::FILE,
-                OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
-                Mode::empty(),
-            )
-            .map_err(|_| StatusCode::NOT_FOUND)?,
-        );
+        let dir = payload::run_directory(&app.settings.output_dir, &session)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        let file = payload::open_record(&dir, streams::FILE).map_err(|_| StatusCode::NOT_FOUND)?;
         if !file
             .metadata()
             .map_err(|_| StatusCode::NOT_FOUND)?

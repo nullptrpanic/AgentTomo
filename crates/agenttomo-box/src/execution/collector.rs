@@ -1,21 +1,22 @@
 //! Long-lived owner of tracing, recording, and the built-in proxy.
 
+mod input;
+
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::Path;
 
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::pipe::Receiver;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::protocol::{self, Input, Message};
+use super::protocol::{self, Message};
 use super::streams::{Output, Streams};
 use crate::recording::Recording;
-use crate::terminal::Pty;
 use crate::tracing::{self, Event};
 
 nix::ioctl_read_bad!(bytes_available, nix::libc::FIONREAD, nix::libc::c_int);
@@ -145,13 +146,15 @@ async fn collect(
     let input = Receiver::from_owned_fd(unsafe { OwnedFd::from_raw_fd(0) })?;
     let (stop_input, stopped) = oneshot::channel();
     let mut stop_input = Some(stop_input);
-    let mut input = tokio::spawn(record_input(
+    let (ack, mut acknowledgements) = mpsc::channel(8);
+    let mut input = tokio::spawn(input::record(
         input,
         stdin,
         terminal,
         input_log,
         stopped,
         agent_actions,
+        ack,
     ));
     let mut frontend = Some(tokio::io::stdout());
     protocol::send(frontend.as_mut().unwrap(), &Message::Started { pid }).await?;
@@ -173,6 +176,9 @@ async fn collect(
                 result.map_err(io::Error::other)??;
                 agent_task = None;
             },
+            Some(()) = acknowledgements.recv() => {
+                if let Some(output) = frontend.as_mut() { protocol::send(output, &Message::InputAck).await?; }
+            }
             result = recording.writer_failure() => result?,
             event = events.recv(), if !tracing_done => match event {
                 Some(Event::Process { kind, data }) => { recording.event("ptrace", kind, data).await?; },
@@ -241,79 +247,6 @@ async fn collect(
         .join()
         .map_err(|_| io::Error::other("tracer thread panicked"))?;
     recording.status("complete", None).await
-}
-
-async fn record_input(
-    input: Receiver,
-    stdin: Box<dyn AsyncWrite + Unpin + Send>,
-    terminal: Option<Pty>,
-    mut log: File,
-    stop: oneshot::Receiver<()>,
-    agents: mpsc::Sender<crate::agent::workspace::Action>,
-) -> io::Result<()> {
-    let mut input = BufReader::new(input);
-    let mut stdin = Some(stdin);
-    let result: io::Result<()> = {
-        let copy = async {
-            loop {
-                match protocol::receive(&mut input).await? {
-                    Input::AgentPrompt {
-                        task_id,
-                        prompt,
-                        sample,
-                    } => {
-                        if task_id.len() != 32
-                            || !task_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-                            || sample.is_none() && prompt.trim().is_empty()
-                            || prompt.len() > 8192
-                        {
-                            return Err(io::Error::other("invalid agent prompt"));
-                        }
-                        let agent_instance_id =
-                            std::env::var("AGENTTOMO_AGENT_ID").map_err(io::Error::other)?;
-                        agents
-                            .send(crate::agent::workspace::Action::Start {
-                                scope: crate::agent::Scope {
-                                    agent_instance_id,
-                                    task_id,
-                                },
-                                prompt,
-                                sample,
-                                report_marker: None,
-                            })
-                            .await
-                            .map_err(io::Error::other)?;
-                    }
-                    Input::AgentCancel => agents
-                        .send(crate::agent::workspace::Action::Cancel)
-                        .await
-                        .map_err(io::Error::other)?,
-                    Input::Resize { rows, cols } => {
-                        if let Some(terminal) = &terminal {
-                            terminal.resize(rows, cols)?;
-                        }
-                    }
-                    Input::Closed => {
-                        stdin.take();
-                    }
-                    Input::Bytes(bytes) => {
-                        log.write_all(&bytes).await?;
-                        if let Some(output) = stdin.as_mut() {
-                            match output.write_all(&bytes).await {
-                                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                                    stdin.take();
-                                }
-                                result => result?,
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        tokio::select! { result = copy => result, _ = stop => Ok(()) }
-    };
-    log.flush().await?;
-    result
 }
 
 async fn record_output(

@@ -18,7 +18,7 @@ use nix::unistd::{Pid, getpid, getppid, setsid};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::recording;
 use protocol::{Input, Message};
@@ -74,11 +74,15 @@ pub async fn run(
     let input = worker.stdin.take().expect("piped worker stdin");
     let mut output = BufReader::new(worker.stdout.take().expect("piped worker stdout"));
     let (root_tx, mut root_rx) = watch::channel(None);
+    let (ack, received) = mpsc::channel(1);
     let receive = async {
         loop {
             match protocol::receive(&mut output).await? {
                 Message::Started { pid } => {
                     let _ = root_tx.send(Some(pid));
+                }
+                Message::InputAck => {
+                    let _ = ack.try_send(());
                 }
                 Message::Stdout(bytes) => forward("stdout", tokio::io::stdout(), &bytes).await?,
                 Message::Stderr(bytes) => forward("stderr", tokio::io::stderr(), &bytes).await?,
@@ -107,7 +111,7 @@ pub async fn run(
     tokio::pin!(receive);
     let result = tokio::select! {
         result = &mut receive => result,
-        result = send_input(input) => {
+        result = send_input(input, received) => {
             match result {
                 Err(error) if error.kind() == io::ErrorKind::BrokenPipe => receive.await,
                 Err(error) => Err(error),
@@ -123,7 +127,10 @@ pub async fn run(
     result
 }
 
-async fn send_input(mut pipe: impl AsyncWrite + Unpin) -> io::Result<()> {
+async fn send_input(
+    mut pipe: impl AsyncWrite + Unpin,
+    mut received: mpsc::Receiver<()>,
+) -> io::Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut buffer = [0; 8192];
     loop {
@@ -134,6 +141,7 @@ async fn send_input(mut pipe: impl AsyncWrite + Unpin) -> io::Result<()> {
             return std::future::pending().await;
         }
         protocol::send(&mut pipe, &Input::Bytes(buffer[..count].to_vec())).await?;
+        received.recv().await.ok_or(io::ErrorKind::BrokenPipe)?;
     }
 }
 

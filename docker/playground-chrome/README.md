@@ -62,7 +62,7 @@ Remove `--browser` from older startup commands.
   is unaffected. Browser sessions use 256 MiB of shared memory.
 - noVNC is bundled with the application. The server checks its existing token,
   Origin and active session before bridging WebSocket bytes through Docker exec
-  to VNC on the container's loopback address. No VNC port is published. Buffers
+  to the desktop user's private Unix socket inside the container. A custom desktop helper can declare the same Unix socket protocol with the line `# agenttomo-rfb-unix-v1`. Older images run the helper bundled with the host binary using their installed X11 tools. No VNC port is published. Buffers
   are bounded and use backpressure; display reconnect closes its previous relay.
 - Closing the page, creating a new session, or stopping the server cancels
   bridges and removes the owned container. Shell exit alone still permits Chrome

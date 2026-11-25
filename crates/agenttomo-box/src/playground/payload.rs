@@ -92,8 +92,7 @@ async fn read(
     if !range.access.authorized(&app) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if session.len() != 32
-        || !session.bytes().all(|byte| byte.is_ascii_hexdigit())
+    if !super::valid_session(&session)
         || range.length > max_bytes
         || decode.as_ref().is_some_and(|value| value.len() > 128)
     {
@@ -101,16 +100,7 @@ async fn read(
     }
     let result = tokio::task::spawn_blocking(move || {
         let dir = run_directory(&app.settings.output_dir, &session)?;
-        let file = File::from(openat(
-            &dir,
-            payload_file,
-            OFlag::O_RDONLY
-                | OFlag::O_NOFOLLOW
-                | OFlag::O_CLOEXEC
-                | OFlag::O_NONBLOCK
-                | OFlag::O_NOCTTY,
-            Mode::empty(),
-        )?);
+        let file = open_record(&dir, payload_file)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(io::Error::from(io::ErrorKind::NotFound));
@@ -158,6 +148,19 @@ pub(super) fn session_directory(root: &FsPath, session: &str) -> io::Result<File
         &dir,
         session,
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?))
+}
+
+pub(super) fn open_record(dir: &File, name: &str) -> io::Result<File> {
+    Ok(File::from(openat(
+        dir,
+        name,
+        OFlag::O_RDONLY
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_CLOEXEC
+            | OFlag::O_NONBLOCK
+            | OFlag::O_NOCTTY,
         Mode::empty(),
     )?))
 }

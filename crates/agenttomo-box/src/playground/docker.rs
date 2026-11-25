@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
-async fn execute(command: &mut Command) -> io::Result<Output> {
+pub(super) async fn execute(command: &mut Command) -> io::Result<Output> {
     // Terminal Ctrl-C targets the foreground process group. Only the server
     // should handle it; repeated interrupts must not abort Docker cleanup.
     command

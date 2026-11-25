@@ -19,6 +19,31 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Access, App, same_origin};
 
+pub struct Display {
+    lifetime: CancellationToken,
+    viewer: Option<CancellationToken>,
+}
+
+impl Display {
+    pub fn new(lifetime: CancellationToken) -> Self {
+        Self {
+            lifetime,
+            viewer: None,
+        }
+    }
+    pub fn close(self) {
+        self.lifetime.cancel();
+    }
+
+    fn attach(&mut self) -> CancellationToken {
+        let viewer = self.lifetime.child_token();
+        if let Some(previous) = self.viewer.replace(viewer.clone()) {
+            previous.cancel();
+        }
+        viewer
+    }
+}
+
 pub async fn start(container: &str) -> io::Result<Child> {
     let mut child = Command::new("docker")
         .args([
@@ -34,7 +59,14 @@ pub async fn start(container: &str) -> io::Result<Child> {
             "--env",
             "LOGNAME=nobody",
             container,
+            "/bin/sh",
+            "-c",
+            // Older bundled images started an unauthenticated TCP listener. Use
+            // the current helper with the same installed X11 tools on those images.
+            r#"if grep -qx '# agenttomo-rfb-unix-v1' "$0"; then exec "$0"; fi
+exec /bin/sh -c "$1""#,
             "/usr/local/bin/agenttomo-desktop",
+            include_str!("../../../../docker/playground-chrome/agenttomo-desktop"),
         ])
         .process_group(0)
         .stdin(Stdio::null())
@@ -79,21 +111,32 @@ pub async fn websocket(
     if !same_origin(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let lifetime = app
+    if !app
         .desktops
         .lock()
         .expect("desktop registry")
-        .get(&id)
-        .cloned();
-    let Some(lifetime) = lifetime.filter(|lifetime| !lifetime.is_cancelled()) else {
+        .contains_key(&id)
+    {
         return StatusCode::NOT_FOUND.into_response();
-    };
+    }
     let tracked = app.sessions.token();
+    let upgrade = if let Some(token) = &access.token {
+        upgrade.protocols([format!("agenttomo.{token}")])
+    } else {
+        upgrade
+    };
     upgrade
         .max_message_size(256 * 1024)
         .max_frame_size(256 * 1024)
         .on_upgrade(move |socket| async move {
             let _tracked = tracked;
+            let viewer = app
+                .desktops
+                .lock()
+                .expect("desktop registry")
+                .get_mut(&id)
+                .map(Display::attach);
+            let Some(lifetime) = viewer else { return };
             if let Err(error) = bridge(socket, &format!("agenttomo-{id}"), lifetime).await {
                 eprintln!("agenttomo-box: desktop {id}: {error}");
             }
@@ -110,11 +153,13 @@ async fn bridge(socket: WebSocket, container: &str, lifetime: CancellationToken)
         .args([
             "exec",
             "--interactive",
+            "--user",
+            "65534:65534",
             container,
             "nc",
             "-N",
-            "127.0.0.1",
-            "5900",
+            "-U",
+            "/tmp/agenttomo-desktop/rfb.sock",
         ])
         .process_group(0)
         .stdin(Stdio::piped())
@@ -158,6 +203,7 @@ async fn bridge(socket: WebSocket, container: &str, lifetime: CancellationToken)
         }
     };
     drop(input);
+    drop(output);
     // Let Docker propagate stdin EOF and nc shut down its socket before
     // terminating the CLI; otherwise reconnects leave remote nc processes.
     if timeout(Duration::from_secs(2), child.wait()).await.is_err() {

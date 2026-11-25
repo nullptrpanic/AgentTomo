@@ -110,10 +110,12 @@ impl AsyncWrite for Pty {
     ) -> Poll<io::Result<usize>> {
         loop {
             let mut guard = ready!(self.0.poll_write_ready(cx))?;
+            let closed = guard.ready().is_write_closed();
             match guard
                 .try_io(|fd| nix::unistd::write(fd.get_ref(), bytes).map_err(io::Error::from))
             {
                 Ok(result) => return Poll::Ready(result),
+                Err(_) if closed => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
                 Err(_) => continue,
             }
         }

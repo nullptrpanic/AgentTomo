@@ -7,10 +7,6 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use nix::{
-    fcntl::{OFlag, openat},
-    sys::stat::Mode,
-};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -38,7 +34,7 @@ pub async fn read(
     if !cursor.access.authorized(&app) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !super::valid_session(&id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     // Take liveness BEFORE reading: an inactive session has finished writing.
@@ -97,16 +93,7 @@ pub async fn read(
 }
 
 fn regular_file(dir: &File, name: &str) -> io::Result<File> {
-    let file = File::from(openat(
-        dir,
-        name,
-        OFlag::O_RDONLY
-            | OFlag::O_NOFOLLOW
-            | OFlag::O_CLOEXEC
-            | OFlag::O_NONBLOCK
-            | OFlag::O_NOCTTY,
-        Mode::empty(),
-    )?);
+    let file = payload::open_record(dir, name)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::from_raw_os_error(nix::libc::EACCES));
     }
