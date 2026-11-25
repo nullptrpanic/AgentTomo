@@ -95,14 +95,18 @@ def receive_sockets(control):
         raise
 
 
+log_lock = threading.Lock()
+
 def log_flow(stream, protocol, source, destination):
     if stream is not None:
         # The original sandbox tuple, not the outer outgoing socket tuple.
-        stream.write(json.dumps({
+        line = json.dumps({
             "protocol": protocol, "src_ip": source[0], "src_port": source[1],
             "dst_ip": destination[0], "dst_port": destination[1],
-        }) + "\n")
-        stream.flush()
+        }) + "\n"
+        with log_lock:
+            stream.write(line)
+            stream.flush()
 
 
 def receive_udp(listener):
@@ -299,11 +303,22 @@ def forward_tcp(client, source, destination, log_stream=None):
 
 
 def serve_tcp(listener, log_stream):
+    slots = threading.BoundedSemaphore(128)
+    def handle(client, source, destination):
+        try:
+            forward_tcp(client, source, destination, log_stream)
+        finally:
+            slots.release()
+
     while True:
         try:
             client, source = listener.accept()
-        except OSError:
-            return
+        except OSError as error:
+            if error.errno in (errno.EBADF, errno.EINVAL):
+                return
+            print(f"secguard: TCP accept: {error}", file=sys.stderr, flush=True)
+            time.sleep(0.1)
+            continue
         try:
             # SO_ORIGINAL_DST is Linux option 80, evaluated in the socket's netns.
             destination = parse_original_destination(client.getsockopt(socket.IPPROTO_IP, 80, 16))
@@ -311,8 +326,13 @@ def serve_tcp(listener, log_stream):
             client.close()
             print(f"secguard: original destination unavailable: {error}", file=sys.stderr, flush=True)
             continue
-        threading.Thread(target=forward_tcp,
-                         args=(client, source, destination, log_stream), daemon=True).start()
+        slots.acquire()
+        try:
+            threading.Thread(target=handle, args=(client, source, destination), daemon=True).start()
+        except RuntimeError:
+            slots.release()
+            client.close()
+            raise
 
 
 def run_worker(control_fd, parent_netns, lock_path, command):
