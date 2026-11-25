@@ -38,6 +38,12 @@ pub fn decode(bytes: Vec<u8>, encoding: &str) -> Decoded {
             };
         }
     };
+    if status == "incomplete" && output.is_empty() {
+        return Decoded {
+            bytes,
+            status: "invalid",
+        };
+    }
     output.truncate(MAX_DECODED_BYTES);
     Decoded {
         bytes: output,

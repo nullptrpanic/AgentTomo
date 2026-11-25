@@ -1,14 +1,14 @@
 use super::{Prefix, Recorder, inflate};
 use crate::content_encoding::ContentEncoding;
 use crate::proxy::http::MessageContext;
-use flate2::Decompress;
 use serde_json::json;
 use sse_parse::SseParser;
 
 pub(in crate::proxy::http) struct Observer {
     parser: SseParser,
     recorder: Recorder,
-    decoder: Option<Decompress>,
+    decoder: Option<inflate::SseDecoder>,
+    stream_end: bool,
     failed: bool,
     start: Option<u128>,
     line_has_bytes: bool,
@@ -19,12 +19,17 @@ pub(in crate::proxy::http) struct Observer {
 impl Observer {
     pub fn new(message: &MessageContext, encoding: &str) -> Self {
         let recorder = Recorder::new(message, "sse", "downstream");
-        let (decoder, failed) = match ContentEncoding::parse(encoding) {
-            Some(ContentEncoding::Identity) => (None, false),
-            Some(ContentEncoding::Gzip) => (Some(Decompress::new_gzip(15)), false),
-            Some(ContentEncoding::Deflate) => (Some(Decompress::new(true)), false),
-            _ => {
-                recorder.error("unsupported SSE Content-Encoding; forwarding continues");
+        let model = message.model_observer();
+        let (decoder, failed) = match ContentEncoding::parse(encoding)
+            .ok_or_else(|| std::io::Error::other("unsupported SSE Content-Encoding"))
+            .and_then(inflate::SseDecoder::new)
+        {
+            Ok(decoder) => (decoder, false),
+            Err(error) => {
+                recorder.error(&error.to_string());
+                if let Some(model) = &model {
+                    message.semantic(model.failure(&error.to_string()));
+                }
                 (None, true)
             }
         };
@@ -36,11 +41,12 @@ impl Observer {
             }),
             recorder,
             decoder,
+            stream_end: false,
             failed,
             start: None,
             line_has_bytes: false,
             skip_lf: false,
-            model: message.model_observer(),
+            model,
             context: message.clone(),
         }
     }
@@ -51,14 +57,16 @@ impl Observer {
         let mut decoder = self.decoder.take();
         for chunk in bytes.chunks(8192) {
             if let Some(decoder) = &mut decoder {
-                if let Err(error) = inflate::feed(decoder, chunk, &mut |bytes| self.parsed(bytes)) {
+                let mut ended = self.stream_end;
+                if let Err(error) = decoder.feed(chunk, &mut ended, |bytes| self.parsed(bytes)) {
+                    self.recorder.error(&error);
                     if let Some(model) = &self.model {
                         self.context.semantic(model.failure(&error));
                     }
-                    self.recorder.error(&error);
                     self.failed = true;
                     break;
                 }
+                self.stream_end = ended;
             } else {
                 self.parsed(chunk);
             }
@@ -128,8 +136,18 @@ impl Observer {
         }
     }
     pub fn finish(&mut self, complete: bool) {
-        if let Some(model) = &self.model {
-            self.context.semantic(model.finish_response(complete));
+        let truncated = self.decoder.is_some() && !self.stream_end && !self.failed && complete;
+        if truncated {
+            self.recorder.error("incomplete compressed SSE stream");
+        }
+        if let Some(model) = &self.model
+            && !self.failed
+        {
+            self.context.semantic(if truncated {
+                model.failure("incomplete compressed SSE stream")
+            } else {
+                model.finish_response(complete)
+            });
         }
         self.parser.finish();
     }

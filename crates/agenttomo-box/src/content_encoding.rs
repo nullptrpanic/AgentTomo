@@ -9,6 +9,15 @@ pub enum ContentEncoding {
     Zstd,
 }
 
+pub fn header(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get_all("content-encoding")
+        .iter()
+        .map(|v| v.to_str().unwrap_or("invalid"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl ContentEncoding {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -27,7 +36,14 @@ impl ContentEncoding {
             Self::Deflate => Box::new(flate2::read::ZlibDecoder::new(bytes)),
             Self::Zstd => {
                 let mut decoder = zstd::stream::read::Decoder::new(bytes)?;
-                decoder.window_log_max(26)?;
+                decoder.window_log_max(
+                    limit
+                        .saturating_sub(1)
+                        .max(1 << 20)
+                        .next_power_of_two()
+                        .ilog2()
+                        .min(26),
+                )?;
                 Box::new(decoder)
             }
         };

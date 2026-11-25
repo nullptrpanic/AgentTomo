@@ -168,7 +168,7 @@ impl Response {
             }
             "error" => events.push(Event {
                 kind: "agent.capture.error",
-                data: json!({"error":value}),
+                data: json!({"error":model_error(&value)}),
                 content: None,
             }),
             _ => {}
@@ -197,7 +197,7 @@ impl Response {
         }
         events.push(Event {
             kind: "agent.model.complete",
-            data: json!({"response_id":response["id"],"status":status,"usage":response["usage"],"error":response["error"]}),
+            data: json!({"response_id":response["id"],"status":status,"usage":response["usage"],"error":response.get("error").filter(|v| !v.is_null()).map(model_error)}),
             content: Some(response.clone()),
         });
         events
@@ -251,6 +251,17 @@ impl Response {
     }
 }
 
+fn model_error(value: &Value) -> String {
+    value["error"]["message"]
+        .as_str()
+        .or(value["message"].as_str())
+        .or(value.as_str())
+        .unwrap_or("Model reported an error")
+        .chars()
+        .take(1024)
+        .collect()
+}
+
 fn is_tool(item: &Value) -> bool {
     item["type"]
         .as_str()
@@ -259,7 +270,7 @@ fn is_tool(item: &Value) -> bool {
 fn tool(item: &Value, kind: &'static str, content: Option<Value>) -> Event {
     Event {
         kind,
-        data: json!({"call_id":item.get("call_id").unwrap_or(&item["id"]),"item_id":item["id"],"name":item.get("name").unwrap_or(&item["type"]),"tool_type":item["type"],"execution":if matches!(item["type"].as_str(),Some("function_call"|"custom_tool_call")) {"agent"} else {"provider_or_native"},"visibility":"model_output"}),
+        data: json!({"call_id":item["call_id"].as_str().filter(|id| !id.is_empty()).or(item["id"].as_str()),"item_id":item["id"],"name":item.get("name").unwrap_or(&item["type"]),"tool_type":item["type"],"execution":if matches!(item["type"].as_str(),Some("function_call"|"custom_tool_call")) {"agent"} else {"provider_or_native"},"visibility":"model_output"}),
         content,
     }
 }

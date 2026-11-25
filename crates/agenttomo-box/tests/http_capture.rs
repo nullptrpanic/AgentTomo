@@ -251,9 +251,7 @@ fn box_proxy_tunnels_https_with_overlay_ca_and_no_application_connect_event() {
     check_https_inspection(false, true);
 }
 
-fn check_https_inspection(tunnel: bool, box_proxy: bool) {
-    let before = std::fs::read("/etc/ssl/certs/ca-certificates.crt").unwrap();
-    let fixture = fixture();
+fn tls_server(fixture: &Fixture) -> (std::path::PathBuf, rustls::ServerConfig) {
     let mut ca = rcgen::CertificateParams::default();
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca_key = rcgen::KeyPair::generate().unwrap();
@@ -273,6 +271,64 @@ fn check_https_inspection(tunnel: bool, box_proxy: bool) {
             rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
         )
         .unwrap();
+    (trust, config)
+}
+
+#[test]
+fn custom_tls_alpn_echo_remains_opaque_and_uses_the_upstream_protocol() {
+    let fixture = fixture();
+    let (trust, mut config) = tls_server(&fixture);
+    config.alpn_protocols = vec![b"echo/1".to_vec()];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut stream = rustls::StreamOwned::new(
+            rustls::ServerConnection::new(std::sync::Arc::new(config)).unwrap(),
+            socket,
+        );
+        let mut bytes = [0; 4];
+        stream.read_exact(&mut bytes).unwrap();
+        assert_eq!(stream.conn.alpn_protocol(), Some(b"echo/1".as_slice()));
+        stream.write_all(&bytes).unwrap();
+        stream.flush().unwrap();
+    });
+    let script = format!(
+        r#"import socket, ssl
+context = ssl.create_default_context()
+context.set_alpn_protocols(["echo/1"])
+with context.wrap_socket(socket.create_connection(("127.0.0.1", {port}), timeout=5), server_hostname="localhost") as client:
+    assert client.selected_alpn_protocol() == "echo/1"
+    client.sendall(b"echo")
+    assert client.recv(4) == b"echo"
+"#
+    );
+    std::fs::write(fixture.0.join("echo.py"), script).unwrap();
+    let mut command = fixture.command("exec env -u SSL_CERT_FILE python3 echo.py");
+    command.env("SSL_CERT_FILE", trust).arg("--capture-http");
+    let output = Fixture::wait(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let events = fixture.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["data"]["upstream_alpn"] == "echo/1")
+    );
+    assert!(!events.iter().any(|e| e["kind"] == "network.http.request"));
+}
+
+fn check_https_inspection(tunnel: bool, box_proxy: bool) {
+    let before = std::fs::read("/etc/ssl/certs/ca-certificates.crt").unwrap();
+    let fixture = fixture();
+    let (trust, config) = tls_server(&fixture);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {

@@ -8,8 +8,11 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub fn replay(prefix: Vec<u8>, io: BoxIo) -> BoxIo {
+    if prefix.is_empty() {
+        return io;
+    }
     Box::new(Replay {
-        prefix: std::io::Cursor::new(prefix),
+        prefix: Some(std::io::Cursor::new(prefix)),
         io,
     })
 }
@@ -17,7 +20,7 @@ pub fn replay(prefix: Vec<u8>, io: BoxIo) -> BoxIo {
 // Detection retains only a bounded preface. Replaying it is essential for
 // fragmented HTTP and protocols that happen to start with ASCII.
 struct Replay {
-    prefix: std::io::Cursor<Vec<u8>>,
+    prefix: Option<std::io::Cursor<Vec<u8>>>,
     io: BoxIo,
 }
 impl AsyncRead for Replay {
@@ -26,11 +29,14 @@ impl AsyncRead for Replay {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.prefix.position() < self.prefix.get_ref().len() as u64 {
-            Pin::new(&mut self.prefix).poll_read(cx, buf)
-        } else {
-            Pin::new(&mut self.io).poll_read(cx, buf)
+        if let Some(prefix) = &mut self.prefix {
+            let result = Pin::new(&mut *prefix).poll_read(cx, buf);
+            if prefix.position() == prefix.get_ref().len() as u64 {
+                self.prefix = None;
+            }
+            return result;
         }
+        Pin::new(&mut self.io).poll_read(cx, buf)
     }
 }
 impl AsyncWrite for Replay {

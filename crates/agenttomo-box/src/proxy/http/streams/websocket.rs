@@ -95,7 +95,7 @@ impl Observer {
         if self.failed {
             return;
         }
-        while !bytes.is_empty() {
+        while !bytes.is_empty() && !self.failed {
             if self.frame.is_none() {
                 if self.header.is_empty() {
                     self.started = crate::proxy::http::now();
@@ -262,7 +262,10 @@ impl Observer {
                 }
                 context.semantic(events);
             } else {
-                context.semantic(vec![crate::agent::Event { kind:"agent.capture.error",data:json!({"task_id":context.agent.as_ref().map(|scope| &scope.task_id),"error":"incomplete or oversized model WebSocket message"}),content:None }]);
+                if !self.failed {
+                    context
+                        .semantic(model.failure("incomplete or oversized model WebSocket message"));
+                }
             }
         }
         let mut data = message.body.metadata();
@@ -281,6 +284,9 @@ impl Observer {
         self.recorder.record(data, message.body.bytes);
     }
     fn fail(&mut self, error: &str) {
+        if let (Some(model), Some(context)) = (&self.model, &self.context) {
+            context.semantic(model.failure(error));
+        }
         self.recorder.error(error);
         self.failed = true;
         self.finish();

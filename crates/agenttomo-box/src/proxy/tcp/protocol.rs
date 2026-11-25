@@ -13,6 +13,29 @@ pub struct Name {
     pub source: &'static str,
 }
 
+impl Name {
+    pub(super) fn route(self, destination: std::net::IpAddr) -> Option<String> {
+        if self.source == "tls_sni" {
+            return self.domain;
+        }
+        if self.source != "http_host" {
+            return None;
+        }
+        let domain = self.domain?;
+        let hostname = domain.trim_matches(['[', ']']).trim_end_matches('.');
+        if let Ok(ip) = hostname.parse::<std::net::IpAddr>() {
+            if ip.to_canonical() != destination.to_canonical() {
+                return None;
+            }
+        } else if (hostname == "localhost" || hostname.ends_with(".localhost"))
+            && !destination.to_canonical().is_loopback()
+        {
+            return None;
+        }
+        Some(domain)
+    }
+}
+
 enum State {
     Start,
     Http(Vec<u8>),
@@ -226,6 +249,28 @@ mod tests {
         names.pop().unwrap()
     }
 
+    #[test]
+    fn literal_and_loopback_headers_cannot_change_the_connected_address() {
+        let destination = "192.0.2.42".parse().unwrap();
+        for (domain, allowed) in [
+            ("localhost", false),
+            ("127.0.0.1", false),
+            ("[::ffff:127.0.0.1]", false),
+            ("192.0.2.42", true),
+            ("example.test", true),
+        ] {
+            assert_eq!(
+                Name {
+                    protocol: "http",
+                    source: "http_host",
+                    domain: Some(domain.into())
+                }
+                .route(destination)
+                .is_some(),
+                allowed
+            );
+        }
+    }
     #[test]
     fn http_headers_survive_fragmentation_and_do_not_parse_a_body_as_another_request() {
         let bytes = b"POST / HTTP/1.1\r\nhOsT: HTTP.Example.Test:8080\r\nContent-Length: 37\r\n\r\nGET / HTTP/1.1\r\nHost: body.test\r\n\r\n";

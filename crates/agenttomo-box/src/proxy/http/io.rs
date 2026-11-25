@@ -65,7 +65,7 @@ pub async fn detect(
     let mut upstream = BufReader::new(upstream);
     let mut prefix = Vec::new();
     let mut buffer = [0; 8192];
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut deadline = None;
     let mut http = false;
     loop {
         let available = buffer.len().min(65536 - prefix.len());
@@ -74,11 +74,14 @@ pub async fn detect(
             count = client.read(&mut buffer[..available]) => count?,
             bytes = upstream.fill_buf() => { bytes?; break; },
             _ = finished.cancelled() => break,
-            _ = tokio::time::sleep_until(deadline) => break,
+            _ = async { if let Some(at) = deadline { tokio::time::sleep_until(at).await } else { std::future::pending().await } } => break,
         };
         if count == 0 {
             break;
         }
+        deadline.get_or_insert_with(|| {
+            tokio::time::Instant::now() + std::time::Duration::from_millis(500)
+        });
         prefix.extend_from_slice(&buffer[..count]);
         let mut headers = [httparse::EMPTY_HEADER; 128];
         match httparse::Request::new(&mut headers).parse(&prefix) {
@@ -104,7 +107,31 @@ pub async fn opaque(
 ) -> io::Result<()> {
     tokio::select! {
         result = tokio::io::copy_bidirectional(&mut client, &mut upstream) => { result?; },
-        _ = finished.cancelled() => { let _ = client.shutdown().await; let _ = upstream.shutdown().await; },
+        _ = finished.cancelled() => { let _ = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            tokio::join!(client.shutdown(), upstream.shutdown())
+        }).await; },
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn idle_preconnection_still_recognizes_http_headers() {
+        let (mut client, incoming) = tokio::io::duplex(128);
+        let (upstream, _server) = tokio::io::duplex(128);
+        let stop = CancellationToken::new();
+        let read = detect(Box::new(incoming), Box::new(upstream), &stop);
+        let send = async {
+            tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+                .await
+                .unwrap();
+        };
+        let (result, _) = tokio::join!(read, send);
+        assert!(result.unwrap().0);
+    }
 }

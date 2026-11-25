@@ -90,15 +90,32 @@ impl Store {
                         Command::Flush(barrier) => barriers.push(barrier),
                     }
                 }
-                if error.is_none()
-                    && let Err(failure) =
+                let mut transient = None;
+                if error.is_none() {
+                    let n = messages.len() as u64;
+                    if let Err(failure) =
                         save(&mut db, messages, limits, dropped.load(Ordering::Relaxed))
-                {
-                    error = Some(failure.to_string());
+                    {
+                        if matches!(
+                            failure.sqlite_error_code(),
+                            Some(
+                                rusqlite::ErrorCode::DatabaseBusy
+                                    | rusqlite::ErrorCode::DatabaseLocked
+                            )
+                        ) {
+                            // The transaction rolled back. Account for the batch and
+                            // let subsequent writes proceed once the reader releases it.
+                            dropped.fetch_add(n, Ordering::Relaxed);
+                            transient = Some(failure.to_string());
+                        } else {
+                            error = Some(failure.to_string());
+                        }
+                    }
                 }
                 for barrier in barriers {
                     let result = error
                         .as_ref()
+                        .or(transient.as_ref())
                         .map_or(Ok(()), |error| Err(io::Error::other(error.clone())));
                     let _ = barrier.send(result);
                 }
@@ -142,6 +159,14 @@ fn save(
         received += 1;
         let data = message.data.to_string();
         let cost = (data.len() + message.payload.len()) as u64;
+        if limits.window_messages == 0
+            || limits.window_bytes == 0
+            || limits.message_bytes == 0
+            || cost > limits.window_bytes
+        {
+            evicted += 1;
+            continue;
+        }
         while count > 0
             && (bytes.saturating_add(cost) > limits.window_bytes || count >= limits.window_messages)
         {
@@ -154,10 +179,6 @@ fn save(
             bytes -= cost;
             count -= 1;
             evicted += 1;
-        }
-        if limits.window_bytes == 0 || limits.message_bytes == 0 || cost > limits.window_bytes {
-            evicted += 1;
-            continue;
         }
         tx.execute(
             "INSERT INTO messages(request_id,data,payload,cost) VALUES (?1,?2,?3,?4)",
@@ -228,6 +249,54 @@ pub fn payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn oversized_message_keeps_history_and_writer_recovers_from_lock() {
+        let dir =
+            std::env::temp_dir().join(format!("agenttomo-window-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let store = Store::create(
+            &dir,
+            Limits {
+                message_bytes: 512,
+                window_bytes: 128,
+                window_messages: 10,
+            },
+        )
+        .await
+        .unwrap();
+        let send = |size| {
+            store.record(Message {
+                request_id: 1,
+                data: json!({}),
+                payload: vec![0; size],
+            })
+        };
+        send(1);
+        store.flush().await.unwrap();
+        send(256);
+        store.flush().await.unwrap();
+        let mut db = Connection::open(dir.join(FILE)).unwrap();
+        assert_eq!(
+            snapshot(&mut db, 1).unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        send(1);
+        assert!(store.flush().await.is_err());
+        db.execute_batch("COMMIT").unwrap();
+        send(1);
+        store.flush().await.unwrap();
+        let state = snapshot(&mut db, 1).unwrap();
+        assert_eq!(state["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(state["dropped"], 1);
+        drop(db);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn byte_budget_reuses_storage_and_zero_disables_retention() {
         let dir =

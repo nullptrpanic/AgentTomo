@@ -197,7 +197,7 @@ Body 默认用 **Decoded** 展示，查看时解压 gzip／deflate／zstd 并按
 
 `--capture-http` 同时启用 HTTP/1.1 解析和 TLS 解密，默认不启用。目标 helper 在私有 mount namespace 中用 OverlayFS 覆盖 `/etc/ssl/certs`，保留原证书并追加本次 CA，不修改 lower。要求 Debian/Ubuntu 的 `ca-certificates.crt`、允许创建 mount namespace 和挂载 tmpfs/OverlayFS；失败停止启动，不静默回退。上游 TLS 使用原证书库校验；不会因目标使用 `curl -k` 而跳过代理的上游校验。每个运行随机生成 `AgentTomo Root CA`，私钥在内存中，公开证书经启动 Unix 通道送入目标 tmpfs/OverlayFS，随诊断作用域释放。注入的信任文件和 NSS 证书数据库的文件事件会标记预览已排除，避免证书随默认预览归档。
 
-当前限 HTTP/1.1；TLS 协商到 HTTP/1.1，不支持 HTTP/2-only、QUIC、证书固定、mTLS、ECH、STARTTLS 或自带证书库的自动注入。根 CA 有效期 10 个日历年，域名证书有效期 1 天。每个运行有独立的证书缓存，固定 TTL 1 小时，容量配置为 1,024 条，并发首次访问同组域名共用签发结果。PSL 处理公共后缀和租户边界，例如 `www.baidu.com`、`a.baidu.com` 和 `baidu.com` 共用含 `*.baidu.com`、`baidu.com` 的证书，深层子域单独分组，IP、单段名称和未知后缀使用精确证书。普通 HTTP 压缩正文保留原压缩字节。完整边界见[内容检查设计](../../docs/content-inspection-design.md)。
+HTTP 内容采集限 HTTP/1.1。TLS 客户端仅声明其他 ALPN 时，按上游协商结果转发字节。当前不支持 QUIC、证书固定、mTLS、ECH、STARTTLS 或自带证书库的自动注入。根 CA 有效期 10 个日历年，域名证书有效期 1 天。每个运行有独立的证书缓存，固定 TTL 1 小时，容量配置为 1,024 条，并发首次访问同组域名共用签发结果。PSL 处理公共后缀和租户边界，例如 `www.baidu.com`、`a.baidu.com` 和 `baidu.com` 共用含 `*.baidu.com`、`baidu.com` 的证书，深层子域单独分组，IP、单段名称和未知后缀使用精确证书。普通 HTTP 压缩正文保留原压缩字节。完整边界见[内容检查设计](../../docs/content-inspection-design.md)。
 
 SSE 和 WebSocket（包括 HTTPS SSE / WSS）在 Traffic 的 **Messages** 页实时展示：方向、开始时间、事件/消息类型、内容、复制和原始详情。滚到底部自动跟随，向上滚动或选旧消息会暂停；点击 **Follow latest** 恢复。SSE 支持多行事件及 gzip/deflate，WebSocket 支持掩码、分片、二进制、ping/pong/close 和 permessage-deflate。
 

@@ -257,8 +257,8 @@ pub async fn forward(
         io: client,
         counts: counts.clone(),
     });
-    let (client, upstream, scheme): (BoxIo, BoxIo, _) = if tls {
-        let (client, upstream) = decrypt(
+    let (client, upstream, scheme, inspect): (BoxIo, BoxIo, _, _) = if tls {
+        let (client, upstream, inspect) = decrypt(
             client,
             Box::new(upstream),
             &inspection,
@@ -268,11 +268,15 @@ pub async fn forward(
             None,
         )
         .await?;
-        (client, upstream, "https")
+        (client, upstream, "https", inspect)
     } else {
-        (client, Box::new(upstream), "http")
+        (client, Box::new(upstream), "http", true)
     };
-    let (is_http, client, upstream) = io::detect(client, upstream, &finished).await?;
+    let (is_http, client, upstream) = if inspect {
+        io::detect(client, upstream, &finished).await?
+    } else {
+        (false, client, upstream)
+    };
     if is_http {
         let session = Session {
             inspection,
@@ -298,6 +302,7 @@ pub async fn forward(
         up: counts.up.load(Ordering::Relaxed),
         down: Some(counts.down.load(Ordering::Relaxed)),
         reason: "closed",
+        error: None,
     })
 }
 
@@ -310,7 +315,7 @@ async fn decrypt(
     events: &mpsc::Sender<Observation>,
     finished: &CancellationToken,
     connect_host: Option<&str>,
-) -> stdio::Result<(BoxIo, BoxIo)> {
+) -> stdio::Result<(BoxIo, BoxIo, bool)> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let handshake = async {
         let start =
@@ -331,12 +336,32 @@ async fn decrypt(
             .unwrap_or_else(|| (context.key.destination.ip().to_string(), "destination_ip"));
         let server_name =
             rustls::pki_types::ServerName::try_from(name.clone()).map_err(stdio::Error::other)?;
-        let remote = tokio_rustls::TlsConnector::from(inspection.authority.client.clone())
+        let offered: Vec<Vec<u8>> = start
+            .client_hello()
+            .alpn()
+            .into_iter()
+            .flatten()
+            .map(<[u8]>::to_vec)
+            .collect();
+        let inspect = offered.is_empty() || offered.iter().any(|p| p == b"http/1.1");
+        let mut outbound = inspection.authority.client.clone();
+        if !inspect {
+            Arc::make_mut(&mut outbound).alpn_protocols = offered;
+        }
+        let remote = tokio_rustls::TlsConnector::from(outbound)
             .connect(server_name, upstream)
             .await?;
-        let local = start
-            .into_stream(inspection.authority.server(&name)?)
-            .await?;
+        let mut inbound = inspection.authority.server(&name)?;
+        if !inspect {
+            Arc::make_mut(&mut inbound).alpn_protocols = remote
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .map(<[u8]>::to_vec)
+                .into_iter()
+                .collect();
+        }
+        let local = start.into_stream(inbound).await?;
         let alpn = local
             .get_ref()
             .1
@@ -348,7 +373,7 @@ async fn decrypt(
             .alpn_protocol()
             .map(String::from_utf8_lossy);
         events.send(context.event("network.protocol", json!({"protocol":"tls","domain":name,"domain_source":name_source,"scope":"connection_preface","tls_intercepted":true,"alpn":alpn,"upstream_alpn":upstream_alpn}))).await.map_err(stdio::Error::other)?;
-        Ok::<_, stdio::Error>((Box::new(local) as BoxIo, Box::new(remote) as BoxIo))
+        Ok::<_, stdio::Error>((Box::new(local) as BoxIo, Box::new(remote) as BoxIo, inspect))
     };
     let result = tokio::select! {
         result = timeout_at(deadline, handshake) => result.map_err(stdio::Error::other).and_then(|result| result),
@@ -402,7 +427,7 @@ async fn tunnel(
         _ = session.finished.cancelled() => return Ok(()),
     };
     session.scheme = if tls { "https" } else { "http" };
-    let (client, upstream): (BoxIo, BoxIo) = if tls {
+    let (client, upstream, inspect): (BoxIo, BoxIo, bool) = if tls {
         decrypt(
             Box::new(client),
             Box::new(upstream),
@@ -414,8 +439,11 @@ async fn tunnel(
         )
         .await?
     } else {
-        (Box::new(client), Box::new(upstream))
+        (Box::new(client), Box::new(upstream), true)
     };
+    if !inspect {
+        return io::opaque(client, upstream, &session.finished).await;
+    }
     let (http, client, upstream) = io::detect(client, upstream, &session.finished).await?;
     if http {
         bridge(client, upstream, session).await
@@ -430,29 +458,21 @@ async fn handle(
     session: Session,
 ) -> Result<Response<HttpBody>, stdio::Error> {
     let model_protocol = crate::agent::Protocol::detect(request.method(), request.uri());
-    let agent = model_protocol
-        .is_some()
-        .then(|| {
-            session
-                .context
-                .metadata
-                .as_ref()
-                .filter(|metadata| metadata.actors.len() == 1)
-                .and_then(|metadata| {
-                    session
-                        .inspection
-                        .agents
-                        .binding(metadata.actors[0].process_instance_id)
-                })
-                .map(|binding| binding.scope)
-        })
-        .flatten();
-    let encoding = request
-        .headers()
-        .get("content-encoding")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
+    let mut session = session;
+    let agent = session.context.metadata.as_mut().and_then(|metadata| {
+        let [actor] = metadata.actors.as_slice() else {
+            return None;
+        };
+        // A persistent connection can carry several turns. Freeze each request
+        // when headers arrive, including its later body and stream events.
+        metadata.agent = session.inspection.agents.binding(actor.process_instance_id);
+        metadata
+            .agent
+            .as_ref()
+            .filter(|_| model_protocol.is_some())
+            .map(|binding| binding.scope.clone())
+    });
+    let encoding = crate::content_encoding::header(request.headers());
     let connect = request.method() == Method::CONNECT;
     let message = MessageContext {
         request_id: session.inspection.ids.fetch_add(1, Ordering::Relaxed),
@@ -587,12 +607,7 @@ async fn handle(
     }
     let response_message = MessageContext {
         status: Some(response.status()),
-        encoding: response
-            .headers()
-            .get("content-encoding")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_owned(),
+        encoding: crate::content_encoding::header(response.headers()),
         ..message
     };
     let format = body::Format::response(

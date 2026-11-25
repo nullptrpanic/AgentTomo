@@ -127,7 +127,10 @@ pub fn datagram(fd: RawFd, buffer: &mut [u8]) -> io::Result<Datagram> {
     let count =
         Errno::result(unsafe { libc::recvmsg(fd, &mut header, libc::MSG_DONTWAIT) })? as usize;
     if header.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
-        return Err(io::Error::other("truncated transparent UDP datagram"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated transparent UDP datagram",
+        ));
     }
     let mut destination = None;
     let mut arrived = None;
@@ -164,7 +167,8 @@ pub fn datagram(fd: RawFd, buffer: &mut [u8]) -> io::Result<Datagram> {
             destination,
             arrived,
         }),
-        _ => Err(io::Error::other(
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
             "UDP original source/destination unavailable",
         )),
     }
@@ -186,4 +190,44 @@ pub fn send_raw(fd: RawFd, packet: &[u8], destination: SocketAddr) -> io::Result
         return Err(io::Error::other("partial raw UDP reply"));
     }
     Ok(())
+}
+
+/// Linux can deliver pending network errors from the next queued connection
+/// through accept. Back off when kernel or process resources are exhausted.
+pub fn transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EINTR
+                | libc::ECONNABORTED
+                | libc::ECONNRESET
+                | libc::EPROTO
+                | libc::ENETDOWN
+                | libc::ENONET
+                | libc::ENETUNREACH
+                | libc::EHOSTDOWN
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENOPROTOOPT
+        )
+    )
+}
+
+pub async fn accept(
+    listener: &tokio::net::TcpListener,
+) -> io::Result<(tokio::net::TcpStream, SocketAddr)> {
+    loop {
+        match listener.accept().await {
+            Err(e) if transient_accept_error(&e) => continue,
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+                ) =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            result => return result,
+        }
+    }
 }

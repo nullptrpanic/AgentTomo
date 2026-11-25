@@ -6,7 +6,7 @@ use crate::recording::Observation;
 use serde_json::json;
 use std::io;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy as copy_stream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 pub struct Outcome {
     pub up: u64,
     pub down: Option<u64>,
+    pub error: Option<io::Error>,
     pub reason: &'static str,
 }
 
@@ -27,39 +28,68 @@ pub async fn copy(
     let (client_read, mut client_write) = tokio::io::split(client);
     let (mut upstream_read, upstream_write) = tokio::io::split(upstream);
     let mut up = 0;
-    let mut down = None;
+    let mut down = 0;
+    let mut download_done = false;
+    let mut failure = None;
     let reason = {
         let upload = upload(client_read, upstream_write, &mut up, context, events);
         let download = async {
-            let count = copy_stream(&mut upstream_read, &mut client_write).await?;
-            client_write.shutdown().await?;
-            Ok::<_, io::Error>(count)
+            let mut buffer = [0; 8192];
+            loop {
+                let n = upstream_read.read(&mut buffer).await?;
+                if n == 0 {
+                    return client_write.shutdown().await;
+                }
+                let mut pending = &buffer[..n];
+                while !pending.is_empty() {
+                    let n = client_write.write(pending).await?;
+                    if n == 0 {
+                        return Err(io::ErrorKind::WriteZero.into());
+                    }
+                    down += n as u64;
+                    pending = &pending[n..];
+                }
+            }
         };
         tokio::pin!(upload, download);
         let mut uploaded = false;
         loop {
-            tokio::select! {
+            let result = tokio::select! {
                 biased;
-                result = &mut upload, if !uploaded => { result?; uploaded = true; }
+                result = &mut upload, if !uploaded => { uploaded = true; result }
                 _ = scope_finished.cancelled() => {
-                    // Preserve queued writes after the last tracee exits, but
-                    // an upstream that stops reading cannot hold cleanup forever.
                     if !uploaded {
                         match tokio::time::timeout(std::time::Duration::from_secs(5), &mut upload).await {
-                            Ok(result) => result?,
+                            Ok(Err(error)) => { failure = Some(error); }
+                            Ok(Ok(())) => {},
                             Err(_) => break "upload_drain_timeout",
                         }
                     }
-                    break if down.is_some() { "closed" } else { "scope_finished" };
+                    break if download_done { "closed" } else { "scope_finished" };
                 }
-                result = &mut download, if down.is_none() => down = Some(result?),
+                result = &mut download, if !download_done => { download_done = true; result }
+            };
+            if let Err(error) = result {
+                let half_closed = matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
+                );
+                failure.get_or_insert(error);
+                if !half_closed {
+                    break "failed";
+                }
             }
-            if uploaded && down.is_some() {
+            if uploaded && download_done {
                 break "closed";
             }
         }
     };
-    Ok(Outcome { up, down, reason })
+    Ok(Outcome {
+        up,
+        down: (download_done || down != 0).then_some(down),
+        reason: if failure.is_some() { "failed" } else { reason },
+        error: failure,
+    })
 }
 
 async fn upload(

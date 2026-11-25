@@ -140,21 +140,21 @@ It does not rewrite recorded payloads or proxy traffic. Output is limited to
 1 MiB; `x-agenttomo-decoding` distinguishes complete, incomplete, output-limited,
 invalid and unsupported content. Incomplete streams expose only the recoverable
 prefix, with an explicit unverified-checksum label. Invalid or unsupported
-encodings (including Brotli, Zstandard and encoding chains) return original
+encodings (including Brotli and encoding chains) return original
 bytes with an explanation. The file preview endpoint continues serving raw ranges.
 Text rendering respects the HTTP Content-Type charset when supplied; JSON
 formatting requires complete, losslessly parsed text. HTML is displayed as text.
 
 ### Current limits
 
-- TLS interception advertises HTTP/1.1, not HTTP/2. HTTP/2-only TLS clients fail
-  negotiation. HTTP/2 prior knowledge, HTTP/3/QUIC, STARTTLS, ECH, certificate
+- HTTP capture prefers HTTP/1.1. When a client offers only other ALPN protocols,
+  the proxy relays the negotiated protocol as opaque bytes. HTTP/2 prior knowledge, HTTP/3/QUIC, STARTTLS, ECH, certificate
   pinning and mTLS are not supported for content capture.
 - Clients with their own CA bundles, custom `SSL_CERT_FILE` / `SSL_CERT_DIR`,
   Java/NSS stores or bundled roots may not trust the injected system bundle.
   The provided Playground Chrome launcher explicitly handles its NSS store.
 - The initial HTTP preface is recognized with httparse, bounded to 64 KiB,
-  128 headers and 500 ms after detection begins. Incomplete/unsupported prefaces
+  128 headers and 500 ms after the first client byte. Incomplete/unsupported prefaces
   are replayed through the opaque forwarder; unusually slow headers may not be
   captured. This lookahead can delay an ambiguous non-HTTP prefix by up to 500 ms.
 - Non-HTTP plaintext streams retain opaque forwarding. TLS is terminated in
@@ -176,7 +176,7 @@ an Authority Key Identifier; certificate verification is never disabled.
 The observers consume copies of forwarded bytes. SSE uses `sse-parse` for
 incremental UTF-8, CR/LF/CRLF, multiline `data`, event names, inherited IDs and
 retry values. Comments are not application events. An unfinished last event is
-discarded as required by SSE. Identity, gzip and zlib-wrapped deflate encoding
+discarded as required by SSE. Identity, multi-member gzip, zstd and zlib-wrapped deflate encoding
 are inspected; other encodings are forwarded with an inspection-error record.
 A 1 MiB parser cap skips oversized blocks and resumes at the next event boundary.
 Message retention may truncate an otherwise parsed event to a smaller prefix.

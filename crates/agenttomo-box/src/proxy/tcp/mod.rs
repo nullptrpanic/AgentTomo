@@ -89,19 +89,20 @@ async fn serve(listener: std::net::TcpListener, service: Service) -> io::Result<
         tokio::select! {
             biased;
             _ = service.finished.cancelled() => break,
-            accepted = listener.accept() => {
+            result = tasks.join_next(), if !tasks.is_empty() => { result.unwrap().map_err(io::Error::other)??; }
+            accepted = crate::network::socket::accept(&listener), if tasks.len() < 1024 => {
                 let (client, source) = accepted?;
                 let timing = TransferTiming::begin("proxy_accept");
-                let key = Key { transport: Transport::Tcp, source, destination: client.local_addr()? };
+                let Ok(destination) = client.local_addr() else { continue };
+                let key = Key { transport: Transport::Tcp, source, destination };
                 let context = Context { key, connection_id: service.ids.fetch_add(1, Ordering::Relaxed), metadata: None };
                 tasks.spawn(forward(client, context, timing, service.clone()));
             }
-            result = tasks.join_next(), if !tasks.is_empty() => { result.unwrap().map_err(io::Error::other)??; }
         }
     }
     // A fast tracee may exit before the Tokio accept readiness is serviced.
     let listener = listener.into_std()?;
-    loop {
+    while tasks.len() < 1024 {
         match listener.accept() {
             Ok((client, source)) => {
                 let timing = TransferTiming::begin("proxy_accept");
@@ -109,7 +110,10 @@ async fn serve(listener: std::net::TcpListener, service: Service) -> io::Result<
                 let key = Key {
                     transport: Transport::Tcp,
                     source,
-                    destination: client.local_addr()?,
+                    destination: match client.local_addr() {
+                        Ok(addr) => addr,
+                        Err(_) => continue,
+                    },
                 };
                 tasks.spawn(forward(
                     TcpStream::from_std(client)?,
@@ -122,7 +126,21 @@ async fn serve(listener: std::net::TcpListener, service: Service) -> io::Result<
                     service.clone(),
                 ));
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) if crate::network::socket::transient_accept_error(&error) => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || matches!(
+                        error.raw_os_error(),
+                        Some(
+                            nix::libc::EMFILE
+                                | nix::libc::ENFILE
+                                | nix::libc::ENOMEM
+                                | nix::libc::ENOBUFS
+                        )
+                    ) =>
+            {
+                break;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -160,9 +178,7 @@ async fn forward(
             let (name, client) = protocol::preface(client, &finished).await?;
             // Explicit HTTP proxy requests address a proxy, not the origin
             // named by CONNECT/absolute-form. Keep their original endpoint.
-            domain = name
-                .filter(|name| matches!(name.source, "tls_sni" | "http_host"))
-                .and_then(|name| name.domain);
+            domain = name.and_then(|name| name.route(key.destination.ip()));
             client
         } else {
             client
@@ -193,7 +209,12 @@ async fn forward(
             };
             match result {
                 Ok(result) => {
-                    json!({"status":result.reason, "bytes_up":result.up, "bytes_down":result.down})
+                    let mut status = json!({"status":result.reason, "bytes_up":result.up, "bytes_down":result.down});
+                    if let Some(error) = result.error {
+                        status["error"] = error.to_string().into();
+                        status["errno"] = error.raw_os_error().into();
+                    }
+                    status
                 }
                 Err(error) => {
                     json!({"status":"failed", "error":error.to_string(), "errno":error.raw_os_error(), "bytes_up":null, "bytes_down":null})

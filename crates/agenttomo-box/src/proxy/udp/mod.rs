@@ -108,19 +108,31 @@ async fn serve(
             match socket::datagram(local.as_raw_fd(), &mut buffer) {
                 Ok(packet) => packet,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::InvalidData
+                    ) =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         } else {
             tokio::select! {
                 biased;
                 _ = finished.cancelled() => { stopping = true; continue; }
-                packet = local.async_io(Interest::READABLE, || socket::datagram(local.as_raw_fd(), &mut buffer)) => packet?,
                 result = tasks.join_next(), if !tasks.is_empty() => {
                     let (key, id, result) = result.unwrap().map_err(io::Error::other)?;
                     result?;
                     if routes.get(&key).is_some_and(|route| route.id == id) { routes.remove(&key); }
                     continue;
                 }
+                packet = local.async_io(Interest::READABLE, || socket::datagram(local.as_raw_fd(), &mut buffer)) => match packet {
+                    Ok(packet) => packet,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted || e.kind() == io::ErrorKind::InvalidData => continue,
+                    Err(e) => return Err(e),
+                },
             }
         };
         let socket::Datagram {
@@ -171,12 +183,17 @@ async fn serve(
             );
         }
         let route = routes.get(&key).unwrap();
-        if let Err(error) = route.sender.try_send(Datagram {
+        let datagram = Datagram {
             bytes: buffer[..size].to_vec(),
             received: timing,
             arrived,
-        }) {
-            drop(error);
+        };
+        let failed = if stopping {
+            route.sender.send(datagram).await.is_err()
+        } else {
+            route.sender.try_send(datagram).is_err()
+        };
+        if failed {
             emit(&events, event(key, route.flow_id.load(Ordering::Relaxed), None, "network.udp.error", json!({"stage":"queue", "error":"UDP flow queue unavailable; datagram dropped"}))).await?;
         }
         // Give flow workers a chance to drain their queues during ready bursts.
@@ -218,7 +235,31 @@ async fn forward(
     } else {
         IpAddr::V6(Ipv6Addr::UNSPECIFIED)
     };
-    let mut upstream = UdpSocket::bind((ip, 0)).await?;
+    let bind = |id| {
+        let events = &events;
+        async move {
+            match UdpSocket::bind((ip, 0)).await {
+                Ok(sock) => Ok(Some(sock)),
+                Err(error) => {
+                    emit(
+                        events,
+                        event(
+                            key,
+                            id,
+                            None,
+                            "network.udp.error",
+                            json!({"stage":"bind","error":error.to_string()}),
+                        ),
+                    )
+                    .await?;
+                    Ok::<_, io::Error>(None)
+                }
+            }
+        }
+    };
+    let Some(mut upstream) = bind(id).await? else {
+        return Ok(());
+    };
     let mut incoming = vec![0; 65536];
     let mut counts = Counts::default();
     let mut metadata: Option<Metadata> = None;
@@ -227,7 +268,6 @@ async fn forward(
     tokio::pin!(idle);
     let status = loop {
         tokio::select! {
-            biased;
             request = outgoing.recv() => {
                 let Some(request) = request else { break "scope_finished"; };
                 let next = match request.arrived {
@@ -239,7 +279,9 @@ async fn forward(
                 {
                     let reason = if metadata.is_some() && next.is_some() { "socket_replaced" } else { "attribution_changed" };
                     emit(&events, summary(key, id, metadata.as_ref(), &counts, previous, reason)).await?;
-                    upstream = UdpSocket::bind((ip, 0)).await?;
+                    if reason == "socket_replaced" {
+                        let Some(next) = bind(id).await? else { return Ok(()) }; upstream = next;
+                    }
                     id = ids.fetch_add(1, Ordering::Relaxed);
                     flow_id.store(id, Ordering::Relaxed);
                     counts = Counts::default();
@@ -257,7 +299,14 @@ async fn forward(
                 idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(120));
             }
             received = upstream.recv_from(&mut incoming) => {
-                let (size, peer) = received?;
+                let (size, peer) = match received {
+                    Ok(value) => value,
+                    Err(error) => {
+                        emit(&events, event(key,id,metadata.as_ref(),"network.udp.error",json!({"stage":"receive","error":error.to_string()}))).await?;
+                        break "receive_error";
+                    }
+                };
+                if peer.ip().to_canonical() != key.destination.ip().to_canonical() { continue; }
                 let bytes = packet::reply(peer, key.source, &incoming[..size])?;
                 match raw_reply(&reply, &bytes, key.source).await {
                     Ok(()) => {
@@ -272,9 +321,8 @@ async fn forward(
             _ = &mut idle => break "idle_timeout",
         }
     };
-    if let Some(metadata) = &metadata {
-        registry.remove(&key, metadata.socket_id);
-    }
+    // The same socket can already have another datagram queued in a new worker.
+    // The registry owns UDP attribution lifetime and expires idle entries.
     if let Some(timing) = timing {
         emit(
             &events,

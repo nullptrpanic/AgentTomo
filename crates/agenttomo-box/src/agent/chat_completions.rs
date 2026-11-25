@@ -107,8 +107,10 @@ impl Stream {
         let mut status = "completed";
         for (index, choice) in std::mem::take(&mut self.choices) {
             let kind = match choice.finish.as_deref() {
-                Some("stop") => MessageKind::Final,
-                Some("tool_calls") if !choice.tools.is_empty() => MessageKind::Intermediate,
+                Some("stop") if choice.tools.is_empty() => MessageKind::Final,
+                Some("tool_calls" | "stop") if !choice.tools.is_empty() => {
+                    MessageKind::Intermediate
+                }
                 _ => {
                     status = "incomplete";
                     MessageKind::Unknown
@@ -216,13 +218,17 @@ impl ModelDecoder for Stream {
         );
         Ok(events)
     }
-    fn http_response(&mut self, status: StatusCode, _: &[u8]) -> io::Result<Vec<Event>> {
-        if status.is_success() {
-            return Err(io::Error::other(
-                "expected a streamed Chat Completions response",
-            ));
+    fn http_response(&mut self, status: StatusCode, bytes: &[u8]) -> io::Result<Vec<Event>> {
+        if !status.is_success() {
+            return Ok(self.failure(format!("HTTP {status}"), Some(status)));
         }
-        Ok(self.failure(format!("HTTP {status}"), Some(status)))
+        let value: Value = serde_json::from_slice(bytes)?;
+        let mut events = self.update(&value, false)?;
+        events.extend(self.end());
+        if let Some(complete) = events.last_mut() {
+            complete.content = Some(value);
+        }
+        Ok(events)
     }
     fn websocket_request(&mut self, _: &[u8]) -> io::Result<Vec<Event>> {
         Ok(Vec::new())
@@ -234,39 +240,48 @@ impl ModelDecoder for Stream {
         if data.trim() == "[DONE]" {
             return Ok(self.end());
         }
-        Ok(match self.chunk(data) {
-            Ok(events) => events,
-            Err(error) => self.failure(error.to_string(), None),
-        })
+        Ok(
+            match serde_json::from_str(data)
+                .map_err(io::Error::from)
+                .and_then(|value| self.update(&value, true))
+            {
+                Ok(events) => events,
+                Err(error) => self.failure(error.to_string(), None),
+            },
+        )
     }
 }
 
 impl Stream {
-    fn chunk(&mut self, data: &str) -> io::Result<Vec<Event>> {
-        let chunk: Value = serde_json::from_str(data)?;
+    fn update(&mut self, chunk: &Value, stream: bool) -> io::Result<Vec<Event>> {
         if !chunk["error"].is_null() {
             return Err(io::Error::other("model stream returned an error"));
         }
-        let id = chunk["id"]
-            .as_str()
-            .ok_or_else(|| io::Error::other("missing Chat Completions ID"))?;
         let mut events = Vec::new();
-        if let Some(existing) = &self.id {
-            if existing != id {
+        match (self.id.as_deref(), chunk["id"].as_str()) {
+            (None, Some(id)) => {
+                self.id = Some(id.to_owned());
+                events.push(Event {
+                    kind: "agent.model.started",
+                    data: json!({"response_id":id,"model":chunk["model"]}),
+                    content: None,
+                });
+            }
+            (Some(existing), Some(id)) if existing != id => {
                 return Err(io::Error::other(
                     "Chat Completions ID changed during the stream",
                 ));
             }
-        } else {
-            self.id = Some(id.to_owned());
-            events.push(Event {
-                kind: "agent.model.started",
-                data: json!({"response_id":id,"model":chunk["model"]}),
-                content: None,
-            });
+            (Some(_), Some(_)) => {}
+            (Some(_), None) if stream && chunk["id"].is_null() => {}
+            _ => return Err(io::Error::other("missing Chat Completions ID")),
         }
+        let id = self.id.as_deref().expect("validated response ID");
         if !chunk["usage"].is_null() {
             self.usage = chunk["usage"].clone();
+        }
+        if stream && chunk["choices"].is_null() && chunk["usage"].is_object() {
+            return Ok(events);
         }
         for choice in chunk["choices"]
             .as_array()
@@ -280,20 +295,23 @@ impl Stream {
             }
             let item_id = self.item_id(index);
             let stored = self.choices.entry(index).or_default();
-            if let Some(reason) = choice["finish_reason"].as_str() {
+            if let Some(reason) = choice["finish_reason"].as_str().filter(|s| !s.is_empty()) {
                 stored.finish = Some(reason.to_owned());
             }
-            if let Some(delta) = choice["delta"]["content"]
-                .as_str()
+            let message = &choice[if stream { "delta" } else { "message" }];
+            for delta in [&message["content"], &message["refusal"]]
+                .into_iter()
+                .filter_map(Value::as_str)
                 .filter(|text| !text.is_empty())
             {
                 append_fragment(&mut stored.text, delta, &mut self.bytes)?;
                 events.push(Event {kind:"agent.message.delta",data:json!({"response_id":id,"item_id":item_id,"role":"assistant","delta":delta}),content:None});
             }
-            if let Some(deltas) = choice["delta"]["tool_calls"].as_array() {
-                for delta in deltas {
+            if let Some(deltas) = message["tool_calls"].as_array() {
+                for (position, delta) in deltas.iter().enumerate() {
                     let index = delta["index"]
                         .as_u64()
+                        .or_else(|| (!stream).then_some(position as u64))
                         .filter(|index| *index < 128)
                         .ok_or_else(|| io::Error::other("invalid Chat Completions tool index"))?;
                     let call = stored.tools.entry(index).or_default();

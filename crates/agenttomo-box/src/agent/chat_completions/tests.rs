@@ -145,3 +145,37 @@ fn function_arguments_share_the_stream_byte_limit_with_text_and_names() {
     assert_eq!(error[0].kind, "agent.capture.error");
     assert!(stream.event("[DONE]").unwrap().is_empty());
 }
+
+#[test]
+fn json_completion_and_usage_only_sse_both_deliver_the_final_message() {
+    let hub = Hub::default();
+    let mut wire = observer(&hub, "json");
+    let json = json!({"id":"ok","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]});
+    wire.feed_body(json.to_string().as_bytes());
+    let events = wire.finish_body("", true, Some(StatusCode::OK));
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "agent.message" && e.content == Some(json!("hello")))
+    );
+    assert_eq!(events.last().unwrap().data["status"], "completed");
+    let mut sse = observer(&hub, "stream");
+    for chunk in [
+        json!({"id":"s","choices":[{"index":0,"delta":{"refusal":"declined"},"finish_reason":"stop"}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":""}]}),
+        json!({"choices":null,"usage":{"total_tokens":3}}),
+    ] {
+        assert!(
+            !sse.event(&chunk.to_string())
+                .iter()
+                .any(|e| e.kind == "agent.capture.error")
+        );
+    }
+    let events = sse.event("[DONE]");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "agent.message" && e.content == Some(json!("declined")))
+    );
+    assert_eq!(events.last().unwrap().data["status"], "completed");
+}
