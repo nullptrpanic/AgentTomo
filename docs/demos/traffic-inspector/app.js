@@ -297,7 +297,7 @@ document.addEventListener("click", (event) => {
   if (button?.hasAttribute("data-open-messages")) { state.tab = "messages"; renderDetail(); return; }
   if (button?.dataset.format) { state.format = button.dataset.format; renderDetail(); return; }
   if (button?.dataset.direction) { state.direction = button.dataset.direction; state.selectedMessage = null; renderMessages(); return; }
-  if (button?.dataset.message) { state.selectedMessage = Number(button.dataset.message); renderMessages(); return; }
+  if (button?.dataset.message) { state.follow = false; updateFollow(); state.selectedMessage = Number(button.dataset.message); renderMessages(); return; }
   if (button?.dataset.messageFormat) { state.messageFormat = button.dataset.messageFormat; renderMessages(); return; }
   if (button?.dataset.showProcess) {
     state.pane = "processes";

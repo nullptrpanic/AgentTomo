@@ -54,6 +54,7 @@ export class SamplesView {
     }
   }
   catalogView() {
+    if (!this.pending) this.request = null;
     this.selected = null; this.stop = null;
     const header = el("header", "samples-heading");
     header.append(el("span", "sample-source", "SECURITY TESTS"), el("h3", "", "受控攻击演示"), el("p", "", this.catalog.intro));
@@ -127,7 +128,10 @@ export class SamplesView {
       this.updateStatus(); this.updateControls(); return;
     }
     if (!this.model.add(event)) return;
-    if (event.kind.startsWith("security.sample.") && event.data.task_id === this.request?.task_id) { this.pending = null; this.request = null; }
+    if (this.request && event.kind.startsWith("security.sample.") &&
+        (event.data.task_id === this.request.task_id || !this.pending && event.data.sample_id === this.request.sample_id)) {
+      this.pending = null; this.request = null;
+    }
     this.updateStatus(); this.updateControls(); this.renderFindings();
   }
   end() {
@@ -164,6 +168,8 @@ export class SamplesView {
   renderFindings() {
     const runs = [...this.model.runs.values()].reverse();
     this.onCount?.(this.model.findingCount);
+    const opened = new Set([...this.findings.querySelectorAll("article details[open]")].map(detail =>
+      JSON.stringify([detail.closest("article").dataset.taskId, detail.querySelector("summary")?.textContent])));
     this.findings.replaceChildren(el("h3", "", "Findings"), el("p", "samples-note", "运行中或结束时观测到实际影响，每次完成的运行计一次。"));
     if (!runs.length) this.findings.append(el("p", "samples-empty", "Run a security test from the workspace to inspect its findings here."));
     for (const run of runs) {
@@ -208,7 +214,11 @@ export class SamplesView {
       }
       const footer = el("footer", "sample-actions");
       footer.append(button("Task trajectory", () => this.onTask(run.task_id)), button("Evidence", () => this.onEvidence(run.event)));
-      card.append(head,body,footer); this.findings.append(card);
+      card.append(head,body,footer);
+      for (const detail of card.querySelectorAll("details")) {
+        detail.open = opened.has(JSON.stringify([run.task_id,detail.querySelector("summary")?.textContent]));
+      }
+      this.findings.append(card);
     }
   }
 }

@@ -16,14 +16,15 @@ export class TrafficModel {
   constructor(limit = 1000) {
     this.limit = limit;
     this.entries = new Map();
-    this.evictedThrough = 0;
+    this.seenRanges = [];
     this.omitted = 0;
   }
   add(event) {
     const field = httpEventField(event.kind), id = event.data?.request_id;
-    if (!field || !Number.isSafeInteger(id) || id <= this.evictedThrough && !this.entries.has(id)) return null;
+    if (!field || !Number.isSafeInteger(id) || id < 1) return null;
     let row = this.entries.get(id);
     if (!row) {
+      if (!this.remember(id)) return null;
       row = { id };
       this.entries.set(id, row);
     }
@@ -32,12 +33,29 @@ export class TrafficModel {
     row.latest = event;
     if (this.entries.size > this.limit) {
       const inactive = [...this.entries.values()].filter(row => !row.stream || row.streamClosed);
-      const oldest = Math.min(...(inactive.length ? inactive.map(row => row.id) : this.entries.keys()));
+      const oldest = inactive[0]?.id ?? this.entries.keys().next().value;
       this.entries.delete(oldest);
-      this.evictedThrough = Math.max(this.evictedThrough, oldest);
       this.omitted++;
     }
     return row;
+  }
+  // Request IDs are allocated in order, but callbacks on separate connections can arrive late.
+  // Store contiguous observed ranges so a gap never stands for an unseen request.
+  remember(id) {
+    const ranges = this.seenRanges;
+    let index = ranges.findIndex(([, end]) => end >= id - 1);
+    if (index < 0) index = ranges.length;
+    const range = ranges[index];
+    if (range && range[0] <= id && id <= range[1]) return false;
+    if (range && range[0] <= id + 1) {
+      range[0] = Math.min(range[0], id);
+      range[1] = Math.max(range[1], id);
+      if (ranges[index + 1]?.[0] === range[1] + 1) range[1] = ranges.splice(index + 1, 1)[0][1];
+    } else {
+      ranges.splice(index, 0, [id, id]);
+      if (ranges.length > Math.max(1024, this.limit)) ranges.shift();
+    }
+    return true;
   }
   matching(event) {
     const id = event.data?.request_id;

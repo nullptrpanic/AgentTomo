@@ -11,6 +11,7 @@ export function markdownContent(source) {
     RETURN_DOM_FRAGMENT: true,
   });
   for (const link of content.querySelectorAll("a[href]")) {
+    if (!/^https?:\/\//i.test(link.getAttribute("href"))) { link.removeAttribute("href"); continue; }
     link.target = "_blank";
     link.rel = "noopener noreferrer";
   }

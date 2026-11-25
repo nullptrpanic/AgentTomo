@@ -126,8 +126,9 @@ export class FilePreview {
       const bytes = await this.load(event, this.request.signal);
       if (version !== this.version) return;
       this.bytes = bytes;
-      this.pretty = previewContent(bytes, { truncated: preview.status === "truncated" }).json;
-      this.renderContent();
+      const content = previewContent(bytes, { pretty: true, truncated: preview.status === "truncated" });
+      this.pretty = content.json;
+      this.renderContent(content);
     } catch (error) {
       if (version !== this.version) return;
       this.body.replaceChildren();
@@ -135,10 +136,10 @@ export class FilePreview {
     }
   }
 
-  renderContent() {
+  renderContent(content) {
     const preview = this.event.data.preview;
     const truncated = preview.status === "truncated";
-    this.displayed = previewContent(this.bytes, { pretty: this.pretty, truncated });
+    this.displayed = content ?? previewContent(this.bytes, { pretty: this.pretty, truncated });
     this.body.replaceChildren();
     append(this.body, "p", `file-inspector-note${truncated ? " truncated" : ""}`, `${truncated ? "Truncated prefix" : "Captured snapshot"} · ${size(this.bytes.length)}${Number.isFinite(preview.size_at_open) ? ` · size at open ${size(preview.size_at_open)}` : ""}`);
     const toolbar = append(this.body, "div", "file-inspector-tools", "");

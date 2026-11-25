@@ -2,7 +2,7 @@
 import { externalLinkIcon, copyIcon, userIcon } from "./icons.mjs";
 import { copyWithFeedback } from "./copy-text.mjs";
 import { markdownContent } from "./agent-markdown.mjs";
-import { isFinalMessage, orderedRounds } from "./agent-model.mjs";
+import { capturedTime as time, elapsedTime, isFinalMessage, orderedRounds } from "./agent-model.mjs";
 
 const el = (tag, name, text) => {
   const node = document.createElement(tag);
@@ -20,7 +20,6 @@ function text(node, value) {
   else current.replaceData(0, current.length, value);
 }
 
-const time = event => (event?.data?.captured_unix_ns || event?.observed_unix_ns) / 1e6;
 const duration = milliseconds => `${Math.max(0, milliseconds / 1000).toFixed(1)}s`;
 const clock = new Intl.DateTimeFormat(undefined, {hour:"2-digit", minute:"2-digit"});
 
@@ -168,11 +167,10 @@ export class AgentChat {
         record.completed = true;
       }
       if (task.state !== "running") {
-        const elapsed = (time(task.finished) || task.endedAt || Date.now()) - (time(task.started) || task.queuedAt);
+        const elapsed = elapsedTime(task, task.started);
         text(record.outcome, task.finished?.data.context_reset ? "Next prompt starts a new conversation" : duration(elapsed));
         record.outcome.dataset.state = task.state;
       } else {
-        text(record.outcome, task.started?.data.context_reset ? "Running in a new conversation" : "Running");
         record.outcome.dataset.state = "running";
       }
       this.updateProgress(task);
@@ -332,12 +330,11 @@ export class AgentChat {
     if (!record) return;
     if (task.state === "running") {
       text(record.progress, taskProgress(task));
-      text(record.outcome, duration(Date.now() - (time(task.started) || task.queuedAt)));
+      text(record.outcome, (task.started?.data.context_reset ? "Running in a new conversation · " : "") + duration(elapsedTime(task, task.started)));
     }
     for (const node of record.entries.values()) {
       if (!node.tool) continue;
-      const end = time(node.tool.output) || time(task.finished) || task.endedAt || Date.now();
-      text(node.elapsed, time(node.tool.started) ? duration(end - time(node.tool.started)) : "");
+      text(node.elapsed, Number.isFinite(time(node.tool.started)) ? duration(elapsedTime(task, node.tool.started, node.tool.output)) : "");
     }
   }
   scroll() {

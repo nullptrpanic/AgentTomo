@@ -51,3 +51,11 @@ test("connection navigation finds all keep-alive requests without guessing by do
   assert.deepEqual(model.matching(connection).map(row => row.id), [2]);
   assert.deepEqual(model.matching(event("request.body", 1, { connection_id: 9 })), []);
 });
+
+test("a delayed lower request ID survives eviction of a higher ID", () => {
+  const model = new TrafficModel(1);
+  model.add(event("request", 3));
+  model.add(event("request", 4));
+  assert.equal(model.add(event("request", 2)).id, 2);
+  assert.equal(model.add(event("response.body", 3)), null);
+});

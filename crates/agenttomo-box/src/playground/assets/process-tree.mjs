@@ -64,7 +64,10 @@ export class ProcessTree {
     let description;
     if (creationKinds.has(event.kind) && valid(data.child_pid)) {
       const child = this.process(data.child_pid, data.child_process_instance_id);
-      if (child !== node) {
+      let parent = node;
+      while (parent && parent !== child) parent = this.nodes.get(parent.parentId);
+      if (!parent) {
+        this.nodes.get(child.parentId)?.children.delete(child.id);
         child.parentId = node.id;
         child.birth = event.kind.replace("process.", "");
         child.startedNs ??= time;

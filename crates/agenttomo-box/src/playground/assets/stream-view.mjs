@@ -12,6 +12,8 @@ export class StreamView {
     this.follow = root.querySelector(".stream-follow");
     this.follow.onclick = () => { this.model.latest(); this.renderMessages(); this.renderPayload(); };
     this.list.addEventListener("scroll", () => {
+      if (this.list.scrollTop === this.renderedTop) return;
+      this.renderedTop = undefined;
       this.model.follow = this.list.scrollHeight - this.list.scrollTop - this.list.clientHeight < 24;
       this.follow.setAttribute("aria-pressed", String(this.model.follow));
     });
@@ -30,10 +32,11 @@ export class StreamView {
   async poll() {
     if (!this.active) return;
     if (this.root.getClientRects().length) {
-      this.pollRequest = new AbortController();
+      const finalRead = Boolean(this.finished || this.row.streamClosed);
+      const request = this.pollRequest = new AbortController();
       try {
         const snapshot = await this.load(this.requestId, null, this.pollRequest.signal);
-        if (!this.active) return;
+        if (!this.active || request.signal.aborted) return;
         const previous = this.model.selected;
         const expired = this.model.update(snapshot);
         const signature = `${this.model.messages.length}:${this.model.messages[0]?.id}:${this.model.messages.at(-1)?.id}`;
@@ -41,27 +44,38 @@ export class StreamView {
         const limits = snapshot.limits;
         this.root.querySelector(".stream-retention").textContent = `${this.model.messages.length} recent messages · run window ${limits.window_bytes} B / ${limits.window_messages} messages · ${snapshot.evicted} evicted · ${snapshot.dropped} dropped under load${limits.message_bytes === 0 || limits.window_bytes === 0 ? " · retention disabled" : ""}`;
         if (previous !== this.model.selected || this.loaded === undefined) this.renderPayload(expired);
+        if (finalRead) { this.complete = true; return; }
       } catch (error) {
-        if (this.active && error.name !== "AbortError") this.root.querySelector(".stream-retention").textContent = `Messages unavailable: ${error.message}. Retrying…`;
+        if (request.signal.aborted) return;
+        const terminal = this.finished || this.row.streamClosed || [400,401,403,404,410].includes(error.status);
+        if (this.active && error.name !== "AbortError") this.root.querySelector(".stream-retention").textContent = `Messages unavailable: ${error.message}.${terminal ? "" : " Retrying…"}`;
+        if (terminal) { this.complete = true; return; }
       }
     }
     if (this.active) this.timer = setTimeout(() => this.poll(), 250);
   }
   renderMessages() {
     const top = this.list.scrollTop;
-    const fragment = document.createDocumentFragment();
+    const existing = new Map([...this.list.children].map(node => [Number(node.dataset.messageId), node]));
     for (const message of this.model.messages) {
+      const previous = existing.get(message.id);
+      if (previous) {
+        previous.setAttribute("aria-pressed", String(message.id === this.model.selected));
+        existing.delete(message.id);
+        continue;
+      }
       const button = document.createElement("button");
       button.type = "button"; button.className = "stream-message"; button.dataset.messageId = message.id;
       button.setAttribute("aria-pressed", String(message.id === this.model.selected));
       const time = new Date(Number(message.started_unix_ns) / 1e6);
       const fields = [message.direction === "upstream" ? "↑ Sent" : "↓ Received", Number.isNaN(time.getTime()) ? "—" : `${time.toLocaleTimeString([], { hour12: false })}.${String(time.getMilliseconds()).padStart(3, "0")}`, message.event || message.kind, `${message.observed_bytes ?? 0} B${message.truncated ? " · truncated" : ""}${message.complete === false ? " · incomplete" : ""}`];
       for (const [index, text] of fields.entries()) { const span = document.createElement("span"); span.className = `stream-field-${index}`; span.textContent = text; button.append(span); }
-      fragment.append(button);
+      this.list.append(button);
     }
-    this.list.replaceChildren(fragment);
+    for (const node of existing.values()) node.remove();
     this.follow.setAttribute("aria-pressed", String(this.model.follow));
     this.list.scrollTop = this.model.follow ? this.list.scrollHeight : top;
+    this.renderedTop = this.list.scrollTop;
   }
   async renderPayload(expired = false) {
     this.payloadRequest?.abort(); const version = ++this.version;
@@ -77,6 +91,7 @@ export class StreamView {
     try {
       const bytes = await this.load(this.requestId, message.id, this.payloadRequest.signal);
       if (!this.active || version !== this.version) return;
+      this.payloadRequest = null;
       const content = previewContent(bytes, { pretty: true, truncated: message.truncated || message.complete === false, forceHex: message.kind === "binary" || message.decoded === false });
       body.textContent = content.text || "(empty message)";
       status.textContent = `${message.kind} · ${message.captured_bytes} / ${message.observed_bytes} B retained${message.event_id ? ` · id ${message.event_id}` : ""}${message.frames ? ` · ${message.frames} frame(s)` : ""}${message.close_code ? ` · close ${message.close_code}` : ""}${message.decoded === false ? " · extension bytes; not decoded" : message.compressed ? " · decompressed" : ""}${message.truncated ? " · prefix only" : ""}${message.complete === false ? " · incomplete" : ""}`;
@@ -88,5 +103,18 @@ export class StreamView {
       if (this.active && version === this.version) status.textContent = error.status === 410 ? "Message expired from the sliding window." : `Message unavailable: ${error.message}`;
     }
   }
-  stop() { this.active = false; ++this.version; clearTimeout(this.timer); this.pollRequest?.abort(); this.payloadRequest?.abort(); }
+  end() { this.finished = true; }
+  pause() {
+    this.active = false; ++this.version; clearTimeout(this.timer); this.pollRequest?.abort();
+    if (this.payloadRequest) { this.payloadRequest.abort(); this.payloadRequest = null; this.loaded = undefined; }
+  }
+  resume() {
+    if (this.active) return;
+    this.active = true;
+    if (!this.complete) this.poll();
+    const selected = this.model.messages.find(message => message.id === this.model.selected);
+    if (this.loaded === undefined) this.renderPayload();
+    else if (selected) this.onSelect({kind:"network.stream.message", category:"network", source:"tcp_proxy", data:selected});
+  }
+  stop() { this.pause(); }
 }

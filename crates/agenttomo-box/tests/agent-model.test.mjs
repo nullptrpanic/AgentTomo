@@ -1,6 +1,28 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { AgentModel, isFinalMessage } from "../src/playground/assets/agent-model.mjs";
+import { AgentModel, elapsedTime, isFinalMessage } from "../src/playground/assets/agent-model.mjs";
+
+test("live and interrupted durations stay on the server timeline when browser clocks differ", t => {
+  let local = 10_000_000;
+  t.mock.method(Date, "now", () => local);
+  for (const skew of [-3_600_000, 3_600_000]) {
+    const model = new AgentModel();
+    const remote = local + skew;
+    const add = (kind, at, fields = {}) => model.add({kind,
+      observed_unix_ns:at * 1e6, data:{task_id:"t", captured_unix_ns:at * 1e6, ...fields}});
+    add("agent.task.started", remote);
+    const task = model.task("t");
+    local += 300;
+    add("agent.tool.call", remote + 300, {agenttomo_toolcall_id:"tool"});
+    const tool = task.tools.get("tool");
+    local += 900;
+    assert.equal(elapsedTime(task, task.started), 1200);
+    assert.equal(elapsedTime(task, tool.started), 900);
+    model.end();
+    local += 50_000;
+    assert.equal(elapsedTime(task, tool.started), 900);
+  }
+});
 
 test("completion keeps the streamed answer while its full payload is unavailable", () => {
   const model = new AgentModel();

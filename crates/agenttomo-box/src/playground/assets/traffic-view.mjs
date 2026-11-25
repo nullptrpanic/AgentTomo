@@ -47,15 +47,17 @@ export class TrafficView {
   add(event) {
     const row = this.model.add(event);
     if (!row) return;
-    if (this.target && this.selected == null && this.model.matching(this.target).some(match => match.id === row.id)) {
+    if (!this.root.hidden && this.target && this.selected == null && this.model.matching(this.target).some(match => match.id === row.id)) {
       this.select(this.target);
       return;
     }
     if (this.selected && !this.model.entries.has(this.selected)) {
-      this.selected = null; this.request?.abort(); this.streamView?.stop(); this.streamView = null; this.version++;
+      this.selected = null; this.detailKey = null; this.request?.abort(); this.streamView?.stop(); this.streamView = null; this.version++;
       this.detail.textContent = "This request left the live list. Its recording remains on disk.";
     }
-    if (row.id === this.selected) {
+    const changesDetail = event.kind.endsWith(this.side) || event.kind.includes(`.${this.side}.`) ||
+      event.kind.startsWith("network.stream.") || ["network.http.error", "network.http.request"].includes(event.kind);
+    if (row.id === this.selected && changesDetail) {
       if (event.kind === "network.stream.open") this.side = "messages";
       this.detailDirty = true;
     }
@@ -66,12 +68,26 @@ export class TrafficView {
     this.scheduled = true;
     requestAnimationFrame(() => {
       this.scheduled = false;
+      if (this.root.hidden) return;
       this.renderList();
       if (this.detailDirty) this.renderDetail();
     });
   }
+  visibility(visible) {
+    if (!visible) {
+      if (this.request) { this.request.abort(); this.request = null; this.bodyState = null; this.version++; }
+      this.streamView?.pause();
+      this.detailDirty = this.selected != null;
+    } else if (this.target && this.selected == null) this.select(this.target);
+    else this.schedule();
+  }
+  end() {
+    this.finished = true;
+    this.streamView?.end();
+  }
   select(event) {
     this.target = event;
+    this.detailKey = null;
     this.connectionId = !Number.isSafeInteger(event.data?.request_id) && Number.isSafeInteger(event.data?.connection_id) ? event.data.connection_id : null;
     this.root.querySelector("input").value = "";
     const navigation = this.root.querySelector(".traffic-navigation");
@@ -139,24 +155,30 @@ export class TrafficView {
     this.list.scrollTop = follow ? this.list.scrollHeight : top;
   }
   async renderDetail() {
+    if (this.root.hidden) { this.detailDirty = true; return; }
     this.detailDirty = false;
     const row = this.model.entries.get(this.selected);
     if (!row) return;
-    if (this.side === "messages" && this.streamView?.requestId === row.id) { this.streamView.update(row); return; }
-    const headersOpen = this.detail.querySelector(".traffic-headers")?.open || false;
-    const bodyOpen = this.detail.querySelector(".traffic-body-section")?.open ?? true;
-    this.request?.abort();
-    const version = ++this.version;
-    this.request = new AbortController();
-    this.streamView?.stop(); this.streamView = null;
-    this.detail.innerHTML = `<div class="traffic-detail-heading"><strong></strong></div><p class="traffic-copy-status" role="status" hidden></p><nav aria-label="Exchange direction"><button type="button" data-side="request">Request</button><button type="button" data-side="response">Response</button></nav><p class="traffic-message-status"></p><details class="traffic-headers traffic-section"><summary><span class="traffic-section-title">Headers</span></summary><pre></pre></details><details class="traffic-body-section traffic-section"><summary class="traffic-body-tools"><span class="traffic-section-title traffic-body-title">Body</span><span class="traffic-body-modes" role="group" aria-label="Body representation"><button type="button" data-body-mode="decoded">Decoded</button><button type="button" data-body-mode="raw">Raw / Hex</button></span><button type="button" class="traffic-body-copy traffic-icon" aria-label="Copy content" title="Copy content" disabled>${copyIcon}</button></summary><p class="traffic-body-status" role="status"></p><pre class="traffic-body"></pre></details>`;
-    this.detail.querySelector(".traffic-headers").open = headersOpen;
-    this.detail.querySelector(".traffic-body-section").open = bodyOpen;
+    if (this.side === "messages" && this.streamView?.requestId === row.id) { this.streamView.update(row); this.streamView.resume(); return; }
+    const key = row.id + "/" + this.side;
+    if (this.detailKey !== key) {
+      this.detailKey = key;
+      this.bodyState = null;
+      const headersOpen = this.detail.querySelector(".traffic-headers")?.open || false;
+      const bodyOpen = this.detail.querySelector(".traffic-body-section")?.open ?? true;
+      this.request?.abort();
+      this.version++;
+      this.request = null;
+      this.streamView?.stop(); this.streamView = null;
+      this.detail.innerHTML = `<div class="traffic-detail-heading"><strong></strong></div><p class="traffic-copy-status" role="status" hidden></p><nav aria-label="Exchange direction"><button type="button" data-side="request">Request</button><button type="button" data-side="response">Response</button></nav><p class="traffic-message-status"></p><details class="traffic-headers traffic-section"><summary><span class="traffic-section-title">Headers</span></summary><pre></pre></details><details class="traffic-body-section traffic-section"><summary class="traffic-body-tools"><span class="traffic-section-title traffic-body-title">Body</span><span class="traffic-body-modes" role="group" aria-label="Body representation"><button type="button" data-body-mode="decoded">Decoded</button><button type="button" data-body-mode="raw">Raw / Hex</button></span><button type="button" class="traffic-body-copy traffic-icon" aria-label="Copy content" title="Copy content" disabled>${copyIcon}</button></summary><p class="traffic-body-status" role="status"></p><pre class="traffic-body"></pre></details>`;
+      this.detail.querySelector(".traffic-headers").open = headersOpen;
+      this.detail.querySelector(".traffic-body-section").open = bodyOpen;
+    }
     const url = httpRequestTarget(row.request?.data) || "Request pending";
     this.detail.querySelector(".traffic-detail-heading strong").textContent = url;
     const status = this.detail.querySelector(".traffic-body-status");
     const copyStatus = this.detail.querySelector(".traffic-copy-status");
-    if (row.stream) { const button = element(this.detail.querySelector("nav"), "button", "", "Messages"); button.type = "button"; button.dataset.side = "messages"; }
+    if (row.stream && !this.detail.querySelector("[data-side=messages]")) { const button = element(this.detail.querySelector("nav"), "button", "", "Messages"); button.type = "button"; button.dataset.side = "messages"; }
     for (const button of this.detail.querySelectorAll("[data-side]")) {
       button.setAttribute("aria-pressed", String(button.dataset.side === this.side));
       button.onclick = () => { this.side = button.dataset.side; this.renderDetail(); };
@@ -169,25 +191,38 @@ export class TrafficView {
       for (const node of this.detail.querySelectorAll(".traffic-message-status,.traffic-headers,.traffic-body-section")) node.remove();
       const root = element(this.detail, "div", "stream-view");
       this.streamView = new StreamView(root, row, this.loadStream, this.onSelect);
+      if (this.finished) this.streamView.end();
       return;
     }
     const header = row[this.side], captured = row[`${this.side}Body`];
     const selectedEvent = captured || header || row.latest;
     this.onSelect(selectedEvent);
-    this.detail.querySelector(".traffic-headers pre").textContent = header ? headerText(header.data.headers) || "No headers" : "Waiting for headers…";
+    const headers = this.detail.querySelector(".traffic-headers pre");
+    const text = header ? headerText(header.data.headers) || "No headers" : "Waiting for headers…";
+    if (headers.textContent !== text) headers.textContent = text;
     const message = this.detail.querySelector(".traffic-message-status");
     message.textContent = row.error ? row.error.data.error : header ? `${header.data.version} · ${this.side === "request" ? header.data.method : header.data.status_code}` : "Exchange in progress…";
     const body = captured?.data.body;
+    const state = JSON.stringify([body, header?.data.headers, row.error?.data.error, row.stream?.data.protocol, this.bodyMode]);
+    if (this.bodyState === state) return;
+    this.bodyState = state;
+    this.request?.abort();
+    const version = ++this.version;
+    this.request = null;
+    this.detail.querySelector(".traffic-body-copy").disabled = true;
     if (body?.status === "stream_window" || this.side === "response" && row.stream?.data.protocol === "sse") { status.textContent = "SSE content is retained in the sliding window. Open Messages for live events."; return; }
     if (!body) { status.textContent = row.error ? "Exchange failed; body capture may be incomplete." : "Streaming. The retained prefix becomes available when this message ends."; return; }
     if (["unavailable", "disabled"].includes(body.status)) { status.textContent = `Body ${body.status}${body.error ? `: ${body.error}` : ""}.`; return; }
     status.textContent = "Loading saved body…";
+    this.request = new AbortController();
     try {
       const raw = this.bodyMode === "raw";
       const payload = await this.load(body, this.request.signal, raw || body.captured_bytes === 0 ? "" : contentEncoding(header?.data.headers));
       if (version !== this.version) return;
       const content = httpPreview(payload, header?.data.headers, body, raw);
-      this.detail.querySelector(".traffic-body").textContent = content.text || (content.partial ? "(no content retained in this preview)" : "(empty body)");
+      const pre = this.detail.querySelector(".traffic-body");
+      const text = content.text || (content.partial ? "(no content retained in this preview)" : "(empty body)");
+      if (pre.textContent !== text) pre.textContent = text;
       status.textContent = content.status;
       const copy = this.detail.querySelector(".traffic-body-copy"); copy.disabled = false;
       copy.title = content.format === "hex" ? "Copy hex" : "Copy content";
@@ -199,6 +234,8 @@ export class TrafficView {
       };
     } catch (error) {
       if (version === this.version) status.textContent = `Body unavailable: ${error.message}`;
+    } finally {
+      if (version === this.version) this.request = null;
     }
   }
 }

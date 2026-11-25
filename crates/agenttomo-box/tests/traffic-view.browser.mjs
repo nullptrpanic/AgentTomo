@@ -37,7 +37,8 @@ try {
     const selected = [];
     let copied;
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async text => { copied = text; } } });
-    const view = new TrafficView(root, async () => ({ bytes: new TextEncoder().encode("response body"), decoding: "identity" }), event => selected.push(event));
+    let bodyLoads = 0;
+    const view = new TrafficView(root, async () => { bodyLoads++; return { bytes: new TextEncoder().encode("response body"), decoding: "identity" }; }, event => selected.push(event));
     view.setEnabled(true);
     const list = root.querySelector(".traffic-list");
     const row = id => root.querySelector(`[data-request-id="${id}"]`);
@@ -67,6 +68,18 @@ try {
     check(seventh.getAttribute("aria-pressed") === "true", "selected request");
     check(root.querySelector(".traffic-body").textContent === "response body", "body remains inspectable");
     check(selected.at(-1).data.request_id === 7, "raw detail selection");
+    const savedBody = root.querySelector(".traffic-body"), loads = bodyLoads;
+    const range = document.createRange(); range.selectNodeContents(savedBody);
+    const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+    view.add(event("response.body", 7, {body:{status:"complete",offset:0,captured_bytes:13,observed_bytes:13,complete:true}})); flush();
+    check(bodyLoads === loads && selection.toString() === "response body" && savedBody === root.querySelector(".traffic-body"), "repeated capture preserves text selection and body fetch");
+    root.hidden = true; view.visibility(false);
+    const count = selected.length;
+    view.add(event("response", 7, {status_code:201,version:"HTTP/1.1",headers:[]})); flush();
+    check(selected.length === count && bodyLoads === loads, "hidden traffic does not overwrite active details or load a body");
+    root.hidden = false; view.visibility(true); flush();
+    selection.removeAllRanges();
+
     check(root.querySelector(".traffic-body-section").open, "body defaults to expanded");
     root.querySelector(".traffic-body-title").click();
     check(!root.querySelector(".traffic-body-section").open && !root.querySelector(".traffic-body").checkVisibility(), "body title collapses content");

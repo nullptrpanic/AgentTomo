@@ -3,6 +3,18 @@ import { orderByStart } from "./event-time.mjs";
 
 const utf8 = new TextEncoder();
 
+export const capturedTime = event => (event?.data?.captured_unix_ns ?? event?.observed_unix_ns) / 1e6;
+
+export function elapsedTime(task, start, end = task.finished) {
+  const began = capturedTime(start);
+  const finished = capturedTime(end);
+  const localEnd = task.endedAt ?? Date.now();
+  if (!Number.isFinite(began)) return localEnd - task.queuedAt;
+  if (Number.isFinite(finished)) return finished - began;
+  if (!Number.isFinite(task.clockOffset)) return localEnd - task.queuedAt;
+  return localEnd + task.clockOffset - began;
+}
+
 export function orderedRounds(task) {
   return orderByStart(task.rounds.map(round => ({
     event: round.request || round.started || round.first,
@@ -65,14 +77,26 @@ export class AgentModel {
   }
   add(event) {
     const d = event.data || {};
-    if (d.agent && Number.isSafeInteger(d.process_instance_id)) this.bindings.set(d.process_instance_id, d.agent);
+    if (d.agent && Number.isSafeInteger(d.process_instance_id)) {
+      this.bindings.delete(d.process_instance_id);
+      this.bindings.set(d.process_instance_id, d.agent);
+      if (this.bindings.size > 2048) this.bindings.delete(this.bindings.keys().next().value);
+    }
     if (!event.kind.startsWith("agent.") || !d.task_id) return;
     const task = this.task(d.task_id);
+    const observed = (event.observed_unix_ns ?? d.captured_unix_ns) / 1e6;
+    if ((task.state === "running" || event.kind === "agent.task.started") && Number.isFinite(observed)) {
+      // A replayed or delayed event must not rewind the live clock.
+      task.clockOffset = Math.max(task.clockOffset ?? -Infinity, observed - Date.now());
+    }
     task.activity = Math.max(task.activity, event.sequence || 0);
-    if (event.kind === "agent.task.started") { task.prompt = d.prompt; task.started = event; task.state = "running"; this.runningTasks.add(task); progress(task, "Connecting to model"); }
+    if (event.kind === "agent.task.started") { task.prompt = d.prompt; task.started = event; task.state = "running"; task.endedAt = undefined; this.runningTasks.add(task); progress(task, "Connecting to model"); }
     if (event.kind === "agent.task.finished") { task.state = d.cancelled || d.status === "cancelled" ? "cancelled" : d.status === "completed" || d.exit_code === 0 ? "completed" : "failed"; task.finished = event; }
     if (event.kind === "agent.task.rejected") { task.state = d.cancelled ? "cancelled" : "rejected"; task.finished = event; }
-    if (task.state !== "running") this.runningTasks.delete(task);
+    if (task.state !== "running") {
+      task.endedAt ??= Date.now();
+      this.runningTasks.delete(task);
+    }
     if (d.error && !d.cancelled && ["agent.task.diagnostic", "agent.task.finished", "agent.task.rejected", "agent.capture.error"].includes(event.kind) && task.errors.at(-1)?.data.error !== d.error) {
       task.errors.push(event);
     }

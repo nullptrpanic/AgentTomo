@@ -24,6 +24,20 @@ try {
  page=await browser.newPage({viewport:{width:1440,height:1050}});
  const errors=[];page.on('pageerror',e=>errors.push(String(e)));
  await page.goto(`http://127.0.0.1:${server.address().port}/`);
+ const navigation = await page.evaluate(async () => {
+   const {SamplesView} = await import('/samples-view.mjs');
+   const view = Object.assign(Object.create(SamplesView.prototype), {
+     root: document.createElement('div'), catalog: {intro:'', samples:[]}, pending:null,
+     request: {task_id:'old', status:'error'}
+   });
+   view.catalogView();
+   const dismissed = view.request === null;
+   view.pending = 'next';
+   view.request = {task_id:'next', status:'waiting'};
+   view.catalogView();
+   return {dismissed, pending:view.request?.task_id};
+ });
+ assert.deepEqual(navigation, {dismissed:true, pending:'next'});
  await page.evaluate(async()=>{
   const {SamplesView}=await import('/samples-view.mjs');
   window.view=new SamplesView({root:document.querySelector('#security-samples'),findings:document.querySelector('#findings'),

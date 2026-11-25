@@ -57,7 +57,7 @@ export class AgentView {
     this.updateControls();
   }
   setReady(value, reason) {
-    if (!value && this.ready) { this.model.end(); this.renderChat(); if (this.snapshot && !this.root.hidden) this.render(); }
+    if (!value && (this.ready || this.model.runningTasks.size)) { this.model.end(); this.renderChat(); if (this.snapshot && !this.root.hidden) this.render(); }
     if (value) this.stopReason = null;
     else if (reason || this.ready) this.stopReason = reason || "Sandbox disconnected.";
     this.ready = value; this.updateControls();
@@ -210,47 +210,65 @@ export class AgentView {
     }
     const snapshot = this.snapshot;
     const follow = this.root.scrollHeight - this.root.scrollTop - this.root.clientHeight < 70;
-    const bindings = this.model.bindings;
-    const processes = [...snapshot.nodes.values()].filter(node => bindings.has(node.instanceId));
+    const processes = [];
     const sequences = new Map(snapshot.visible.map(entry => [entry.id, entry.event.sequence || 0]));
     const taskActivity = new Map();
     this.activitySequences = new Map();
-    for (const node of processes) {
-      const binding = bindings.get(node.instanceId), sequence = sequences.get(node.activity) || 0;
-      this.activitySequences.set(`pid-${node.instanceId}`, sequence);
-      taskActivity.set(binding.task_id, Math.max(taskActivity.get(binding.task_id) || 0, sequence));
-      if (binding.agenttomo_toolcall_id) this.activitySequences.set(binding.agenttomo_toolcall_id, Math.max(this.activitySequences.get(binding.agenttomo_toolcall_id) || 0, sequence));
-    }
-    const processById = new Map(processes.map(node => [node.id, node]));
     const resources = new Map();
     for (const entry of snapshot.behaviors) {
       if (!resources.has(entry.nodeId)) resources.set(entry.nodeId, []);
       resources.get(entry.nodeId).push(entry);
     }
+    for (const node of snapshot.nodes.values()) {
+      // A conversation server spans turns. Project each observation under the
+      // scope captured with that event, including late arrivals.
+      const bindings = new Map();
+      for (const entry of node.events) {
+        const binding = entry.event.data?.agent;
+        if (binding) bindings.set(binding.task_id, binding);
+      }
+      const last = this.model.bindings.get(node.instanceId);
+      if (!bindings.size && last) bindings.set(last.task_id, last);
+      for (const binding of bindings.values()) {
+        const owns = entry => entry.event.data?.agent?.task_id === binding.task_id ||
+          (!entry.event.data?.agent && bindings.size === 1);
+        const events = node.events.filter(owns);
+        const owned = (resources.get(node.id) || []).filter(owns);
+        const key = `pid-${node.instanceId}-${binding.task_id}`;
+        const sequence = Math.max(0, ...events.map(entry => sequences.get(entry.id) || 0));
+        processes.push({...node, binding, events, owned, key});
+        this.activitySequences.set(key, sequence);
+        taskActivity.set(binding.task_id, Math.max(taskActivity.get(binding.task_id) || 0, sequence));
+        if (binding.agenttomo_toolcall_id) this.activitySequences.set(binding.agenttomo_toolcall_id, Math.max(this.activitySequences.get(binding.agenttomo_toolcall_id) || 0, sequence));
+      }
+    }
+    const sameBranch = (parent, child) => parent.id === child.parentId &&
+      parent.binding.task_id === child.binding.task_id &&
+      parent.binding.agenttomo_toolcall_id === child.binding.agenttomo_toolcall_id;
     const resource = entry => {
       this.activitySequences.set(`resource-${entry.id}`, sequences.get(entry.activity ?? entry.id) || entry.event.sequence || 0);
       return this.branch(`resource-${entry.id}`, entry.event.category || entry.event.kind.split(".")[0], entry.title || clipped(entry.description), entry.type ? entry.description : entry.event.kind,
         (entry.children || []).map(resource), () => { this.closeDetail(); this.onSelect(entry.event); });
     };
     const process = node => {
-      const binding = bindings.get(node.instanceId);
+      const binding = node.binding;
       const argv = [...node.events].reverse().find(entry => entry.event.kind === "process.exec")?.event.data.argv || [node.name || "Process"];
-      const childProcesses = processes.filter(child => child.parentId === node.id && bindings.get(child.instanceId)?.agenttomo_toolcall_id === binding.agenttomo_toolcall_id);
+      const childProcesses = processes.filter(child => sameBranch(node, child));
       const children = () => {
-        const entries = (resources.get(node.id) || []).map(entry => ({ time: entry.started ?? eventTime(entry.event), item: resource(entry) }));
+        const entries = node.owned.map(entry => ({ time: entry.started ?? eventTime(entry.event), item: resource(entry) }));
         for (const child of childProcesses) entries.push({ time: child.events.length ? eventTime(child.events[0].event) : 0, item: process(child) });
         entries.sort((a, b) => (a.time || 0) - (b.time || 0));
         return entries.map(entry => entry.item);
       };
       const evidence = [...node.events].reverse().find(entry => entry.event.kind === "process.exec")?.event || node.events[0]?.event;
       const inspect = evidence ? () => { this.closeDetail(); this.onSelect(evidence); } : null;
-      const branch = this.branch(`pid-${node.instanceId}`, "process", formatCommand(argv), `PID ${node.pid} · ${node.exit || node.state} · ${binding.association}`, resources.get(node.id)?.length || childProcesses.length ? children : [], inspect, false);
+      const branch = this.branch(node.key, "process", formatCommand(argv), `PID ${node.pid} · ${node.exit || node.state} · ${binding.association}`, node.owned.length || childProcesses.length ? children : [], inspect, false);
       if (binding.association.includes("inferred")) branch.classList.add("agent-inferred");
       return branch;
     };
     const roots = (task, toolId) => processes.filter(node => {
-      const binding = bindings.get(node.instanceId), parent = processById.get(node.parentId);
-      return binding.task_id === task.id && (binding.agenttomo_toolcall_id || null) === toolId && (!parent || bindings.get(parent.instanceId)?.agenttomo_toolcall_id !== binding.agenttomo_toolcall_id);
+      const binding = node.binding;
+      return binding.task_id === task.id && (binding.agenttomo_toolcall_id || null) === toolId && !processes.some(parent => sameBranch(parent,node));
     }).map(node => [node.events[0]?.event, process(node)]);
     const tasks = [];
     for (const task of this.model.tasks.values()) {
@@ -310,6 +328,7 @@ export class AgentView {
         this.expanded.set(id, true);
         this.updateBranch(this.branches.get(id), true);
       }
+      this.root.querySelector(".agent-highlight")?.classList.remove("agent-highlight");
       item.querySelector(".agent-card")?.classList.add("agent-highlight"); item.scrollIntoView({ block: "nearest", behavior: "smooth" });
     });
   }
