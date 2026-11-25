@@ -43,6 +43,14 @@ impl Login {
         }
         let auth: Value =
             serde_json::from_slice(&bytes).map_err(|_| invalid("invalid host Codex login"))?;
+        let mode = auth["auth_mode"].as_str();
+        let current_chatgpt =
+            mode == Some("chatgpt") || (mode.is_none() && auth["tokens"].is_object());
+        if current_chatgpt != *chatgpt || mode.is_some_and(|s| !matches!(s, "apikey" | "chatgpt")) {
+            return Err(invalid(
+                "host Codex authentication mode changed; open a new Playground session",
+            ));
+        }
         let value = if *chatgpt {
             if auth["tokens"]["account_id"].as_str() != account.as_deref() {
                 return Err(invalid(
@@ -200,7 +208,11 @@ pub fn prepare(
     for name in ["OPENAI_API_KEY", "CODEX_API_KEY"] {
         builder.environment(&scopes.keys, "authorization", name, true)?;
     }
-    if let Some(base) = builder.host_environment.get("OPENAI_BASE_URL") {
+    if let Some(base) = builder
+        .host_environment
+        .get("OPENAI_BASE_URL")
+        .filter(|value| !value.trim().is_empty())
+    {
         provider_scope(base)?;
         builder
             .environment
@@ -330,7 +342,12 @@ pub fn prepare(
     audit::verify(&files, &builder.secrets)?;
     Ok(Prepared {
         files,
-        policy: Policy::new(builder.grants),
+        policy: {
+            let mut policy = Policy::new(builder.grants);
+            policy.allow_configured(&scopes.keys);
+            policy.allow_configured(&scopes.chatgpt);
+            policy
+        },
     })
 }
 

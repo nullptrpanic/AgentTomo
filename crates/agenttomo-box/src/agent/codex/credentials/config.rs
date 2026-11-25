@@ -1,5 +1,6 @@
 //! Provider credential fields are interpreted only in the Codex adapter.
 use super::{Builder, Scope, chatgpt_scope, invalid, provider_scope};
+use axum::http::Uri;
 use std::{collections::BTreeMap, io};
 
 pub(super) struct Scopes {
@@ -14,6 +15,7 @@ pub(super) fn sanitize(
     let base = builder
         .host_environment
         .get("OPENAI_BASE_URL")
+        .filter(|value| !value.trim().is_empty())
         .map(String::as_str)
         .unwrap_or("https://api.openai.com/v1");
     let mut scopes = Scopes {
@@ -47,14 +49,9 @@ pub(super) fn sanitize(
             };
             scopes.chatgpt.push(chatgpt_scope(&base)?);
         }
-        if document
-            .get("mcp_servers")
-            .and_then(toml::Value::as_table)
-            .is_some_and(|servers| servers.values().any(has_mcp_credentials))
-        {
-            return Err(invalid(
-                "MCP credentials need a separate credential adapter; remove them from this Codex configuration",
-            ));
+        validate_mcp(document)?;
+        if let Some(otel) = document.get("otel") {
+            validate_telemetry(otel)?;
         }
         // Sandbox authentication is synthetic and intentionally uses its private file.
         document.insert("cli_auth_credentials_store".into(), "file".into());
@@ -83,6 +80,20 @@ pub(super) fn sanitize(
                 return Err(invalid(
                     "command-backed and gateway OAuth credentials need a separate Codex credential adapter",
                 ));
+            }
+            if let Some(query) = effective.get("query_params") {
+                let query = query
+                    .as_table()
+                    .ok_or_else(|| invalid("invalid Codex provider query parameters"))?;
+                if !query.iter().all(|(name, value)| {
+                    value
+                        .as_str()
+                        .is_some_and(|v| public_query_parameter(name, v))
+                }) {
+                    return Err(invalid(
+                        "unsupported Codex provider query parameter; use a scoped authentication header for credentials",
+                    ));
+                }
             }
             let base = effective
                 .get("base_url")
@@ -189,15 +200,156 @@ pub(super) fn metadata_header(name: &str) -> bool {
     )
 }
 
-fn has_mcp_credentials(server: &toml::Value) -> bool {
-    server.as_table().is_some_and(|server| {
-        [
+// Query parameters have no host-side credential adapter. Only publish values
+// with a known public meaning, including the Azure API version selector.
+fn public_query_parameter(name: &str, value: &str) -> bool {
+    if !name.eq_ignore_ascii_case("api-version") {
+        return false;
+    }
+    let date = value.strip_suffix("-preview").unwrap_or(value);
+    let version = value.strip_prefix('v').unwrap_or(value);
+    value == "preview"
+        || version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        || time::Date::parse(date, &time::format_description::well_known::Iso8601::DATE).is_ok()
+}
+
+fn validate_endpoint(value: &toml::Value) -> io::Result<()> {
+    let error = || {
+        invalid(
+            "unsupported Codex service URL; use an HTTP(S) endpoint without embedded credentials or private query parameters",
+        )
+    };
+    let url = value.as_str().ok_or_else(error)?;
+    let uri: Uri = url.parse().map_err(|_| error())?;
+    let authority = uri.authority().ok_or_else(error)?;
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || authority.as_str().contains('@')
+        || url.contains(['#', '\\'])
+    {
+        return Err(error());
+    }
+    if uri.query().is_some() {
+        let axum::extract::Query(params) =
+            axum::extract::Query::<Vec<(String, String)>>::try_from_uri(&uri)
+                .map_err(|_| error())?;
+        if !params
+            .iter()
+            .all(|(name, value)| public_query_parameter(name, value))
+        {
+            return Err(error());
+        }
+    }
+    Ok(())
+}
+
+fn validate_mcp(config: &toml::Table) -> io::Result<()> {
+    let unsupported = || {
+        invalid(
+            "MCP credentials need a separate credential adapter; remove them from this Codex configuration",
+        )
+    };
+    let idp = config
+        .get("mcp_enterprise_managed_auth")
+        .and_then(|auth| auth.get("idp"));
+    if idp.and_then(|idp| idp.get("client_secret")).is_some() {
+        return Err(unsupported());
+    }
+    let Some(servers) = config.get("mcp_servers") else {
+        return Ok(());
+    };
+    let servers = servers
+        .as_table()
+        .ok_or_else(|| invalid("invalid Codex MCP configuration"))?;
+    for server in servers.values() {
+        let server = server
+            .as_table()
+            .ok_or_else(|| invalid("invalid Codex MCP server"))?;
+        if [
             "env",
             "http_headers",
+            "http_headers_helper",
             "env_http_headers",
             "bearer_token_env_var",
         ]
         .iter()
         .any(|name| server.contains_key(*name))
+            || server
+                .get("oauth")
+                .and_then(|oauth| oauth.get("client_secret"))
+                .is_some()
+        {
+            return Err(unsupported());
+        }
+        if let Some(url) = server.get("url") {
+            validate_endpoint(url)?;
+        }
+    }
+    Ok(())
+}
+
+fn public_telemetry_header(name: &str, value: &toml::Value) -> bool {
+    let Some(value) = value.as_str() else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    value.to_ascii_lowercase().split(',').all(|item| {
+        matches!(
+            (name.as_str(), item.trim_matches([' ', '\t'])),
+            ("accept", "*/*")
+                | (
+                    "accept" | "content-type",
+                    "application/json"
+                        | "application/json; charset=utf-8"
+                        | "application/x-protobuf"
+                        | "application/protobuf"
+                        | "application/grpc"
+                        | "application/grpc+proto"
+                        | "application/grpc+json"
+                )
+                | (
+                    "accept-encoding" | "content-encoding",
+                    "identity" | "gzip" | "deflate" | "br" | "zstd"
+                )
+        )
     })
+}
+
+fn validate_telemetry(value: &toml::Value) -> io::Result<()> {
+    let error = || {
+        invalid(
+            "unsupported Codex telemetry credentials or exporter settings; use an exporter without authentication",
+        )
+    };
+    let table = value.as_table().ok_or_else(error)?;
+    if table.contains_key("bearer_token") || table.contains_key("headers_helper") {
+        return Err(error());
+    }
+    if let Some(headers) = table.get("headers")
+        && !headers
+            .as_table()
+            .ok_or_else(error)?
+            .iter()
+            .all(|(name, value)| public_telemetry_header(name, value))
+    {
+        return Err(error());
+    }
+    if let Some(endpoint) = table.get("endpoint") {
+        validate_endpoint(endpoint)?;
+    }
+    for name in ["exporter", "trace_exporter", "metrics_exporter"] {
+        if let Some(exporter) = table.get(name) {
+            if matches!(exporter.as_str(), Some("none" | "statsig")) {
+                continue;
+            }
+            for (transport, settings) in exporter.as_table().ok_or_else(error)? {
+                if !matches!(transport.as_str(), "otlp-http" | "otlp-grpc") {
+                    return Err(error());
+                }
+                validate_telemetry(settings)?;
+            }
+        }
+    }
+    Ok(())
 }

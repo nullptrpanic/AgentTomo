@@ -74,65 +74,69 @@ impl Gateway {
         let handler_jobs = jobs.clone();
         let handler_policy = policy.clone();
         let handler = self.clone();
-        let service =
-            service_fn(move |mut request: Request<Incoming>| {
-                let jobs = handler_jobs.clone();
-                let policy = handler_policy.clone();
-                let gateway = handler.clone();
-                let proxy = proxy.clone();
-                let stop = handler_stop.clone();
-                async move {
-                    if request.method() != "CONNECT" {
-                        return Ok::<_, Infallible>(failure(
-                            StatusCode::METHOD_NOT_ALLOWED,
-                            "expected a TCP CONNECT request",
+        let service = service_fn(move |mut request: Request<Incoming>| {
+            let jobs = handler_jobs.clone();
+            let policy = handler_policy.clone();
+            let gateway = handler.clone();
+            let proxy = proxy.clone();
+            let stop = handler_stop.clone();
+            async move {
+                if request.method() != "CONNECT" {
+                    return Ok::<_, Infallible>(failure(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "expected a TCP CONNECT request",
+                    ));
+                }
+                let Some(target) = request.uri().authority().cloned().filter(|target| {
+                    !target.as_str().contains('@')
+                        && target.port_u16().is_some_and(|port| port != 0)
+                }) else {
+                    return Ok(failure(
+                        StatusCode::BAD_REQUEST,
+                        "invalid CONNECT destination",
+                    ));
+                };
+                let origin = policy.origin(&target);
+                let upstream = match timeout(
+                    Duration::from_secs(15),
+                    connect(&target, proxy.as_ref(), policy.direct_allowed(&target)),
+                )
+                .await
+                {
+                    Ok(Ok(upstream)) => upstream,
+                    _ => {
+                        return Ok(failure(
+                            StatusCode::BAD_GATEWAY,
+                            "cannot establish the host upstream connection",
                         ));
                     }
-                    let Some(target) = request.uri().authority().cloned().filter(|target| {
-                        !target.as_str().contains('@')
-                            && target.port_u16().is_some_and(|port| port != 0)
-                    }) else {
-                        return Ok(failure(
-                            StatusCode::BAD_REQUEST,
-                            "invalid CONNECT destination",
-                        ));
-                    };
-                    let upstream =
-                        match timeout(Duration::from_secs(15), connect(&target, proxy.as_ref()))
-                            .await
-                        {
-                            Ok(Ok(upstream)) => upstream,
-                            _ => {
-                                return Ok(failure(
-                                    StatusCode::BAD_GATEWAY,
-                                    "cannot establish the host upstream connection",
-                                ));
+                };
+                let upgraded = hyper::upgrade::on(&mut request);
+                jobs.spawn(async move {
+                    let forward = async {
+                        let client: BoxIo =
+                            Box::new(TokioIo::new(upgraded.await.map_err(io::Error::other)?));
+                        match origin {
+                            Some(origin) => {
+                                let (client, upstream) =
+                                    gateway.transport(client, upstream, &origin).await?;
+                                forward_http(client, upstream, policy.clone(), origin).await
                             }
-                        };
-                    let upgraded = hyper::upgrade::on(&mut request);
-                    jobs.spawn(async move {
-                        let forward = async {
-                            let client: BoxIo =
-                                Box::new(TokioIo::new(upgraded.await.map_err(io::Error::other)?));
-                            match policy.origin(&target) {
-                                Some(origin) => {
-                                    let (client, upstream) =
-                                        gateway.transport(client, upstream, &origin).await?;
-                                    forward_http(client, upstream, policy.clone(), origin).await
-                                }
-                                None => transport::opaque(client, upstream, &stop).await,
-                            }
-                        };
-                        tokio::select! {
-                            result = forward => { let _ = result; },
-                            _ = policy.lifetime.cancelled() => {},
-                            _ = stop.cancelled() => {},
+                            None => transport::opaque(client, upstream, &stop).await,
                         }
-                    });
-                    Ok(Response::new(empty()))
-                }
-            });
+                    };
+                    tokio::select! {
+                        result = forward => { let _ = result; },
+                        _ = policy.lifetime.cancelled() => {},
+                        _ = stop.cancelled() => {},
+                    }
+                });
+                Ok(Response::new(empty()))
+            }
+        });
         let connection = hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(Duration::from_secs(15))
             .max_buf_size(16384)
             .serve_connection(TokioIo::new(client), service)
             .with_upgrades();
@@ -183,7 +187,11 @@ impl Gateway {
     }
 }
 
-async fn connect(target: &HttpAuthority, proxy: Option<&Proxy>) -> io::Result<BoxIo> {
+async fn connect(
+    target: &HttpAuthority,
+    proxy: Option<&Proxy>,
+    configured: bool,
+) -> io::Result<BoxIo> {
     let host = target.host().trim_matches(['[', ']']);
     let port = target
         .port_u16()
@@ -193,7 +201,54 @@ async fn connect(target: &HttpAuthority, proxy: Option<&Proxy>) -> io::Result<Bo
         let domain = host.parse::<IpAddr>().is_err().then_some(host);
         outbound::connect(SocketAddr::new(ip, port), proxy, domain).await
     } else {
-        Ok(Box::new(TcpStream::connect((host, port)).await?))
+        let mut local = Vec::new();
+        if !configured {
+            for interface in nix::ifaddrs::getifaddrs()? {
+                if let Some(address) = interface.address {
+                    if let Some(v4) = address.as_sockaddr_in() {
+                        local.push(IpAddr::V4(v4.ip()));
+                    }
+                    if let Some(v6) = address.as_sockaddr_in6() {
+                        local.push(IpAddr::V6(v6.ip()).to_canonical());
+                    }
+                }
+            }
+        }
+        let addresses: Vec<_> = tokio::net::lookup_host((host, port))
+            .await?
+            .filter(|addr| {
+                configured
+                    || (public_destination(addr.ip()) && !local.contains(&addr.ip().to_canonical()))
+            })
+            .collect();
+        if addresses.is_empty() {
+            return Err(invalid("direct destination is restricted"));
+        }
+        Ok(Box::new(TcpStream::connect(&addresses[..]).await?))
+    }
+}
+
+fn public_destination(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || a == 0
+                || a >= 224
+                || (a == 100 && (64..128).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && matches!(b, 18 | 19)))
+        }
+        IpAddr::V6(v6) => {
+            let [first, second, ..] = v6.segments();
+            // Accept native global unicast, excluding transition and documentation ranges.
+            first & 0xe000 == 0x2000
+                && first != 0x2002
+                && !(first == 0x2001 && (second < 0x200 || second == 0xdb8))
+        }
     }
 }
 
@@ -268,6 +323,7 @@ fn failure(status: StatusCode, message: &str) -> Response<Body> {
             .to_string();
     Response::builder()
         .status(status)
+        .header("connection", "close")
         .header("content-type", "application/json")
         .body(
             Full::new(Bytes::from(body))

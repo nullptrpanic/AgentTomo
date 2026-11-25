@@ -96,6 +96,117 @@ fn provider_headers_and_environment_keys_are_scoped_and_not_exposed_in_files() {
     assert!(headers["x-auth"].is_sensitive());
 }
 
+fn assert_external_credential_rejected(config: &str, marker: &str) {
+    for name in ["config.toml", "alternate.config.toml"] {
+        let mut files = BTreeMap::from([("config.toml".into(), "model = 'example'".into())]);
+        files.insert(name.into(), config.into());
+        let error = prepare(Path::new("/unused"), files, BTreeMap::new())
+            .err()
+            .expect("unsupported credentials must stop sandbox bootstrap");
+        assert!(!error.to_string().contains(marker), "{name}");
+    }
+}
+
+#[test]
+fn snapshot_rejects_provider_query_credentials() {
+    for name in ["api-key", "custom", "api-version"] {
+        let config = format!("[model_providers.demo.query_params]\n{name} = 'query-fixture'");
+        assert_external_credential_rejected(&config, "query-fixture");
+    }
+}
+
+#[test]
+fn snapshot_rejects_telemetry_credentials() {
+    for exporter in ["exporter", "trace_exporter", "metrics_exporter"] {
+        for transport in ["otlp-http", "otlp-grpc"] {
+            let protocol = if transport == "otlp-http" {
+                "protocol = 'json'\n"
+            } else {
+                ""
+            };
+            let config = format!(
+                "[otel.{exporter}.{transport}]\nendpoint = 'https://telemetry.example'\n{protocol}headers = {{ Authorization = 'Bearer header-fixture' }}"
+            );
+            assert_external_credential_rejected(&config, "header-fixture");
+        }
+    }
+    assert_external_credential_rejected("[otel]\nbearer_token = 'otel-fixture'", "otel-fixture");
+    assert_external_credential_rejected(
+        "[otel]\nheaders_helper = 'helper-fixture'",
+        "helper-fixture",
+    );
+    assert_external_credential_rejected(
+        "[otel.metrics_exporter.otlp-grpc]\nendpoint = 'https://telemetry.example/events?key=endpoint-fixture'",
+        "endpoint-fixture",
+    );
+}
+
+#[test]
+fn snapshot_rejects_opaque_telemetry_header_values() {
+    let config = "[otel.trace_exporter.otlp-http]\nendpoint = 'https://telemetry.example'\nprotocol = 'json'\nheaders = { Content-Type = 'header-fixture' }";
+    assert_external_credential_rejected(config, "header-fixture");
+}
+
+#[test]
+fn snapshot_rejects_credentials_in_mcp_urls() {
+    for url in [
+        "https://user:url-fixture@mcp.example/service",
+        "https://mcp.example/service?access_token=url-fixture",
+        "https://mcp.example/service?api-version=v1&private=url-fixture",
+        "https://mcp.example/service#url-fixture",
+    ] {
+        let config = format!("[mcp_servers.search]\nurl = '{url}'");
+        assert_external_credential_rejected(&config, "url-fixture");
+    }
+}
+
+#[test]
+fn snapshot_rejects_mcp_oauth_secrets_and_header_commands() {
+    for config in [
+        "[mcp_servers.search.oauth]\nclient_secret = 'mcp-fixture'",
+        "[mcp_enterprise_managed_auth.idp]\nclient_secret = 'mcp-fixture'",
+        "[mcp_servers.search]\nurl = 'https://mcp.example/tools'\nhttp_headers_helper = 'mcp-fixture'",
+    ] {
+        assert_external_credential_rejected(config, "mcp-fixture");
+    }
+}
+
+#[test]
+fn snapshot_preserves_public_connection_settings() {
+    let config = r#"
+[model_providers.demo.query_params]
+api-version = "2025-04-01-preview"
+[otel]
+environment = "staging"
+exporter = "none"
+metrics_exporter = "statsig"
+[otel.trace_exporter.otlp-http]
+endpoint = "https://telemetry.example/v1/traces"
+protocol = "json"
+headers = { Content-Type = "application/json" }
+[mcp_servers.search]
+url = "https://mcp.example/tools?api-version=v1"
+[mcp_servers.search.oauth]
+client_id = "public-application"
+[mcp_servers.local]
+command = "local-tools"
+[profiles.work]
+model_provider = "demo"
+"#;
+    let expected: toml::Table = toml::from_str(config).unwrap();
+    let files = BTreeMap::from([
+        ("config.toml".into(), config.into()),
+        ("alternate.config.toml".into(), config.into()),
+    ]);
+    let prepared = prepare(Path::new("/unused"), files, BTreeMap::new()).unwrap();
+    for name in ["config.toml", "alternate.config.toml"] {
+        let actual: toml::Table = toml::from_str(&prepared.files[name]).unwrap();
+        for (key, value) in &expected {
+            assert_eq!(actual.get(key), Some(value), "{name} {key}");
+        }
+    }
+}
+
 #[test]
 fn wrong_session_authority_path_and_duplicate_credentials_are_rejected() {
     let config = "[model_providers.test]\nbase_url='https://models.example/v1'\nexperimental_bearer_token='original-bearer-value'\n";

@@ -53,6 +53,22 @@ The implementation reuses the existing HTTP CONNECT connector, TLS authority, op
 - Preserve protocol metadata headers such as Content-Type and Content-Encoding so capture can keep interpreting compressed model requests.
 - Report unsupported authentication mechanisms before passing their material into the container. The first milestone covers the existing file-based ChatGPT login and API-key authentication. Other credential stores and provider authentication flows require explicit support.
 
+The adapter checks `config.toml` and each named `*.config.toml` file, including
+sessions without a host login. Model provider `query_params` may carry a public
+`api-version` selector such as `v1`, `preview` or `2025-04-01-preview`.
+MCP and telemetry endpoints may use absolute HTTP or HTTPS URLs with the same
+public selector. Embedded user information, fragments and unrecognized query
+parameters stop startup before the sandbox is created. MCP header commands and
+OAuth client secrets, including an enterprise identity provider's secret, also
+stop startup. Public OAuth client IDs are preserved. Model providers that
+require credentials can use the existing scoped authentication headers.
+
+OpenTelemetry log, trace and metrics exporters may use OTLP over HTTP or gRPC.
+The adapter accepts standard JSON, protobuf and gRPC media types and common
+content encodings in `Accept`, `Content-Type`, `Accept-Encoding` and
+`Content-Encoding`. Bearer tokens, commands that generate headers, and other
+header names or values stop startup. The diagnostic omits the supplied values.
+
 The approved direct dependencies are `toml` 1.2.1 and `base64` 0.23.1. They provide TOML parsing and Base64URL encoding and decoding for synthetic JWT envelopes.
 
 ### Scoped injection

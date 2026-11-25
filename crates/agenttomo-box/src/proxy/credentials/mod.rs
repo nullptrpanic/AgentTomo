@@ -205,14 +205,26 @@ impl Grant {
 
 pub struct Policy {
     grants: Vec<Grant>,
+    direct_origins: Vec<Origin>,
     pub lifetime: CancellationToken,
 }
 impl Policy {
     pub fn new(grants: Vec<Grant>) -> Self {
         Self {
             grants,
+            direct_origins: Vec::new(),
             lifetime: CancellationToken::new(),
         }
+    }
+    pub fn allow_configured(&mut self, scopes: &[Scope]) {
+        self.direct_origins
+            .extend(scopes.iter().map(|scope| scope.origin.clone()));
+    }
+    pub fn direct_allowed(&self, authority: &Authority) -> bool {
+        self.direct_origins
+            .iter()
+            .any(|origin| origin.matches(authority))
+            || self.origin(authority).is_some()
     }
     pub fn origin(&self, authority: &Authority) -> Option<Origin> {
         self.grants

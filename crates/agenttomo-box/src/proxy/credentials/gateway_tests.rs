@@ -250,6 +250,9 @@ async fn unrelated_tcp_keeps_server_first_bytes_and_half_close() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = upstream.local_addr().unwrap();
     let mut harness = Harness::start("192.0.2.1:443".parse().unwrap(), None).await;
+    let mut policy = Policy::new(Vec::new());
+    policy.allow_configured(&[Scope::new(&format!("http://{address}"), &[]).unwrap()]);
+    harness.gateway.register("test-owner".into(), policy);
     harness.destination = address;
     let server = tokio::spawn(async move {
         let (mut stream, _) = upstream.accept().await.unwrap();
@@ -314,5 +317,20 @@ async fn credential_requests_cannot_use_header_echo_methods_or_unrelated_endpoin
             .await
             .unwrap()
             .unwrap();
+    }
+}
+
+#[test]
+fn direct_routes_check_the_resolved_address_including_mapped_ipv4() {
+    for ip in [
+        "127.0.0.1",
+        "::ffff:127.0.0.1",
+        "::1",
+        "169.254.1.1",
+        "10.0.0.1",
+        "fe80::1",
+        "fd00::1",
+    ] {
+        assert!(!public_destination(ip.parse().unwrap()));
     }
 }

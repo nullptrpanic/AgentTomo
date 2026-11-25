@@ -46,7 +46,13 @@ impl FromStr for Proxy {
         {
             return Err("proxy authentication is not supported; use an unauthenticated HTTP CONNECT endpoint".into());
         }
-        if !matches!(uri.path(), "" | "/") || uri.query().is_some() || uri.port_u16() == Some(0) {
+        if !matches!(uri.path(), "" | "/")
+            || uri.query().is_some()
+            || uri.port_u16() == Some(0)
+            || uri
+                .authority()
+                .is_some_and(|a| a.port_u16().is_none() && a.as_str().len() != a.host().len())
+        {
             return Err("proxy URL must contain only http://host[:port]".into());
         }
         Ok(Self(uri))
