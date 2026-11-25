@@ -150,13 +150,21 @@ pub fn prepare(
     for (udp, reply) in &endpoints.udp {
         fds.extend([udp.as_raw_fd(), reply.as_raw_fd()]);
     }
-    sendmsg::<()>(
-        control.as_raw_fd(),
-        &[IoSlice::new(b"N")],
-        &[ControlMessage::ScmRights(&fds)],
-        MsgFlags::MSG_NOSIGNAL,
-        None,
-    )?;
+    loop {
+        match sendmsg::<()>(
+            control.as_raw_fd(),
+            &[IoSlice::new(b"N")],
+            &[ControlMessage::ScmRights(&fds)],
+            MsgFlags::MSG_NOSIGNAL,
+            None,
+        ) {
+            Err(nix::errno::Errno::EINTR) => continue,
+            result => {
+                result?;
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -201,7 +209,7 @@ fn has_outer_ipv6_route() -> io::Result<bool> {
     let routes: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
     Ok(routes.iter().any(|route| {
         matches!(route["type"].as_str(), None | Some("unicast"))
-            && matches!(route["dst"].as_str(), Some(dst) if dst != "::1" && dst != "::1/128")
+            && matches!(route["dst"].as_str(), Some(dst) if dst == "default" || dst.split('/').next().and_then(|s| s.parse::<std::net::Ipv6Addr>().ok()).is_some_and(|ip| !ip.is_loopback() && !ip.is_unicast_link_local() && !ip.is_multicast()))
     }))
 }
 
@@ -332,12 +340,17 @@ pub fn receive(control: &mut UnixStream) -> io::Result<Endpoints> {
     let mut fds = Vec::new();
     let (count, flags) = {
         let mut io = [IoSliceMut::new(&mut byte)];
-        let message = recvmsg::<()>(
-            control.as_raw_fd(),
-            &mut io,
-            Some(&mut ancillary),
-            MsgFlags::MSG_CMSG_CLOEXEC,
-        )?;
+        let message = loop {
+            match recvmsg::<()>(
+                control.as_raw_fd(),
+                &mut io,
+                Some(&mut ancillary),
+                MsgFlags::MSG_CMSG_CLOEXEC,
+            ) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                result => break result?,
+            }
+        };
         for item in message.cmsgs()? {
             if let ControlMessageOwned::ScmRights(raw) = item {
                 fds.extend(

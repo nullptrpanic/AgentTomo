@@ -113,7 +113,7 @@ impl AgentAdapter for AgentKit {
     }
     fn observation_rules(&self) -> ObservationRules {
         ObservationRules {
-            runtime_executables: vec!["agenttomo-agentkit".into()],
+            runtime_executables: vec![PROGRAM.into()],
             private_paths: vec![self.home().into()],
         }
     }

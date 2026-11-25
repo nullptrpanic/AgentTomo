@@ -70,7 +70,7 @@ pub async fn initialize(
             .await?;
     }
     tokio::fs::DirBuilder::new()
-        .mode(0o777)
+        .mode(0o700)
         .create(Path::new(ROOT).join("control"))
         .await?;
     if let Some(certificate) = bootstrap.proxy_ca {

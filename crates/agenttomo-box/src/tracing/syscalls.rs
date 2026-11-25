@@ -3,7 +3,7 @@
 use crate::{
     collectors::{file, memory, network},
     network::association::Registry,
-    syscall::{Call, Stop, query},
+    syscall::{Call, Stop},
 };
 use nix::{sys::ptrace, unistd::Pid};
 use serde_json::Value;
@@ -21,7 +21,6 @@ enum Pending {
     Report(file::report::Mutation),
     Memory(memory::Attempt),
     Network(Box<network::Attempt>),
-    Query(Box<(query::Query, network::Query)>),
 }
 
 impl Dispatch {
@@ -96,18 +95,7 @@ impl Dispatch {
                 data: attempt.finish(stop.result()),
             })),
             Some(Pending::Network(attempt)) => {
-                if let Some(request) = self.network.finish(*attempt, stop.result())
-                    && let Some(query) = query::Query::start(&request.call)?
-                {
-                    self.pending
-                        .insert(tid, Pending::Query(Box::new((query, request))));
-                }
-                Ok(None)
-            }
-            Some(Pending::Query(query)) => {
-                let (query, request) = *query;
-                let source = query.finish(tid, &stop)?;
-                self.network.queried(request, source);
+                self.network.finish(*attempt, stop.result());
                 Ok(None)
             }
             None => Ok(None),

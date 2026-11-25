@@ -93,7 +93,7 @@ async fn collect(
         .as_ref()
         .map(|inspection| super::trust::Overlay::new(&inspection.authority.pem))
         .transpose()?;
-    let registry = crate::network::association::Registry::default();
+    let registry = crate::network::association::Registry::with_agents(agents.clone());
     let associations = registry.clone();
     let (network, endpoints) = oneshot::channel::<crate::network::Endpoints>();
     let scope_finished = CancellationToken::new();
@@ -175,8 +175,8 @@ async fn collect(
             },
             result = recording.writer_failure() => result?,
             event = events.recv(), if !tracing_done => match event {
-                Some(Event::Process { kind, mut data }) => { agents.fields(&mut data); recording.event("ptrace", kind, data).await?; },
-                Some(Event::FileOpen(mut opened)) => { agents.fields(&mut opened.data); recording.file_open(opened).await?; },
+                Some(Event::Process { kind, data }) => { recording.event("ptrace", kind, data).await?; },
+                Some(Event::FileOpen(opened)) => { recording.file_open(opened).await?; },
                 Some(Event::RootExit(code)) => {
                     if let Some(task) = agent_task.take() { task.abort(); }
                     // Drain a snapshot, not EOF or an unbounded busy pipe.
@@ -200,7 +200,7 @@ async fn collect(
                 _ => return Err(io::Error::other("tracer closed without completing collection")),
             },
             event = proxy_events.recv(), if !proxy_done => match event {
-                Some(mut event) => { agents.fields(&mut event.data); recording.event(event.source, event.kind, event.data).await?; },
+                Some(event) => { recording.event(event.source, event.kind, event.data).await?; },
                 None => proxy_done = true,
             },
             result = &mut proxy_task, if !proxy_exited => {

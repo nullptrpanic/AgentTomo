@@ -49,7 +49,7 @@ Docker 默认 seccomp/AppArmor 可能禁止嵌套 namespace。Playground 开发�
 
 ## 进程归属
 
-socket 成功创建时，读取该已知 FD 的 inode 并分配运行内 socket ID。fork/dup 后同一 inode 可以继续识别；不会遍历全部 FD。connect 入口只有目标地址，自动源端口尚未确定，因此在成功或 EINPROGRESS 出口临时执行一次 getsockname 查询，再完整恢复原返回值、寄存器和借用的栈字节。查询期间通过 PTRACE_SETSIGMASK 临时阻塞可屏蔽信号，由内核保留待交付信号及 siginfo；恢复原信号掩码后正常交付，SIGSTOP/SIGKILL 仍按内核语义处理。FD 被其他线程关闭/复用时放弃归属。
+socket 成功创建时，读取该已知 FD 的 inode 并分配运行内 socket ID。fork/dup 后同一 inode 可以继续识别；不会遍历全部 FD。connect 入口只有目标地址，自动源端口尚未确定，因此在调用出口使用 pidfd_getfd 复制并核对 socket inode，再在采集器读取本地端点。内核或权限不支持复制时，从目标网络命名空间的 TCP/UDP 表按 inode 查询。查询仅在源端点尚未缓存时执行，无法确认身份时放弃归属。
 
 代理接受连接可能早于元数据登记，最多等待 250 ms。未取得可靠元数据仍转发，标记 `attribution=unavailable`，不猜 PID。TCP 的 `attribution=connect_initiator` 表示建连发起者，不宣称它就是共享 FD 后每一次 write 的执行者。PID、稳定的 `process_instance_id` 和 `socket_id` 随代理事件保存，迟到的事件不会复活已退出进程。同进程线程共享该身份；线程号仅保留在底层 ptrace 操作内。
 

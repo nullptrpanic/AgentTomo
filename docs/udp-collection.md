@@ -27,7 +27,7 @@ sequenceDiagram
 
 ## 归属与记录
 
-ptrace 只采集私有元数据：socket、connect/bind，以及 sendto/sendmsg/sendmmsg/write/writev 的发送者和目的地址。必要时在调用结束查询 getsockname 得到自动源端口。recvfrom/recvmsg/recvmmsg 及 getpeername 不需要停点，真实内核完成短缓冲区、MSG_PEEK/MSG_TRUNC 和接收过滤。
+ptrace 只采集私有元数据：socket、connect/bind，以及 sendto/sendmsg/sendmmsg/write/writev 的发送者和目的地址。必要时在调用结束通过只读 socket 查询得到自动源端口。recvfrom/recvmsg/recvmmsg 及 getpeername 不需要停点，真实内核完成短缓冲区、MSG_PEEK/MSG_TRUNC 和接收过滤。
 
 UDP connect 只设置默认目标，不产生出口事件，也不把地址排序探测者当作报文发送者。代理最多等待 250 ms 的元数据屏障，让已进入的发送调用完成，失败调用不成为参与者；超时保留转发，但不猜归属。
 

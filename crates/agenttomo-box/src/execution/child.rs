@@ -15,6 +15,13 @@ pub fn exec(
 ) -> u8 {
     // fd 3 is a dedicated, unbuffered gate, separate from the target's streams.
     let mut control = unsafe { UnixStream::from_raw_fd(3) };
+    if let Err(error) = nix::fcntl::fcntl(
+        &control,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    ) {
+        let _ = write!(control, "Esetting close-on-exec on control socket: {error}");
+        return 125;
+    }
     let ca = if trust_overlay.is_some() {
         match super::trust::receive(&mut control) {
             Ok(ca) => ca,

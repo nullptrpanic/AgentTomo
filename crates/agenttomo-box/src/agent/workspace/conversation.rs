@@ -1,5 +1,5 @@
 //! One traced AgentKit server and one SDK session live across turns in a sandbox.
-use super::{Action, Scope, finish_sample, kill_group, prepare_sample, spawn};
+use super::{Action, Scope, finish_sample, prepare_sample, spawn};
 use crate::{
     agent::{Adapter, adapter::LaunchRequest, agentkit::http::Session},
     execution::protocol,
@@ -15,6 +15,7 @@ use tokio::{io::BufReader, net::UnixStream, process::Child, task::JoinSet};
 
 struct Process {
     child: Child,
+    group: nix::unistd::Pid,
     session: Session,
 }
 
@@ -44,6 +45,7 @@ impl Process {
             .ok_or_else(|| io::Error::other("AgentKit did not start"))?;
         Ok(Self {
             child,
+            group: nix::unistd::Pid::from_raw(pid as i32),
             session: Session::new(address, pid),
         })
     }
@@ -51,7 +53,7 @@ impl Process {
 
 async fn stop(process: &mut Option<Process>) {
     if let Some(mut process) = process.take() {
-        kill_group(Some(&mut process.child));
+        let _ = nix::sys::signal::killpg(process.group, nix::sys::signal::Signal::SIGKILL);
         let _ = process.child.wait().await;
     }
 }

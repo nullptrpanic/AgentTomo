@@ -13,7 +13,7 @@ pub mod workspace;
 pub use adapter::{
     Adapter, AgentConfig, Installation, ObservationRules, discover, observation_rules,
 };
-pub use bindings::{Hub, Scope};
+pub use bindings::{Binding, Hub, Scope};
 pub use protocol::{Event, Protocol};
 pub use wire::Observer;
 
@@ -64,29 +64,22 @@ pub fn environment(pid: nix::unistd::Pid) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn runtime_rules_are_supplied_by_the_adapter_and_match_executable_names() {
-        let hub = super::Hub::with_runtimes(vec!["example-agent".into(), "example-helper".into()]);
+    fn runtime_rules_match_the_running_executable() {
+        let pid = nix::unistd::getpid();
         let scope = super::Scope {
             agent_instance_id: "a".into(),
             task_id: "t".into(),
         };
         let env = serde_json::json!({"AGENTTOMO_AGENT_ID":"a","AGENTTOMO_TASK_ID":"t"});
-        let (call, _) = hub.call(&scope, "call", true);
-        hub.observe_exec(1, &env, &serde_json::json!(["/opt/example-agent", "run"]));
-        assert_eq!(hub.binding(1).unwrap().association, "agent_runtime");
-        hub.fork(1, 2);
-        hub.observe_exec(2, &env, &serde_json::json!(["/opt/example-helper"]));
-        assert!(hub.binding(2).unwrap().agenttomo_toolcall_id.is_none());
-        hub.fork(2, 3);
-        hub.observe_exec(
-            3,
-            &env,
-            &serde_json::json!(["/usr/bin/curl", "example-agent"]),
-        );
-        assert_eq!(hub.binding(3).unwrap().agenttomo_toolcall_id, Some(call));
-        // A different application's name is not implicitly a runtime.
-        hub.observe_exec(4, &env, &serde_json::json!(["/usr/bin/codex"]));
-        assert_ne!(hub.binding(4).unwrap().association, "agent_runtime");
+        for (path, is_runtime) in [("/proc/self/exe", true), ("/dev/null", false)] {
+            let hub = super::Hub::with_runtimes(vec![path.into()]);
+            hub.call(&scope, "call", true);
+            hub.observe_exec(1, &env, pid);
+            assert_eq!(
+                hub.binding(1).unwrap().association == "agent_runtime",
+                is_runtime
+            );
+        }
     }
 
     #[tokio::test]

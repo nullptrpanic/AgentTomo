@@ -10,10 +10,26 @@ pub fn canonical(address: SocketAddr) -> SocketAddr {
                 SocketAddr::new(ip.into(), address.port())
             } else {
                 address.set_flowinfo(0);
+                if !address.ip().is_unicast_link_local() && !address.ip().is_multicast() {
+                    address.set_scope_id(0);
+                }
                 SocketAddr::V6(address)
             }
         }
         address => address,
+    }
+}
+
+pub fn routed_source(source: SocketAddr, destination: SocketAddr) -> SocketAddr {
+    if source.ip().is_unspecified() {
+        let ip = if destination.is_ipv4() {
+            Ipv4Addr::LOCALHOST.into()
+        } else {
+            Ipv6Addr::LOCALHOST.into()
+        };
+        SocketAddr::new(ip, source.port())
+    } else {
+        source
     }
 }
 

@@ -21,10 +21,76 @@ use std::{
 
 pub struct Socket {
     pub id: u64,
+    inode: u64,
+    table: &'static str,
     pub source: Cell<Option<SocketAddr>>,
     pub peer: Cell<Option<SocketAddr>>,
     pub transport: Transport,
 }
+impl Socket {
+    pub(super) fn local_addr(&self, call: &Call) -> Option<SocketAddr> {
+        // pidfd_getfd is optional (Linux 5.6 and ptrace permissions). Verify
+        // the inode because another thread can replace the fd after syscall entry.
+        if let Some(address) = self.duplicate_addr(call) {
+            return Some(address);
+        }
+        let file = std::fs::File::open(format!("/proc/{}/net/{}", call.tid, self.table)).ok()?;
+        for line in io::BufReader::new(file).lines().skip(1) {
+            let line = line.ok()?;
+            let mut fields = line.split_ascii_whitespace();
+            let local = fields.nth(1)?;
+            if fields.nth(7)?.parse::<u64>().ok()? != self.inode {
+                continue;
+            }
+            let (ip, port) = local.split_once(':')?;
+            let mut octets = Vec::new();
+            for word in ip.as_bytes().as_chunks::<8>().0 {
+                octets.extend(
+                    u32::from_str_radix(std::str::from_utf8(word).ok()?, 16)
+                        .ok()?
+                        .to_ne_bytes(),
+                );
+            }
+            let ip = match octets.as_slice() {
+                &[a, b, c, d] => std::net::Ipv4Addr::new(a, b, c, d).into(),
+                bytes => std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                    <[u8; 16]>::try_from(bytes).ok()?,
+                )),
+            };
+            return Some(SocketAddr::new(ip, u16::from_str_radix(port, 16).ok()?));
+        }
+        None
+    }
+
+    fn duplicate_addr(&self, call: &Call) -> Option<SocketAddr> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let pidfd =
+            Errno::result(unsafe { libc::syscall(libc::SYS_pidfd_open, call.tid.as_raw(), 0) })
+                .ok()?;
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
+        let fd = Errno::result(unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_getfd,
+                pidfd.as_raw_fd(),
+                call.args[0] as i32,
+                0,
+            )
+        })
+        .ok()?;
+        let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+        if file.metadata().ok()?.ino() != self.inode {
+            return None;
+        }
+        let mut bytes = [0u8; 128];
+        let mut len = bytes.len() as libc::socklen_t;
+        Errno::result(unsafe {
+            libc::getsockname(file.as_raw_fd(), bytes.as_mut_ptr().cast(), &mut len)
+        })
+        .ok()?;
+        crate::network::address::decode(bytes.get(..len as usize)?)
+    }
+}
+
 fn inode(tid: Pid, fd: i32) -> Option<u64> {
     let path = std::fs::read_link(format!("/proc/{tid}/fd/{fd}")).ok()?;
     path.to_str()?
@@ -38,6 +104,7 @@ pub struct Registry {
     watches: Option<Inotify>,
     by_watch: HashMap<WatchDescriptor, (u64, u64)>,
     resync: bool,
+    untracked: std::collections::VecDeque<(u64, u64)>,
     next_id: u64,
 }
 impl Default for Registry {
@@ -47,6 +114,7 @@ impl Default for Registry {
             watches: Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK).ok(),
             by_watch: HashMap::new(),
             resync: false,
+            untracked: Default::default(),
             next_id: 0,
         }
     }
@@ -107,11 +175,26 @@ impl Registry {
                 return;
             }
             self.by_watch.insert(wd, (ino, self.next_id));
+        } else {
+            // Missing close notifications must not retain unbounded inode history.
+            self.untracked.push_back((ino, self.next_id));
+            if self.untracked.len() > 16384
+                && let Some((old, id)) = self.untracked.pop_front()
+            {
+                remove_generation(&mut self.by_inode, old, id);
+            }
         }
         self.by_inode.insert(
             ino,
             Rc::new(Socket {
                 id: self.next_id,
+                inode: ino,
+                table: match (transport, call.args[0] as i32 == libc::AF_INET6) {
+                    (Transport::Tcp, false) => "tcp",
+                    (Transport::Tcp, true) => "tcp6",
+                    (Transport::Udp, false) => "udp",
+                    (Transport::Udp, true) => "udp6",
+                },
                 source: Cell::new(None),
                 peer: Cell::new(None),
                 transport,

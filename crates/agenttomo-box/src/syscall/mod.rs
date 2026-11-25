@@ -2,7 +2,6 @@
 
 mod filter;
 pub mod memory;
-pub mod query;
 
 use nix::{errno::Errno, libc, unistd::Pid};
 use std::io;

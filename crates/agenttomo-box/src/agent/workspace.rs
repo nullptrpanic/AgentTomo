@@ -30,7 +30,15 @@ pub async fn run(browser: bool) -> io::Result<u8> {
     let adapter = super::Adapter::selected()?
         .ok_or_else(|| io::Error::other("workspace requires an agent adapter"))?;
     let listener = UnixListener::bind(SOCKET)?;
-    std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o666))?;
+    std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o600))?;
+    let parent = nix::unistd::getppid().as_raw();
+    let connection = loop {
+        let (peer, _) = listener.accept().await?;
+        if peer.peer_cred()?.pid() == Some(parent) {
+            break peer;
+        }
+    };
+    drop(listener);
     let mut terminal = if browser {
         Command::new("/usr/local/bin/agenttomo-browser-session")
     } else {
@@ -40,10 +48,6 @@ pub async fn run(browser: bool) -> io::Result<u8> {
     };
     adapter.configure(&mut terminal)?;
     let mut terminal = terminal.kill_on_drop(true).spawn()?;
-    let connection = tokio::select! {
-        accepted = listener.accept() => accepted?.0,
-        status = terminal.wait() => return Ok(status?.code().unwrap_or(125) as u8),
-    };
     if adapter.conversation_server() {
         return conversation::serve(adapter, terminal, connection).await;
     }
@@ -270,20 +274,24 @@ pub async fn drive(
                 Some(mut action) => {
                     // The collector owns the turn binding. A second start must not cross
                     // the completion acknowledgement while the subprocess is reusable.
-                    if conversation && let Action::Start { scope, .. } = &action && let Some(active) = &running {
+                    if let Action::Start { scope, sample, .. } = &action && let Some(active) = &running {
                         if active != scope {
+                            if let Some(id) = sample {
+                                events.send(crate::recording::Observation { source:"agent_launcher", kind:"security.sample.finished",
+                                    data:json!({"agent_instance_id":scope.agent_instance_id,"task_id":scope.task_id,"sample_id":id,"status":"error","error":"Another task is already running.","captured_unix_ns":super::now()}) }).await.map_err(io::Error::other)?;
+                            }
                             events.send(crate::recording::Observation {
                                 source: "agent_launcher", kind: "agent.task.rejected",
                                 data: json!({"agent_instance_id":scope.agent_instance_id,"task_id":scope.task_id,
-                                    "error":"Another conversation turn is running.","captured_unix_ns":super::now()}),
+                                    "error":"Another task is already running.","captured_unix_ns":super::now()}),
                             }).await.map_err(io::Error::other)?;
                         }
                         continue;
                     }
-                    if conversation && matches!(action, Action::Cancel) && running.is_none() { continue; }
+                    if matches!(action, Action::Cancel) && running.is_none() { continue; }
                     if let Action::Start { scope, sample, report_marker, .. } = &mut action && running.is_none() {
                         running = Some(scope.clone());
-                        if conversation { agents.begin_turn(scope); }
+                        agents.begin_turn(scope, conversation && sample.is_none());
                         cancelled = false;
                         if sample.as_deref() == Some("tool-leak") {
                             // Arm the tracer before sending Start so it can match the first write.
@@ -294,7 +302,7 @@ pub async fn drive(
                         }
                     }
                     if matches!(action, Action::Cancel) { cancelled = true; }
-                    if !conversation && matches!(action, Action::Cancel) && let Some(scope) = &running && let Err(error) = agents.cancel(scope) {
+                    if matches!(action, Action::Cancel) && let Some(scope) = &running && let Err(error) = agents.cancel(scope) {
                         events.send(crate::recording::Observation { source:"agent_launcher", kind:"agent.capture.error", data:json!({"task_id":scope.task_id,"agent_instance_id":scope.agent_instance_id,"error":format!("some task processes could not be stopped and remain traced: {error}"),"captured_unix_ns":super::now()}) }).await.map_err(io::Error::other)?;
                     }
                     protocol::send(&mut write, &action).await?;
@@ -318,7 +326,7 @@ pub async fn drive(
                     _ => return Err(io::Error::other("invalid workspace control event")),
                 };
                 let scope: Scope = serde_json::from_value(data["scope"].take())?;
-                if kind == "security.sample.finished" && cancelled { data["status"] = "cancelled".into(); }
+                if kind == "security.sample.finished" && cancelled && running.as_ref() == Some(&scope) { data["status"] = "cancelled".into(); }
                 if kind == "security.sample.finished" && data["sample_id"] == "tool-leak"
                     && data.get("exit_code").is_some() && let Some(evidence) = reports.finish(&scope) {
                     crate::playground::samples::apply_report_evidence(&mut data,evidence);
@@ -332,8 +340,9 @@ pub async fn drive(
                     data["cancelled"] = cancelled.into();
                     reports.finish(&scope);
                     running = None;
+                    cancelled = false;
                 }
-                if kind == "agent.task.finished" {
+                if kind == "agent.task.finished" && running.as_ref() == Some(&scope) {
                     agents.finish_turn(&scope);
                     started = false;
                     data["cancelled"] = cancelled.into();
@@ -342,6 +351,7 @@ pub async fn drive(
                         data["status"] = "cancelled".into();
                     }
                     running = None;
+                    cancelled = false;
                 }
                 data["agent_instance_id"] = scope.agent_instance_id.into();
                 data["task_id"] = scope.task_id.into();

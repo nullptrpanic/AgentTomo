@@ -9,11 +9,7 @@ use crate::{
     syscall::{Call, memory},
 };
 use nix::libc;
-use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
-    rc::Rc,
-};
+use std::{net::SocketAddr, path::PathBuf, rc::Rc};
 
 pub fn watched_syscalls() -> Vec<i64> {
     vec![
@@ -36,12 +32,6 @@ pub enum Attempt {
         destinations: Vec<Option<SocketAddr>>,
         pending: Option<Pending>,
     },
-}
-pub struct Query {
-    pub call: Call,
-    socket: Rc<sockets::Socket>,
-    destinations: Vec<Option<SocketAddr>>,
-    pending: Option<Pending>,
 }
 pub struct Collector {
     sockets: sockets::Registry,
@@ -93,7 +83,7 @@ impl Collector {
             _ if socket.transport != Transport::Udp => return None,
             libc::SYS_sendto => vec![remote(&call, call.args[4], call.args[5]).or(peer)],
             libc::SYS_sendmsg => vec![message(&call, call.args[1]).or(peer)],
-            libc::SYS_sendmmsg => (0..call.args[2].min(1024))
+            libc::SYS_sendmmsg => (0..u64::from((call.args[2] as u32).min(1024)))
                 .map(|index| {
                     call.args[1]
                         .checked_add(index * std::mem::size_of::<libc::mmsghdr>() as u64)
@@ -120,11 +110,11 @@ impl Collector {
             pending,
         })
     }
-    pub fn finish(&mut self, attempt: Attempt, result: i64) -> Option<Query> {
+    pub fn finish(&mut self, attempt: Attempt, result: i64) {
         let (call, socket, mut destinations, pending) = match attempt {
             Attempt::Socket(call) => {
                 self.sockets.created(call, result);
-                return None;
+                return;
             }
             Attempt::Operation {
                 call,
@@ -134,70 +124,54 @@ impl Collector {
             } => (call, socket, destinations, pending),
         };
         if result < 0
-            && !(call.number == libc::SYS_connect && result == -(libc::EINPROGRESS as i64))
+            && !(call.number == libc::SYS_connect
+                && matches!(-result as i32, libc::EINPROGRESS | libc::EINTR))
         {
-            return None;
+            return;
         }
         // The call holds the socket identity through its exit stop, even if
         // another thread has since closed the last FD and the index was reaped.
         if call.number == libc::SYS_bind {
             socket.source.set(None);
-            return None;
+            return;
         }
         if call.number == libc::SYS_connect {
             socket.source.set(None);
             socket.peer.set(destinations[0]);
-            destinations[0]?;
+            if destinations[0].is_none() {
+                return;
+            }
         }
         if call.number == libc::SYS_sendmmsg {
             destinations.truncate(result as usize);
         }
         if destinations.iter().all(Option::is_none) {
-            return None;
-        }
-        if let Some(source) = socket.source.get() {
-            self.publish(&call, &socket, &destinations, source, pending.as_ref());
-            return None;
-        }
-        Some(Query {
-            call,
-            socket,
-            destinations,
-            pending,
-        })
-    }
-    pub fn queried(&mut self, query: Query, source: Option<SocketAddr>) {
-        // Another thread can close/reuse this FD during the query. A different
-        // socket must not inherit the original call's identity.
-        if self
-            .sockets
-            .lookup(query.call.tid, query.call.args[0] as i32)
-            .map(|socket| socket.id)
-            != Some(query.socket.id)
-        {
             return;
         }
-        let Some(mut source) = source.map(address::canonical).filter(|s| s.port() != 0) else {
-            return;
+        let source = match socket.source.get() {
+            Some(source) => source,
+            None => {
+                let fd = call.args[0] as i32;
+                if self
+                    .sockets
+                    .lookup(call.tid, fd)
+                    .is_none_or(|current| current.id != socket.id)
+                {
+                    return;
+                }
+                let Some(source) = socket
+                    .local_addr(&call)
+                    .map(address::canonical)
+                    .filter(|s| s.port() != 0)
+                else {
+                    return;
+                };
+                socket.source.set(Some(source));
+                source
+            }
         };
-        // This namespace has only lo and routes egress through it. An unconnected
-        // auto-bound UDP socket reports INADDR_ANY until connect.
-        if source.ip().is_unspecified() {
-            source.set_ip(if source.is_ipv4() {
-                IpAddr::V4(Ipv4Addr::LOCALHOST)
-            } else {
-                IpAddr::V6(Ipv6Addr::LOCALHOST)
-            });
-        }
-        query.socket.source.set(Some(source));
-        if query.socket.transport != Transport::Udp || query.call.number != libc::SYS_connect {
-            self.publish(
-                &query.call,
-                &query.socket,
-                &query.destinations,
-                source,
-                query.pending.as_ref(),
-            );
+        if socket.transport != Transport::Udp || call.number != libc::SYS_connect {
+            self.publish(&call, &socket, &destinations, source, pending.as_ref());
         }
     }
     fn publish(
@@ -215,7 +189,7 @@ impl Collector {
             self.registry.register(
                 Key {
                     transport: socket.transport,
-                    source,
+                    source: address::routed_source(source, *destination),
                     destination: *destination,
                 },
                 socket.id,
@@ -276,8 +250,7 @@ mod tests {
             ))
             .unwrap();
         socket.connect(destination).unwrap();
-        let query = collector.finish(connect, 0).unwrap();
-        collector.queried(query, Some(source));
+        collector.finish(connect, 0);
         let write = collector
             .enter(call(libc::SYS_write, [fd, 0, 1, 0, 0, 0]))
             .unwrap();

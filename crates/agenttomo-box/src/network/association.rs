@@ -49,6 +49,7 @@ pub struct Metadata {
     pub socket_id: u64,
     pub socket_ids: Vec<u64>,
     pub actors: Vec<Identity>,
+    pub agent: Option<crate::agent::Binding>,
 }
 impl Metadata {
     fn new(socket_id: u64, since: SystemTime) -> Self {
@@ -57,6 +58,7 @@ impl Metadata {
             socket_id,
             socket_ids: vec![socket_id],
             actors: Vec::new(),
+            agent: None,
         }
     }
     pub fn fields(&self, data: &mut Value, tcp: bool) {
@@ -76,6 +78,11 @@ impl Metadata {
         // A flow shared by multiple writers has no single packet-level owner.
         if self.actors.len() == 1 {
             crate::process::fields(Some(self.actors[0]), data);
+            if data.get("agent").is_none()
+                && let Some(agent) = &self.agent
+            {
+                data["agent"] = json!(agent);
+            }
         }
     }
 }
@@ -84,6 +91,7 @@ impl Metadata {
 pub struct Registry(Arc<Inner>);
 #[derive(Default)]
 struct Inner {
+    agents: crate::agent::Hub,
     entries: Mutex<Entries>,
     changed: Notify,
     pending: Mutex<HashMap<PendingScope, BTreeMap<SystemTime, usize>>>,
@@ -170,6 +178,13 @@ impl Drop for Pending {
 }
 
 impl Registry {
+    pub fn with_agents(agents: crate::agent::Hub) -> Self {
+        Self(Arc::new(Inner {
+            agents,
+            ..Inner::default()
+        }))
+    }
+
     pub fn begin_datagram(
         &self,
         source: Option<SocketAddr>,
@@ -179,7 +194,11 @@ impl Registry {
         let scopes: Vec<_> = destinations
             .iter()
             .map(|destination| PendingScope {
-                source,
+                source: source.and_then(|src| match destination.map(super::address::canonical) {
+                    Some(dst) => Some(super::address::routed_source(src, dst)),
+                    None if src.ip().is_unspecified() => None,
+                    None => Some(src),
+                }),
                 destination: destination.map(super::address::canonical),
             })
             .collect();
@@ -228,6 +247,7 @@ impl Registry {
         let key = key.canonical();
         let mut entries = self.0.entries.lock().unwrap();
         entries.prune(&key, Instant::now());
+        let agent = self.0.agents.binding(actor.process_instance_id);
         let mut replace_udp = None;
         if key.transport == Transport::Udp
             && let Some(entry) = entries.flows.get(&key)
@@ -242,12 +262,22 @@ impl Registry {
             entries = self.0.entries.lock().unwrap();
             entries.prune(&key, Instant::now());
         }
+        // A burst of distinct tuples can fill the TTL window. Keep established
+        // evidence and omit new associations once the per-run budget is full.
+        if entries.flows.len() >= 4 * PRUNE_THRESHOLD && !entries.flows.contains_key(&key) {
+            return;
+        }
         let entry = entries.flows.entry(key).or_insert_with(|| Entry {
             current: Metadata::new(socket_id, started),
             previous: VecDeque::new(),
             updated: Instant::now(),
         });
-        if replace_udp.as_ref() == Some(&entry.current.socket_ids) {
+        if replace_udp.as_ref() == Some(&entry.current.socket_ids)
+            || key.transport == Transport::Udp
+                && entry.current.actors.as_slice() == [actor]
+                && entry.current.socket_ids.as_slice() == [socket_id]
+                && entry.current.agent != agent
+        {
             // Retain boundaries for datagrams already queued in the kernel or
             // worker. An older packet outside the window has unknown ownership.
             if entry.previous.len() == MAX_RETIRED_UDP_GENERATIONS {
@@ -268,6 +298,7 @@ impl Registry {
         if !metadata.actors.contains(&actor) {
             metadata.actors.push(actor);
         }
+        metadata.agent = (metadata.actors.len() == 1).then_some(agent).flatten();
         entry.updated = Instant::now();
         drop(entries);
         self.0.changed.notify_waiters();

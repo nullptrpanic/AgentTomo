@@ -29,7 +29,10 @@ impl AgentAdapter for Codex {
     }
     fn observation_rules(&self) -> ObservationRules {
         ObservationRules {
-            runtime_executables: vec!["codex".into(), "codex-code-mode-host".into()],
+            runtime_executables: vec![
+                format!("{DISTRIBUTION}/bin/codex"),
+                format!("{DISTRIBUTION}/bin/codex-code-mode-host"),
+            ],
             private_paths: vec![
                 HOME.into(),
                 "/root/.agenttomo-codex".into(),

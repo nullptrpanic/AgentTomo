@@ -208,7 +208,13 @@ fn run(
         // The acknowledgement itself is a send/write on the private gate.
         // Drive that stop before waiting for its byte; do not expose it as a
         // target event. A failed filter installation instead reaches EXIT.
-        match waitpid(root, Some(WaitPidFlag::__WALL))? {
+        let status = loop {
+            match waitpid(root, Some(WaitPidFlag::__WALL)) {
+                Err(Errno::EINTR) => continue,
+                result => break result?,
+            }
+        };
+        match status {
             WaitStatus::PtraceEvent(pid, _, nix::libc::PTRACE_EVENT_SECCOMP) => {
                 let call = crate::syscall::Call::read(pid, None)?;
                 if call.args[0] != 3 {
@@ -261,9 +267,22 @@ fn run(
     let mut known = HashSet::from([root]);
     let mut newborn = HashSet::new();
     let mut root_exited = false;
+    let workspace = reports.is_some();
     let mut calls = syscalls::Dispatch::new(registry, netns, capture_files, reports);
     let mut processes = processes::Registry::default();
-    processes.child(root);
+    if let Some(child) = processes.child(root, None)
+        && workspace
+    {
+        agents.workspace_launcher(child.identity.process_instance_id);
+    }
+    let observe = |mut event: Event| {
+        match &mut event {
+            Event::Process { data, .. } => agents.fields(data),
+            Event::FileOpen(opened) => agents.fields(&mut opened.data),
+            _ => {}
+        }
+        emit(sender, event)
+    };
     loop {
         let status = match waitpid(None, Some(WaitPidFlag::__WALL)) {
             Err(Errno::EINTR) => continue,
@@ -279,13 +298,10 @@ fn run(
                     agents.exited(identity);
                     let mut data = json!({"exit_code": code});
                     crate::process::fields(Some(identity), &mut data);
-                    emit(
-                        sender,
-                        Event::Process {
-                            kind: "process.exit",
-                            data,
-                        },
-                    )?;
+                    observe(Event::Process {
+                        kind: "process.exit",
+                        data,
+                    })?;
                 }
                 if pid == root {
                     root_exited = true;
@@ -300,13 +316,10 @@ fn run(
                     agents.exited(identity);
                     let mut data = json!({"signal": signal as i32, "core_dumped": core_dumped});
                     crate::process::fields(Some(identity), &mut data);
-                    emit(
-                        sender,
-                        Event::Process {
-                            kind: "process.exit",
-                            data,
-                        },
-                    )?;
+                    observe(Event::Process {
+                        kind: "process.exit",
+                        data,
+                    })?;
                 }
                 if pid == root {
                     root_exited = true;
@@ -330,14 +343,21 @@ fn run(
                     nix::libc::PTRACE_EVENT_FORK
                     | nix::libc::PTRACE_EVENT_VFORK
                     | nix::libc::PTRACE_EVENT_CLONE => {
-                        let new = Pid::from_raw(ptrace::getevent(pid)? as i32);
+                        let new = match ptrace::getevent(pid) {
+                            Ok(id) => Pid::from_raw(id as i32),
+                            Err(Errno::ESRCH) => {
+                                calls.forget(pid);
+                                continue;
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
                         let kind = match event {
                             nix::libc::PTRACE_EVENT_FORK => "process.fork",
                             nix::libc::PTRACE_EVENT_VFORK => "process.vfork",
                             _ => "process.clone",
                         };
                         let parent = processes.observe(pid);
-                        let child = processes.child(new);
+                        let child = processes.child(new, parent);
                         if !child.as_ref().is_some_and(|child| child.exited) && known.insert(new) {
                             newborn.insert(new);
                         }
@@ -358,11 +378,18 @@ fn run(
                                 "child_process_instance_id": child.map(|p| p.process_instance_id),
                             });
                             crate::process::fields(parent, &mut data);
-                            emit(sender, Event::Process { kind, data })?;
+                            observe(Event::Process { kind, data })?;
                         }
                     }
                     nix::libc::PTRACE_EVENT_EXEC => {
-                        let old = Pid::from_raw(ptrace::getevent(pid)? as i32);
+                        let old = match ptrace::getevent(pid) {
+                            Ok(id) => Pid::from_raw(id as i32),
+                            Err(Errno::ESRCH) => {
+                                calls.forget(pid);
+                                continue;
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
                         if old != pid {
                             calls.forget(old);
                             known.remove(&old);
@@ -371,11 +398,7 @@ fn run(
                         let identity = processes.exec(pid, old);
                         let mut data = exec_context(pid);
                         let environment = crate::agent::environment(pid);
-                        agents.observe_exec(
-                            identity.process_instance_id,
-                            &environment,
-                            &data["argv"],
-                        );
+                        agents.observe_exec(identity.process_instance_id, &environment, pid);
                         agents.track(identity)?;
                         if environment
                             .as_object()
@@ -385,13 +408,10 @@ fn run(
                         }
                         crate::process::fields(Some(identity), &mut data);
                         agents.fields(&mut data);
-                        emit(
-                            sender,
-                            Event::Process {
-                                kind: "process.exec",
-                                data,
-                            },
-                        )?;
+                        observe(Event::Process {
+                            kind: "process.exec",
+                            data,
+                        })?;
                     }
                     nix::libc::PTRACE_EVENT_STOP if !first_stop && signal != Signal::SIGTRAP => {
                         listen(pid)?;
@@ -403,15 +423,12 @@ fn run(
             }
             WaitStatus::PtraceSyscall(pid) => {
                 match calls.exit(pid, &agents, |data| {
-                    emit(
-                        sender,
-                        Event::Process {
-                            kind: "file.report_marker",
-                            data,
-                        },
-                    )
+                    observe(Event::Process {
+                        kind: "file.report_marker",
+                        data,
+                    })
                 }) {
-                    Ok(Some(event)) => emit(sender, event)?,
+                    Ok(Some(event)) => observe(event)?,
                     Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => {
                         calls.forget(pid)
                     }
@@ -460,6 +477,7 @@ fn exec_context(pid: Pid) -> Value {
                 raw.strip_suffix(&[0])
                     .unwrap_or(&raw)
                     .split(|byte| *byte == 0)
+                    .filter(|_| !raw.is_empty())
                     .map(|arg| String::from_utf8_lossy(arg).into_owned())
                     .collect::<Vec<_>>()
             );
